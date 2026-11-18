@@ -5,8 +5,8 @@ import { transaction } from "./database.js";
 import { ApiError, keys, uuid, pagination, invalid } from "./validation.js";
 import {
   access,
-  selectMeasure,
-  measure,
+  selectPeriodMeasure,
+  periodMeasure,
   getMeasure,
   saveMeasure,
   importRegistry,
@@ -14,7 +14,10 @@ import {
   forbidden,
   kyivDate,
 } from "./registry.js";
+import { createEvidenceStore, mountEvidenceRoutes } from "./evidence.js";
+import { mountResultRoutes } from "./result-routes.js";
 const webBuild = fileURLToPath(new URL("../../web/dist/", import.meta.url));
+const defaultEvidenceDirectory = fileURLToPath(new URL("../../../data/evidence", import.meta.url));
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const cookieName = "dacm_session";
 const tokenFrom = (req) =>
@@ -29,6 +32,7 @@ export function createApp(
   {
     demoMode = false,
     today = kyivDate,
+    evidenceDirectory = defaultEvidenceDirectory,
     allowedOrigins = [
       "http://127.0.0.1:3001",
       "http://localhost:3001",
@@ -38,6 +42,7 @@ export function createApp(
   } = {},
 ) {
   const app = express();
+  const evidence = createEvidenceStore(database, { directory: evidenceDirectory });
   if (
     !demoMode &&
     database
@@ -234,6 +239,7 @@ export function createApp(
         "departmentId",
         "executorId",
         "active",
+        "periodKey",
         "page",
         "pageSize",
       ],
@@ -242,18 +248,21 @@ export function createApp(
     const programId = uuid(req.query.programId);
     programAllowed(req.user, programId);
     const { page, pageSize } = pagination(req.query),
-      rule = access(req.user);
+      rule = access(req.user, { periodKey: req.query.periodKey, today: today() });
     const conditions = ["s.program_id=?", rule.sql],
       params = [programId, ...rule.params];
     for (const [key, column] of [
       ["sectionId", "m.section_id"],
       ["departmentId", "m.department_id"],
-      ["executorId", "m.executor_id"],
     ])
       if (Object.hasOwn(req.query, key)) {
         conditions.push(`${column}=?`);
         params.push(uuid(req.query[key]));
       }
+    if (Object.hasOwn(req.query, "executorId")) {
+      conditions.push(`${rule.executor}=?`);
+      params.push(rule.period, uuid(req.query.executorId));
+    }
     if (Object.hasOwn(req.query, "active")) {
       if (!["true", "false"].includes(req.query.active)) invalid();
       conditions.push("m.active=?");
@@ -267,15 +276,18 @@ export function createApp(
       .get(...params).n;
     const items = database
       .prepare(
-        `${selectMeasure} WHERE ${where} ORDER BY m.code,m.id LIMIT ? OFFSET ?`,
+        `${selectPeriodMeasure(rule)} WHERE ${where} ORDER BY m.code,m.id LIMIT ? OFFSET ?`,
       )
-      .all(...params, pageSize, (page - 1) * pageSize)
-      .map(measure);
+      .all(rule.period, ...params, pageSize, (page - 1) * pageSize)
+      .map((row) => periodMeasure(row, req.user, rule.period));
     res.json({ items, total, page, pageSize });
   });
   app.get("/api/measures/:id", (req, res) => {
-    keys(req.query, []);
-    res.json(getMeasure(database, req.user, uuid(req.params.id)));
+    keys(req.query, ["periodKey"]);
+    res.json(getMeasure(database, req.user, uuid(req.params.id), {
+      periodKey: req.query.periodKey,
+      today: today(),
+    }));
   });
   app.post("/api/measures", (req, res) => {
     keys(req.query, []);
@@ -295,25 +307,54 @@ export function createApp(
   });
   app.get("/api/measures/:id/audit", (req, res) => {
     if (["leader", "analyst"].includes(req.user.role)) forbidden();
-    keys(req.query, ["page", "pageSize"]);
+    keys(req.query, ["page", "pageSize", "entityType", "periodKey"]);
+    const { entityType, periodKey } = req.query;
+    if (entityType !== undefined && !["measure", "period_assignment"].includes(entityType)) invalid();
+    const canReadAssignments = ["coordinator", "admin"].includes(req.user.role);
+    if (entityType === "period_assignment" && !canReadAssignments) forbidden();
     const id = uuid(req.params.id);
-    getMeasure(database, req.user, id);
+    getMeasure(database, req.user, id, { periodKey, today: today() });
     const { page, pageSize } = pagination(req.query);
+
+    const conditions = ["a.entity_id=?"];
+    const params = [id];
+    if (entityType || !canReadAssignments) {
+      conditions.push("a.entity_type=?");
+      params.push(entityType ?? "measure");
+    } else {
+      conditions.push("a.entity_type IN ('measure','period_assignment')");
+    }
+    if (periodKey !== undefined) {
+      conditions.push("(a.entity_type<>'period_assignment' OR json_extract(a.after_json, '$.periodKey')=?)");
+      params.push(periodKey);
+    }
+    const where = conditions.join(" AND ");
     const total = database
-      .prepare(
-        "SELECT count(*) AS n FROM audit_events WHERE entity_type='measure' AND entity_id=?",
-      )
-      .get(id).n;
+      .prepare(`SELECT count(*) AS n FROM audit_events a WHERE ${where}`)
+      .get(...params).n;
     const items = database
       .prepare(
-        "SELECT id,actor_id AS actorId,action,entity_type AS entityType,entity_id AS entityId,before_json,after_json,occurred_at AS occurredAt FROM audit_events WHERE entity_type='measure' AND entity_id=? ORDER BY occurred_at,id LIMIT ? OFFSET ?",
+        `SELECT a.id,a.actor_id AS actorId,actor.display_name AS actorName,a.action,
+                a.entity_type AS entityType,a.entity_id AS entityId,a.before_json,a.after_json,
+                a.occurred_at AS occurredAt,previous.display_name AS before_name,
+                replacement.display_name AS after_name
+         FROM audit_events a JOIN users actor ON actor.id=a.actor_id
+         LEFT JOIN users previous ON a.entity_type='period_assignment'
+           AND previous.id=json_extract(a.before_json, '$.executorId')
+         LEFT JOIN users replacement ON a.entity_type='period_assignment'
+           AND replacement.id=json_extract(a.after_json, '$.executorId')
+         WHERE ${where} ORDER BY a.occurred_at,a.id LIMIT ? OFFSET ?`,
       )
-      .all(id, pageSize, (page - 1) * pageSize)
-      .map(({ before_json, after_json, ...row }) => ({
-        ...row,
-        before: JSON.parse(before_json),
-        after: JSON.parse(after_json),
-      }));
+      .all(...params, pageSize, (page - 1) * pageSize)
+      .map(({ before_json, after_json, before_name, after_name, ...row }) => {
+        const before = JSON.parse(before_json);
+        const after = JSON.parse(after_json);
+        if (row.entityType === "period_assignment") {
+          if (before) before.executorName = before_name;
+          if (after) after.executorName = after_name;
+        }
+        return { ...row, before, after };
+      });
     res.json({ items, total, page, pageSize });
   });
   app.post("/api/imports/registry", (req, res) => {
@@ -321,9 +362,12 @@ export function createApp(
     keys(req.query, []);
     res.status(201).json(importRegistry(database, req.user.id, req.body));
   });
+  mountResultRoutes(app, database, { today, evidence });
+  mountEvidenceRoutes(app, database, evidence);
   app.use("/api", (_req, _res) => missing());
   app.use(express.static(webBuild));
-  app.use((error, _req, res, _next) => {
+  app.use((error, _req, res, next) => {
+    if (res.headersSent) return next(error);
     let status = error.status || 500,
       code = error.code || "internal_error",
       message = error.message;
@@ -349,7 +393,7 @@ export function createApp(
         code = "internal_error";
       }
     }
-    if (status >= 500) {
+    if (status >= 500 && !(error instanceof ApiError && code === "insufficient_storage")) {
       code = "internal_error";
       message = "Внутрішня помилка сервера";
     }

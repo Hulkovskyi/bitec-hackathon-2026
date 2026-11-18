@@ -129,9 +129,10 @@ test("migration and explicit seed are repeatable without overwriting data", () =
       db.prepare("SELECT title FROM measures WHERE id=?").get(id(501)).title,
       "Збережена зміна",
     );
-    assert.equal(
-      db.prepare("SELECT count(*) AS n FROM schema_migrations").get().n,
-      1,
+    assert.deepEqual(
+      db.prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .all().map(({ version }) => version),
+      [1, 2],
     );
     assert.equal(db.prepare("PRAGMA foreign_keys").get().foreign_keys, 1);
   } finally {
