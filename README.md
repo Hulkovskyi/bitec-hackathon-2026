@@ -13,11 +13,11 @@
 
 ![Реєстр і картка синтетичного заходу очима координатора](docs/images/registry-demo.jpg)
 
-Етапи 0 і 1 прийнято в публічну `main`. Перенесення етапу 2 проходить публічне рев’ю. Сигнали, панелі, звіт та відео заплановані далі. [Поточний стан](docs/PROGRESS.md) · [План етапів](docs/PROJECT_STAGES.md)
+Етапи 0–2 прийнято в публічну `main`. Сигнали, панелі, звіт та відео заплановані далі. [Поточний стан](docs/PROGRESS.md) · [План етапів](docs/PROJECT_STAGES.md)
 
 ## Як запустити
 
-Потрібні Git, Node.js 24 і npm. До злиття PR етапу 2 після клонування виконайте `git switch codex/stage-02-workflow`. Після злиття достатньо клонувати основну гілку.
+Потрібні Git, Node.js 24 і npm. Клонуйте основну гілку.
 
 ```bash
 git clone https://github.com/Hulkovskyi/bitec-hackathon-2026.git && cd bitec-hackathon-2026
