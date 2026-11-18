@@ -1,0 +1,20 @@
+{
+  "name": "digital-anti-corruption-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "dev:api": "npm run dev --workspace @dacm/api",
+    "dev:web": "npm run dev --workspace @dacm/web",
+    "build": "npm run build --workspace @dacm/web",
+    "test": "npm test --workspace @dacm/api",
+    "start": "npm start --workspace @dacm/api",
+    "seed": "node apps/api/src/seed.js"
+  }
+}
