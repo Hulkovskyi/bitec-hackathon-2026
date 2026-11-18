@@ -28,3 +28,5 @@ Thumbs.db
 *.sqlite-*
 *.db
 *.db-*
+
+*.evidence/

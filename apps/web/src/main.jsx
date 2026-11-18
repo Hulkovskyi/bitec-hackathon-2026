@@ -1,5 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { ResultPanel } from "./ResultPanel.jsx";
+import { halfYears } from "./periods.js";
 import "./styles.css";
 
 const roleNames = {
@@ -13,7 +15,9 @@ async function api(path, options = {}) {
   const response = await fetch("/api" + path, {
     ...options,
     headers: {
-      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(options.body && !(options.body instanceof FormData)
+        ? { "Content-Type": "application/json" }
+        : {}),
       ...options.headers,
     },
   });
@@ -189,24 +193,34 @@ function Program({ program, user }) {
     [error, setError] = useState(null);
   const [page, setPage] = useState(1),
     [section, setSection] = useState(""),
+    [periodKey, setPeriodKey] = useState(""),
     [refresh, setRefresh] = useState(0),
     [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState(null),
     [editing, setEditing] = useState(false),
     [detailLoading, setDetailLoading] = useState(false);
   const detailRequest = useRef(null);
-  useEffect(() => () => detailRequest.current?.abort(), []);
+  const detailView = useRef(0);
+  useEffect(() => () => {
+    detailView.current += 1;
+    detailRequest.current?.abort();
+  }, []);
+  const reflectPlanLock = useCallback((id, planFrozen) => {
+    setSelected((current) => current?.id === id && current.planFrozen !== planFrozen
+      ? { ...current, planFrozen }
+      : current);
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    setResult(null);
     const query = new URLSearchParams({
       programId: program.id,
       page: String(page),
       pageSize: "20",
       ...(section ? { sectionId: section } : {}),
+      ...(periodKey ? { periodKey } : {}),
     });
     Promise.all([
       api(`/programs/${program.id}/registry-options`, {
@@ -215,6 +229,7 @@ function Program({ program, user }) {
       api("/measures?" + query, { signal: controller.signal }),
     ])
       .then(([o, r]) => {
+        if (controller.signal.aborted) return;
         setOptions(o);
         setResult(r);
       })
@@ -225,8 +240,9 @@ function Program({ program, user }) {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [program.id, page, section, refresh]);
+  }, [program.id, page, section, periodKey, refresh]);
   function clearDetail() {
+    detailView.current += 1;
     detailRequest.current?.abort();
     detailRequest.current = null;
     setDetailLoading(false);
@@ -235,6 +251,7 @@ function Program({ program, user }) {
   }
   function changePage(offset) {
     clearDetail();
+    setResult(null);
     setPage((p) => p + offset);
   }
   async function open(id) {
@@ -244,7 +261,8 @@ function Program({ program, user }) {
     setDetailLoading(true);
     setError(null);
     try {
-      const measure = await api("/measures/" + id, {
+      const query = periodKey ? `?${new URLSearchParams({ periodKey })}` : "";
+      const measure = await api("/measures/" + id + query, {
         signal: controller.signal,
       });
       if (!controller.signal.aborted) setSelected(measure);
@@ -257,10 +275,32 @@ function Program({ program, user }) {
       }
     }
   }
-  function saved(value) {
-    setSelected(value);
+  function beginSave() {
+    const originView = detailView.current;
+    return (value) => {
+      // The write still changes the registry after its form has been left.
+      setRefresh((n) => n + 1);
+      if (detailView.current !== originView) return;
+
+      const compatiblePeriod = value.scheduleType === "one_time"
+        ? periodKey === "once"
+        : halfYears(value.effectiveFrom, program.periodEnd).some(({ key }) => key === periodKey);
+      if (periodKey && compatiblePeriod) {
+        open(value.id);
+      } else {
+        if (periodKey) {
+          setPeriodKey("");
+          setPage(1);
+          setResult(null);
+        }
+        setSelected(value);
+        setEditing(false);
+      }
+    };
+  }
+  function closeForm() {
+    detailView.current += 1;
     setEditing(false);
-    setRefresh((n) => n + 1);
   }
   return (
     <section>
@@ -282,24 +322,37 @@ function Program({ program, user }) {
           </button>
         )}
       </div>
-      <label>
-        Розділ
-        <select
-          value={section}
-          onChange={(e) => {
+      <div className="form-grid">
+        <label>
+          Розділ
+          <select value={section} onChange={(e) => {
+            clearDetail();
+            setResult(null);
             setSection(e.target.value);
             setPage(1);
+          }}>
+            <option value="">Усі доступні розділи</option>
+            {options?.sections.map((s) => (
+              <option key={s.id} value={s.id}>{s.code}. {s.title}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Період реєстру
+          <select value={periodKey} onChange={(e) => {
             clearDetail();
-          }}
-        >
-          <option value="">Усі доступні розділи</option>
-          {options?.sections.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.code}. {s.title}
-            </option>
-          ))}
-        </select>
-      </label>
+            setResult(null);
+            setPeriodKey(e.target.value);
+            setPage(1);
+          }}>
+            <option value="">Поточний перегляд</option>
+            <option value="once">Одноразові заходи</option>
+            {halfYears(program.periodStart, program.periodEnd).map(({ key, label }) => (
+              <option key={key} value={key}>{label}</option>
+            ))}
+          </select>
+        </label>
+      </div>
       <ErrorMessage error={error} />
       {error && (
         <button className="secondary" onClick={() => setRefresh((n) => n + 1)}>
@@ -357,7 +410,9 @@ function Program({ program, user }) {
               </table>
             </div>
           ) : (
-            <p className="empty">У цьому розділі немає доступних заходів.</p>
+            <p className="empty">{periodKey
+              ? "За вибраний період немає доступних заходів."
+              : "У цьому розділі немає доступних заходів."}</p>
           )}
           <nav aria-label="Сторінки реєстру">
             <button
@@ -415,8 +470,19 @@ function Program({ program, user }) {
             <dd>{selected.version}</dd>
           </dl>
           {user.role === "coordinator" && (
-            <button onClick={() => setEditing(true)}>Редагувати захід</button>
+            selected.planFrozen
+              ? <p className="count">План зафіксовано після подання результату.</p>
+              : <button onClick={() => setEditing(true)}>Редагувати захід</button>
           )}
+          <ResultPanel
+            key={`${selected.id}:${selected.periodKey ?? periodKey}`}
+            measure={selected}
+            program={program}
+            user={user}
+            options={options}
+            api={api}
+            onPlanLockChange={reflectPlanLock}
+          />
         </article>
       )}
       {editing && options && (
@@ -425,8 +491,8 @@ function Program({ program, user }) {
           original={selected}
           options={options}
           program={program}
-          onSaved={saved}
-          onCancel={() => setEditing(false)}
+          onSaveStart={beginSave}
+          onCancel={closeForm}
           onReload={() => open(selected.id)}
         />
       )}
@@ -437,14 +503,18 @@ function MeasureForm({
   original,
   options,
   program,
-  onSaved,
+  onSaveStart,
   onCancel,
   onReload,
 }) {
   const firstDepartment = options.departments[0]?.id || "";
   const [value, setValue] = useState(() =>
     original
-      ? { ...original, indicator: { ...original.indicator } }
+      ? {
+          ...original,
+          executorId: original.baseExecutorId ?? original.executorId,
+          indicator: { ...original.indicator },
+        }
       : {
           sectionId: options.sections[0]?.id || "",
           departmentId: firstDepartment,
@@ -477,6 +547,7 @@ function MeasureForm({
     options.sections.find((s) => s.id === value.sectionId)?.code === 2;
   async function submit(event) {
     event.preventDefault();
+    const finishSave = onSaveStart();
     setBusy(true);
     setError(null);
     const body = Object.fromEntries(
@@ -502,7 +573,7 @@ function MeasureForm({
       body.active = value.active;
     }
     try {
-      onSaved(
+      finishSave(
         await api("/measures" + (original ? "/" + original.id : ""), {
           method: original ? "PATCH" : "POST",
           body: JSON.stringify(body),
@@ -569,7 +640,7 @@ function MeasureForm({
             </select>
           </label>
           <label>
-            Виконавець
+            {original ? "Базовий виконавець" : "Виконавець"}
             <select
               required
               value={value.executorId}

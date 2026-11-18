@@ -41,14 +41,52 @@ export function scope(db, user, programId, departmentId) {
       .get(user.id, programId, departmentId)
   );
 }
-export function access(user) {
-  if (user.role === "admin") return { sql: "1=1", params: [] };
-  return {
-    sql: `EXISTS (SELECT 1 FROM user_scopes us WHERE us.user_id=? AND us.program_id=s.program_id AND us.department_id=m.department_id)${user.role === "executor" ? " AND m.executor_id=?" : ""}`,
-    params: user.role === "executor" ? [user.id, user.id] : [user.id],
-  };
+export function access(user, { periodKey, today = kyivDate() } = {}) {
+  const conditions = [];
+  const params = [];
+  if (user.role !== "admin") {
+    conditions.push(`EXISTS (
+      SELECT 1 FROM user_scopes us
+      WHERE us.user_id=? AND us.program_id=s.program_id AND us.department_id=m.department_id
+    )`);
+    params.push(user.id);
+  }
+
+  const currentHalf = `${today.slice(0, 4)}-H${today.slice(5, 7) <= "06" ? "1" : "2"}`;
+  const period = periodKey === undefined ? currentHalf : periodKey;
+  if (typeof period !== "string" || (period !== "once" && !/^\d{4}-H[12]$/.test(period)))
+    invalid("Некоректний період заходу");
+
+  const year = period.slice(0, 4);
+  const halfStart = year + (period.endsWith("H1") ? "-01-01" : "-07-01");
+  const halfEnd = year + (period.endsWith("H1") ? "-06-30" : "-12-31");
+  const continuous = `(m.schedule_type='continuous' AND m.effective_from<=?
+    AND EXISTS (SELECT 1 FROM programs p WHERE p.id=s.program_id AND p.period_end>=?))`;
+
+  if (periodKey === "once") {
+    conditions.push("m.schedule_type='one_time'");
+  } else if (periodKey !== undefined || user.role === "executor") {
+    conditions.push(periodKey === undefined
+      ? `(m.schedule_type='one_time' OR ${continuous})`
+      : continuous);
+    params.push(halfEnd, halfStart);
+  }
+  const executor = `COALESCE((
+    SELECT a.executor_id FROM period_assignments a WHERE a.measure_id=m.id
+    AND a.period_key=CASE WHEN m.schedule_type='one_time' THEN 'once' ELSE ? END
+  ), m.executor_id)`;
+  if (user.role === "executor") {
+    conditions.push(`${executor}=?`);
+    params.push(period, user.id);
+  }
+  return { sql: conditions.join(" AND ") || "1=1", params, executor, period };
 }
-export const selectMeasure = `SELECT m.*,s.program_id,i.id AS indicator_id,i.title AS indicator_title,i.unit,i.baseline,i.target,i.direction FROM measures m JOIN sections s ON s.id=m.section_id JOIN indicators i ON i.measure_id=m.id`;
+const measureColumns = "m.*,s.program_id,i.id AS indicator_id,i.title AS indicator_title,i.unit,i.baseline,i.target,i.direction";
+const measureTables = "FROM measures m JOIN sections s ON s.id=m.section_id JOIN indicators i ON i.measure_id=m.id";
+export const selectMeasure = `SELECT ${measureColumns} ${measureTables}`;
+export const selectPeriodMeasure = (rule) =>
+  `SELECT ${measureColumns}, ${rule.executor} AS effective_executor_id ${measureTables}`;
+
 export function measure(row) {
   return {
     id: row.id,
@@ -77,13 +115,39 @@ export function measure(row) {
     },
   };
 }
-export function getMeasure(db, user, id) {
-  const rule = access(user);
+export function getMeasure(db, user, id, options) {
+  const rule = access(user, options);
   const row = db
-    .prepare(`${selectMeasure} WHERE m.id=? AND ${rule.sql}`)
+    .prepare(`${selectPeriodMeasure(rule)} WHERE m.id=? AND ${rule.sql}`)
+    .get(rule.period, id, ...rule.params);
+  if (!row) missing();
+  const value = periodMeasure(row, user, rule.period);
+  return user.role === "coordinator"
+    ? { ...value, planFrozen: planIsFrozen(db, id) }
+    : value;
+}
+
+export function periodMeasure(row, user, period) {
+  return {
+    ...measure(row),
+    executorId: row.effective_executor_id,
+    periodKey: row.schedule_type === "one_time" ? "once" : period,
+    ...(user.role === "coordinator" ? { baseExecutorId: row.executor_id } : {}),
+  };
+}
+
+// Plan writes and their audit use the stored assignment, independent of the
+// current half-year or a coordinator's period filter.
+function getBaseMeasure(db, user, id) {
+  const rule = access(user);
+  const row = db.prepare(`${selectMeasure} WHERE m.id=? AND ${rule.sql}`)
     .get(id, ...rule.params);
   return row ? measure(row) : missing();
 }
+
+const planIsFrozen = (db, id) => Boolean(db.prepare(
+  "SELECT 1 FROM results WHERE measure_id=? AND status IN ('submitted','approved') LIMIT 1",
+).get(id));
 export function audit(db, actor, action, entityType, entityId, before, after) {
   db.prepare("INSERT INTO audit_events VALUES (?,?,?,?,?,?,?,?)").run(
     randomUUID(),
@@ -246,13 +310,17 @@ export function saveMeasure(db, user, input, id, { today = kyivDate } = {}) {
   if (id) positive(input.version);
   if (Object.hasOwn(input, "active")) flag(input.active);
   return transaction(db, () => {
-    const before = id ? getMeasure(db, user, id) : null;
+    const dateToday = today();
+    const before = id ? getBaseMeasure(db, user, id) : null;
     if (before && before.version !== input.version)
       throw new ApiError(
         409,
         "version_conflict",
         "Запис змінено. Оновіть картку та повторіть редагування.",
       );
+    if (before && planIsFrozen(db, id)) {
+      throw new ApiError(409, "plan_frozen", "План заходу зафіксовано після подання результату");
+    }
     const combined = before
       ? { ...before, indicator: { ...before.indicator }, ...input }
       : input;
@@ -263,8 +331,22 @@ export function saveMeasure(db, user, input, id, { today = kyivDate } = {}) {
       combined,
       user,
       before?.programId,
-      today(),
+      dateToday,
     );
+    if (before && (
+      value.departmentId !== before.departmentId ||
+      value.executorId !== before.executorId ||
+      value.scheduleType !== before.scheduleType
+    ) && db.prepare(
+      `SELECT 1 FROM results WHERE measure_id=?
+       UNION ALL SELECT 1 FROM period_assignments WHERE measure_id=? LIMIT 1`,
+    ).get(id, id)) {
+      throw new ApiError(
+        409,
+        "plan_frozen",
+        "Результат або призначення вже існує. Змінюйте виконавця через призначення на період.",
+      );
+    }
     if (!id) id = insertMeasure(db, value);
     else {
       const result = db
@@ -293,7 +375,7 @@ export function saveMeasure(db, user, input, id, { today = kyivDate } = {}) {
         "UPDATE indicators SET title=?,unit=?,baseline=?,target=?,direction=? WHERE measure_id=?",
       ).run(i.title, i.unit, i.baseline, i.target, i.direction, id);
     }
-    const after = getMeasure(db, user, id);
+    const after = getBaseMeasure(db, user, id);
     audit(
       db,
       user.id,
@@ -303,7 +385,7 @@ export function saveMeasure(db, user, input, id, { today = kyivDate } = {}) {
       before,
       after,
     );
-    return after;
+    return getMeasure(db, user, id, { today: dateToday });
   });
 }
 
@@ -455,7 +537,7 @@ export function importRegistry(
         for (const row of payload[group]) {
           const after =
             group === "measures"
-              ? getMeasure(db, { id: actor, role: "admin" }, uuid(row.id))
+              ? getBaseMeasure(db, { id: actor, role: "admin" }, uuid(row.id))
               : row;
           audit(
             db,

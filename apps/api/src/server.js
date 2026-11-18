@@ -16,7 +16,10 @@ const database = new DatabaseSync(databasePath);
 
 migrate(database);
 
-createApp(database, { demoMode: process.env.DEMO_MODE === "true" }).listen(
+createApp(database, {
+  demoMode: process.env.DEMO_MODE === "true",
+  evidenceDirectory: databasePath + ".evidence",
+}).listen(
   port,
   host,
   () => {
