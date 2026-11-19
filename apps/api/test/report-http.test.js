@@ -214,12 +214,14 @@ test("W5 effective start and W6 early completion place measures in the right hal
   assert.equal(rowFor(h2, early.id), undefined);
   assert.equal(rowFor(h2, newContinuous.id).periodKey, "2026-H2");
   assert.equal(rowFor(h2, newContinuous.id).executionState, "not_due");
+  assert.equal(rowFor(h2, newContinuous.id).actualDate, "2026-12-31");
 });
 
 test("continuous results use the exact half-year and late approvals remain in their result period", async (t) => {
   const continuous = measure(501, "CONT", { scheduleType: "continuous", plannedDate: null });
   const late = measure(502, "LATE");
-  const { db, login } = await setup(t, [continuous, late]);
+  const withoutResult = measure(503, "CONT-NO-RESULT", { scheduleType: "continuous", plannedDate: null });
+  const { db, login } = await setup(t, [continuous, late, withoutResult]);
   const h1Id = result(db, 601, continuous, {
     periodKey: "2026-H1", resultDate: "2026-06-15", approvedAt: "2026-07-12T12:00:00.000Z",
   });
@@ -238,12 +240,21 @@ test("continuous results use the exact half-year and late approvals remain in th
   assert.equal(h1Row.actualDate, "2026-06-30");
   assert.equal(h1Row.executionState, "completed");
   assert.equal(rowFor(h1, late.id).resultId, lateId);
+  assert.equal(rowFor(h1, withoutResult.id).actualDate, "2026-06-30");
+  assert.equal(rowFor(h1, withoutResult.id).executionState, "not_approved");
+  assert.equal(rowFor(h1, withoutResult.id).resultId, null);
   const h2Row = rowFor(h2, continuous.id);
   assert.equal(h2Row.resultId, null);
-  assert.equal(h2Row.actualDate, null);
+  assert.equal(h2Row.actualDate, "2026-12-31");
   assert.equal(h2Row.indicator.actual, null);
   assert.equal(h2Row.reviewStatus, "submitted");
   assert.equal(h2Row.executionState, "not_due");
+  assert.equal(h2Row.resultDescription, "");
+  const response = await coordinator(reportUrl(2, { format: "csv" }));
+  checked(response);
+  const csv = parseCsv(response.text);
+  const exported = csv.slice(1).find(([measureId]) => measureId === continuous.id);
+  assert.equal(exported[csv[0].indexOf("Фактичний строк виконання")], "2026-12-31");
   assert.equal(rowFor(h2, late.id), undefined);
   assert.equal(h1.period.cutoff, "2026-06-30");
   assert.equal(h2.period.cutoff, "2026-11-17");
@@ -269,6 +280,9 @@ test("missing approvals distinguish future deadlines from due records and preser
   assert.equal(rowFor(report, today.id).executionState, "not_approved");
   assert.equal(rowFor(report, overdue.id).executionState, "not_approved");
   assert.equal(rowFor(report, overdue.id).reviewStatus, "returned");
+  assert.equal(rowFor(report, future.id).resultDescription, "");
+  assert.equal(rowFor(report, today.id).resultDescription, "Погоджений результат відсутній");
+  assert.equal(rowFor(report, overdue.id).resultDescription, "Погоджений результат відсутній");
   for (const row of rows(report)) {
     assert.equal(row.resultId, null);
     assert.equal(row.resultRevision, null);
@@ -276,8 +290,13 @@ test("missing approvals distinguish future deadlines from due records and preser
     assert.equal(row.actualDate, null);
     assert.equal(row.indicator.actual, null);
     assert.equal(row.indicator.targetReached, null);
-    assert.equal(row.resultDescription, "Погоджений результат відсутній");
   }
+  const response = await coordinator(reportUrl(2, { format: "csv" }));
+  checked(response);
+  const csv = parseCsv(response.text);
+  const descriptionColumn = csv[0].indexOf("Опис результату виконання заходу або пояснення причин невиконання");
+  const futureCsv = csv.slice(1).find(([measureId]) => measureId === future.id);
+  assert.equal(futureCsv[descriptionColumn], "");
   assert.deepEqual(report.summary.counts, {
     completed: 0, partial: 0, not_completed: 0, not_due: 1, not_approved: 2,
   });

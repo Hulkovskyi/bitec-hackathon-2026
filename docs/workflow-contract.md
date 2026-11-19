@@ -110,7 +110,7 @@ cutoff = min(today Europe/Kyiv, period.end). Дозволений звіт за 
 1. Approved completed -> «Виконано», partial -> «Виконано частково», not_completed -> «Не виконано».
 2. Немає approved і строк після cutoff -> «Строк виконання не настав».
 3. Немає approved і строк настав -> «Не виконано / результат не погоджено». reviewStatus окремо показує стан останньої revision обраного періоду; approved resultId/resultRevision посилаються на вибраний погоджений стан. Draft/returned майбутньої revision не затирає його.
-Опис approved: description та nonCompletionReason для partial/not_completed. Якщо approved немає — «Погоджений результат відсутній»; не вигадувати причину. Для continuous фактична дата у звіті — period.end (30.06/31.12) лише якщо є approved результат; без нього порожньо. Для once — actual_date або порожньо.
+Опис approved: description та nonCompletionReason для partial/not_completed. Для not_due опис порожній. Для not_approved показати «Погоджений результат відсутній». Для continuous фактичний строк у звіті завжди дорівнює period.end (30.06/31.12). Стан і дані результату й далі визначаються окремо за погодженою ревізією. Для once — actual_date або порожньо.
 Три заголовки sections брати дослівно з ROADMAP; всі три показувати навіть із нулем рядків. Сортувати section.code, department.code, measure.code, id; однакові коди в різних підрозділах не зливати в один рядок.
 
 Один запит читає спільний знімок SQLite або PostgreSQL у транзакції тільки для читання. CSV RFC 4180, UTF-8 BOM, подвійні лапки екранувати; клітинки, які починаються з =,+,-,@, tab/CR, нейтралізувати як текст для захисту від формул. Назва файла серверна. JSON/CSV/друк/довідка мають однакові id й суми при однаковому snapshot.
