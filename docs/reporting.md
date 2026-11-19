@@ -13,4 +13,4 @@
 
 `GET /api/reports/half-year?programId=…&year=2026&half=2` повертає JSON. Додайте `format=csv` для CSV з UTF‑8 BOM. Текстові поля, які таблиця могла б сприйняти як формулу, екрануються. [Контракт](workflow-contract.md#піврічний-звіт-і-аналітична-довідка)
 
-[Синтетичний CSV H2](examples/half-year-2026-H2.csv) · [Довідка з тієї самої вибірки](examples/half-year-2026-H2-brief.md) · [Перевірка](verification.md)
+[Синтетичний звіт A4](examples/half-year-2026-H2-a4.pdf) · [Синтетичний CSV H2](examples/half-year-2026-H2.csv) · [Довідка з тієї самої вибірки](examples/half-year-2026-H2-brief.md) · [Перевірка](verification.md)

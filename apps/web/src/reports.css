@@ -221,6 +221,7 @@
 }
 
 @media print {
+  :root:has(.report-document),
   body:has(.report-document) {
     background: white;
     color: black;
@@ -260,10 +261,26 @@
 
   .report-document {
     font-size: 10pt;
+    line-height: 1.35;
+  }
+
+  .report-section,
+  .report-brief {
+    margin-top: 14pt;
+  }
+
+  .report-totals {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    margin-bottom: 10pt;
+  }
+
+  .report-totals > div {
+    padding: 4pt 0;
   }
 
   .report-section h3,
-  .report-brief h3 {
+  .report-brief h3,
+  .report-brief h4 {
     break-after: avoid;
   }
 
