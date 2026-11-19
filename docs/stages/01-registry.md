@@ -26,4 +26,4 @@
 
 [PR №3](https://github.com/Hulkovskyi/bitec-hackathon-2026/pull/3) злитий 18.11.2026. SHA публічної `main` після злиття — `7ed5b4d878ef46971edd922b4e63b15a542de419`. [7ed5b4d](https://github.com/Hulkovskyi/bitec-hackathon-2026/commit/7ed5b4d878ef46971edd922b4e63b15a542de419)
 
-Наступний етап ведеться у приватному Issue №2. Початок роботи — міграція 002 і тести погодження й аудиту. [Контракт наступного етапу](../workflow-contract.md)
+Результат виконання, докази й погодження прийнято на [публічному етапі 2](02-workflow.md).
