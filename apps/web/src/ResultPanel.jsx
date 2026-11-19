@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { halfYears } from "./periods.js";
 import "./results.css";
 
+const evidenceLimitMiB = import.meta.env.VITE_HOSTED_DEMO === "true" ? 4 : 5;
+
 const statusLabels = {
   draft: "Чернетка",
   submitted: "На перевірці",
@@ -63,7 +65,7 @@ function RequestError({ error, onRetry }) {
   );
 }
 
-export function ResultPanel({ measure, program, user, options, api, onPlanLockChange }) {
+export function ResultPanel({ measure, program, user, options, api, onPlanLockChange, sourceResultId }) {
   const periods = periodsFor(measure, program);
   const today = kyivToday();
   const activePeriod = periods.find((period) => period.start <= today && period.end >= today);
@@ -75,7 +77,10 @@ export function ResultPanel({ measure, program, user, options, api, onPlanLockCh
   return (
     <section className="result-panel" aria-label="Результат виконання заходу">
       <header className="result-panel-heading">
-        <h3>Результат виконання</h3>
+        <div>
+          <h3>Результат виконання</h3>
+          <p className="result-measure-title">{measure.title}</p>
+        </div>
         {periods.length > 1 && (
           <label className="result-period">
             Період виконання
@@ -93,6 +98,7 @@ export function ResultPanel({ measure, program, user, options, api, onPlanLockCh
           onPlanLockChange={onPlanLockChange}
           options={options}
           period={period}
+          sourceResultId={period.key === measure.periodKey ? sourceResultId : null}
           today={today}
           user={user}
         />
@@ -101,9 +107,9 @@ export function ResultPanel({ measure, program, user, options, api, onPlanLockCh
   );
 }
 
-function PeriodResults({ api, measure, onPlanLockChange, options, period, today, user }) {
+function PeriodResults({ api, measure, onPlanLockChange, options, period, sourceResultId, today, user }) {
   const [data, setData] = useState(null);
-  const [resultId, setResultId] = useState("");
+  const [resultId, setResultId] = useState(sourceResultId ?? "");
   const [refresh, setRefresh] = useState(0);
   const [requestError, setRequestError] = useState(null);
   const [createBusy, setCreateBusy] = useState(false);
@@ -134,14 +140,15 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, today,
           .filter((item) => item.periodKey === period.key)
           .sort((a, b) => b.revision - a.revision);
         setData({ items, assignment: currentAssignment });
-        setResultId((current) => items.some((item) => item.id === current)
-          ? current : items[0]?.id || "");
+        setResultId((current) => current && (
+          current === sourceResultId || items.some((item) => item.id === current)
+        ) ? current : items[0]?.id || "");
       })
       .catch((error) => {
         if (!controller.signal.aborted) setRequestError(error);
       });
     return () => controller.abort();
-  }, [api, assignmentPath, canAssign, canExecute, measure.id, onPlanLockChange, period.key, refresh, resultPath]);
+  }, [api, assignmentPath, canAssign, canExecute, measure.id, onPlanLockChange, period.key, refresh, resultPath, sourceResultId]);
 
   function reload() {
     setRequestError(null);
@@ -169,6 +176,8 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, today,
   }
 
   const { items, assignment } = data;
+  const selectedResult = items.find((item) => item.id === resultId);
+  const sourceUnavailable = sourceResultId && resultId === sourceResultId && !selectedResult;
   const latest = items[0];
   const openPeriod = measure.active &&
     (!latest || (latest.status === "approved" && latest.outcome !== "completed"));
@@ -179,47 +188,55 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, today,
   return (
     <>
       <RequestError error={requestError} onRetry={reload} />
-      {canAssign && assignment && (
-        <AssignmentForm
-          key={`${assignment.executorId}-${assignment.version}`}
-          api={api}
-          path={assignmentPath}
-          assignment={assignment}
-          departmentId={measure.departmentId}
-          executors={options?.executors || []}
-          locked={!allowAssign}
-          onChanged={reload}
-          periodKey={period.key}
-        />
+      {sourceUnavailable && (
+        <p role="status" className="result-muted">Ревізія із сигналу недоступна в цьому періоді.</p>
       )}
-      {canAssign && (
-        <AssignmentHistory
-          api={api}
-          measureId={measure.id}
-          periodKey={period.key}
-          refresh={refresh}
-        />
-      )}
-      <div className="result-toolbar">
-        {items.length > 0 ? (
-          <label>
-            Версія результату
-            <select value={resultId} onChange={(event) => setResultId(event.target.value)}>
-              {items.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.revision} · {statusText(item)}
-                </option>
-              ))}
-            </select>
-          </label>
-        ) : <p className="result-muted">За цей період ще немає результату.</p>}
-        {ownAssignment && openPeriod && (
-          <button type="button" disabled={createBusy} onClick={createDraft}>
-            {latest ? "Створити наступну версію" : "Створити чернетку"}
-          </button>
+      <div className="result-controls">
+        {canAssign && (
+          <div className="result-assignment-tools">
+            {assignment && (
+              <AssignmentForm
+                key={`${assignment.executorId}-${assignment.version}`}
+                api={api}
+                path={assignmentPath}
+                assignment={assignment}
+                departmentId={measure.departmentId}
+                executors={options?.executors || []}
+                locked={!allowAssign}
+                onChanged={reload}
+                periodKey={period.key}
+              />
+            )}
+            <AssignmentHistory
+              api={api}
+              measureId={measure.id}
+              periodKey={period.key}
+              refresh={refresh}
+            />
+          </div>
         )}
+        <div className="result-toolbar">
+          {items.length > 0 ? (
+            <label>
+              Версія результату
+              <select value={selectedResult?.id ?? ""} onChange={(event) => setResultId(event.target.value)}>
+                {!selectedResult && <option value="" disabled>Оберіть версію</option>}
+                {items.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.revision} · {statusText(item)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : <p className="result-muted">За цей період ще немає результату.</p>}
+          {ownAssignment && openPeriod && (
+            <button type="button" disabled={createBusy} onClick={createDraft}>
+              {latest ? "Створити наступну версію" : "Створити чернетку"}
+            </button>
+          )}
+        </div>
       </div>
-      {resultId && (
+      {selectedResult && (
         <ResultDetail
           key={resultId}
           api={api}
@@ -231,6 +248,7 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, today,
           onChanged={reload}
           ownAssignment={ownAssignment}
           unit={measure.indicator.unit}
+          executors={options?.executors || []}
         />
       )}
     </>
@@ -356,7 +374,7 @@ function draftFields(result) {
 }
 
 function ResultDetail({
-  api, onChanged, ownAssignment, period, refresh, resultId, today, unit, user,
+  api, executors, onChanged, ownAssignment, period, refresh, resultId, today, unit, user,
 }) {
   const [result, setResult] = useState(null);
   const [fields, setFields] = useState(null);
@@ -448,77 +466,93 @@ function ResultDetail({
   }
 
   const returnedReview = (result.reviews || []).findLast((item) => item.decision === "return");
+  const executorName = executors.find(({ id }) => id === result.executorId)?.displayName ||
+    (result.executorId === user.id ? user.displayName : null);
   return (
     <div className="result-detail">
-      <p className="result-state" role="status">
-        <strong>{statusText(result)}</strong>
-        <span>Версія {result.revision}</span>
-      </p>
-      {result.status === "returned" && returnedReview && (
-        <p className="result-return-note"><strong>Коментар координатора</strong><br />{returnedReview.comment}</p>
-      )}
       <RequestError error={error} onRetry={error?.status === 409 || error?.code === "version_conflict"
         ? () => { setError(null); onChanged(); } : null} />
-      {editable ? (
-        <DraftForm
-          busy={busyOrLoading}
-          dirty={dirty}
-          fields={fields}
-          onChange={changeField}
-          onSave={save}
-          period={period}
-          today={today}
-          unit={unit}
+      <div className="result-workspace">
+        <EvidenceArea
+          api={api}
+          key={result.id}
+          disabled={busyOrLoading || dirty}
+          editable={editable}
+          canCheck={canCheck}
+          result={result}
+          onUpload={(body) => act("upload", `${path}/evidence`, { method: "POST", body })}
         />
-      ) : (
-        <dl>
-          <dt>Підсумок</dt><dd>{outcomeLabels[result.outcome] || "Не зазначено"}</dd>
-          <dt>Опис</dt><dd className="result-text">{result.description || "Не зазначено"}</dd>
-          {result.nonCompletionReason && <><dt>Причина</dt><dd className="result-text">{result.nonCompletionReason}</dd></>}
-          <dt>Дата результату</dt><dd>{result.resultDate || "Не зазначено"}</dd>
-          {result.measuredValue != null && <><dt>Значення індикатора</dt><dd>{result.measuredValue} {unit}</dd></>}
-        </dl>
-      )}
-      <EvidenceArea
-        api={api}
-        key={result.id}
-        disabled={busyOrLoading || dirty}
-        editable={editable}
-        canCheck={canCheck}
-        result={result}
-        onUpload={(body) => act("upload", `${path}/evidence`, { method: "POST", body })}
-      />
-      {editable && (
-        <div className="result-submit">
-          {dirty && <p className="result-muted">Збережіть зміни перед завантаженням файлу або поданням.</p>}
-          <button
-            type="button"
-            disabled={busyOrLoading || dirty}
-            onClick={() => act("submit", `${path}/submit`, json("POST", { version: result.version }))}
-          >Подати на перевірку</button>
-        </div>
-      )}
-      {canReview && (
-        <div className="result-review">
-          <label>
-            Коментар до рішення
-            <textarea value={comment} disabled={busyOrLoading} maxLength={4000} onChange={(event) => setComment(event.target.value)} />
-          </label>
-          <div className="result-action-row">
-            <button
-              className="secondary"
-              disabled={busyOrLoading || !comment.trim()}
-              onClick={() => act("return", `${path}/review`, json("POST", {
-                decision: "return", comment, version: result.version,
-              }))}
-            >Повернути на доопрацювання</button>
-            <button disabled={busyOrLoading} onClick={() => act("approve", `${path}/review`, json("POST", {
-              decision: "approve", comment, version: result.version,
-            }))}>Погодити результат</button>
+        <section className="result-review-pane">
+          <h4>Результат</h4>
+          <div className="result-state" role="status">
+            <strong className={`result-status result-status-${result.status}`}>{statusText(result)}</strong>
+            <span>Версія {result.revision}</span>
           </div>
-        </div>
-      )}
-      <ResultHistory api={api} canAudit={canAudit} result={result} user={user} />
+          {result.submittedAt && (
+            <p className="result-submitted">
+              Подано <time dateTime={result.submittedAt}>{dateTime(result.submittedAt)}</time>
+            </p>
+          )}
+          {result.status === "returned" && returnedReview && (
+            <p className="result-return-note"><strong>Коментар координатора</strong><br />{returnedReview.comment}</p>
+          )}
+          {editable ? (
+            <DraftForm
+              busy={busyOrLoading}
+              dirty={dirty}
+              fields={fields}
+              onChange={changeField}
+              onSave={save}
+              period={period}
+              today={today}
+              unit={unit}
+            />
+          ) : (
+            <dl className="result-facts">
+              {executorName && <><dt>Виконавець</dt><dd>{executorName}</dd></>}
+              <dt>Підсумок</dt><dd>{outcomeLabels[result.outcome] || "Не зазначено"}</dd>
+              <dt>Опис</dt><dd className="result-text">{result.description || "Не зазначено"}</dd>
+              {result.nonCompletionReason && <><dt>Причина</dt><dd className="result-text">{result.nonCompletionReason}</dd></>}
+              <dt>Дата результату</dt><dd>{result.resultDate || "Не зазначено"}</dd>
+              {result.measuredValue != null && <><dt>Значення індикатора</dt><dd>{result.measuredValue} {unit}</dd></>}
+            </dl>
+          )}
+          <ResultHistory api={api} canAudit={canAudit} result={result} user={user} />
+          {editable && (
+            <div className="result-submit">
+              {dirty && <p className="result-muted">Збережіть зміни перед завантаженням файлу або поданням.</p>}
+              <button
+                type="button"
+                disabled={busyOrLoading || dirty}
+                onClick={() => act("submit", `${path}/submit`, json("POST", { version: result.version }))}
+              >Подати на перевірку</button>
+            </div>
+          )}
+          {canReview && (
+            <div className="result-review">
+              <label>
+                Коментар до рішення
+                <textarea value={comment} disabled={busyOrLoading} maxLength={4000}
+                  placeholder="Опишіть, що потрібно виправити…"
+                  onChange={(event) => setComment(event.target.value)} />
+              </label>
+              <div className="result-review-actions">
+                <button type="button" disabled={busyOrLoading} onClick={() => act("approve", `${path}/review`, json("POST", {
+                  decision: "approve", comment, version: result.version,
+                }))}>Погодити результат</button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={busyOrLoading || !comment.trim()}
+                  onClick={() => act("return", `${path}/review`, json("POST", {
+                    decision: "return", comment, version: result.version,
+                  }))}
+                >Повернути на доопрацювання</button>
+              </div>
+            </div>
+          )}
+        </section>
+      </div>
     </div>
   );
 }
@@ -571,19 +605,115 @@ function DraftForm({ busy, dirty, fields, onChange, onSave, period, today, unit 
   );
 }
 
+const previewMedia = new Set(["image/png", "image/jpeg", "text/plain"]);
+const textPreviewLimit = 32 * 1024;
+const evidenceTypes = {
+  "application/pdf": "PDF",
+  "image/png": "PNG",
+  "image/jpeg": "JPEG",
+  "text/plain": "TXT",
+};
+const sizeFormat = new Intl.NumberFormat("uk-UA", { maximumFractionDigits: 1 });
+
+const evidenceDownload = (id) => `/api/evidence/${encodeURIComponent(id)}/download`;
+
+function fileSize(bytes) {
+  if (bytes < 1024) return `${sizeFormat.format(bytes)} Б`;
+  if (bytes < 1024 ** 2) return `${sizeFormat.format(bytes / 1024)} КіБ`;
+  return `${sizeFormat.format(bytes / 1024 ** 2)} МіБ`;
+}
+
+function EvidenceIcon({ download = false }) {
+  return (
+    <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      {download
+        ? <path d="M12 3v12m-4-4 4 4 4-4M5 17v4h14v-4" />
+        : <path d="M6 3h8l4 4v14H6zM14 3v5h4M9 12h6m-6 4h6" />}
+    </svg>
+  );
+}
+
+function EvidencePreview({ file }) {
+  const [preview, setPreview] = useState(null);
+  const [error, setError] = useState(null);
+  const canPreview = previewMedia.has(file.mediaType);
+
+  useEffect(() => {
+    if (!canPreview) return;
+    const controller = new AbortController();
+    let imageUrl;
+
+    async function load() {
+      // The same-origin download route checks access and the stored file digest.
+      const response = await fetch(evidenceDownload(file.id), { signal: controller.signal, redirect: "error" });
+      if (response.status === 409) throw new Error("Цілісність файлу не підтверджено.");
+      if (!response.ok) throw new Error("Не вдалося завантажити файл для перегляду.");
+      const mediaType = response.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
+      if (mediaType !== file.mediaType) throw new Error("Тип файлу не збігається з даними доказу.");
+
+      const blob = await response.blob();
+      if (controller.signal.aborted) return;
+      if (mediaType === "text/plain") {
+        const text = await blob.slice(0, textPreviewLimit).text();
+        if (!controller.signal.aborted) setPreview({ text, truncated: blob.size > textPreviewLimit });
+      } else {
+        imageUrl = URL.createObjectURL(blob);
+        setPreview({ imageUrl });
+      }
+    }
+
+    load().catch((cause) => {
+      if (!controller.signal.aborted) setError(cause.message);
+    });
+    return () => {
+      controller.abort();
+      if (imageUrl) URL.revokeObjectURL(imageUrl);
+    };
+  }, [canPreview, file.id, file.mediaType]);
+
+  return (
+    <div className="result-preview" aria-label="Перегляд доказу">
+      <div className="result-preview-bar">
+        <strong>{canPreview ? "Перегляд доказу" : "Документ"}</strong>
+        <span>{evidenceTypes[file.mediaType]} · {fileSize(file.byteSize)}</span>
+      </div>
+      {!canPreview ? (
+        <div className="result-preview-message">
+          <span className="result-file-symbol"><EvidenceIcon /></span>
+          <p>Завантажте файл, щоб переглянути документ.</p>
+        </div>
+      ) : error ? (
+        <p className="result-preview-message" role="status">{error}</p>
+      ) : preview?.imageUrl ? (
+        <img src={preview.imageUrl} alt={file.originalName}
+          onError={() => setError("Не вдалося відобразити зображення.")} />
+      ) : preview ? (
+        <>
+          <pre>{preview.text || "Файл не містить тексту."}</pre>
+          {preview.truncated && <p className="result-preview-limit">Повний текст доступний у завантаженому файлі.</p>}
+        </>
+      ) : <p className="result-preview-message" role="status">Завантажуємо перегляд доказу…</p>}
+    </div>
+  );
+}
+
 function EvidenceArea({ api, canCheck, disabled, editable, onUpload, result }) {
   const [file, setFile] = useState(null);
   const [replacement, setReplacement] = useState("");
+  const [previewId, setPreviewId] = useState("");
   const [checked, setChecked] = useState(null);
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState(null);
   const current = result.evidence || [];
   const currentIds = new Set(current.map((item) => item.id));
   const older = (result.evidenceHistory || []).filter((item) => !currentIds.has(item.id));
+  const previewFile = current.find(({ id }) => id === previewId) ?? current[0];
+  const exceedsLimit = file?.size > evidenceLimitMiB * 1024 ** 2;
 
   async function upload(event) {
     event.preventDefault();
-    if (!file || disabled) return;
+    if (!file || disabled || exceedsLimit) return;
     const form = event.currentTarget;
     const body = new FormData();
     body.set("file", file);
@@ -610,20 +740,39 @@ function EvidenceArea({ api, canCheck, disabled, editable, onUpload, result }) {
     }
   }
 
-  function evidenceList(files) {
+  function evidenceList(files, selectPreview = false) {
     return (
       <ul className="result-evidence-list">
         {files.map((item) => (
-          <li key={item.id}>
+          <li key={item.id} className={item.id === previewFile?.id ? "result-evidence-current" : undefined}>
             <div className="result-evidence-file">
-              <a href={`/api/evidence/${item.id}/download`} download>{item.originalName}</a>
-              <span className="result-muted">Версія {item.revision}</span>
+              <div className="result-evidence-heading">
+                <span className="result-file-symbol"><EvidenceIcon /></span>
+                <div>
+                  <a href={evidenceDownload(item.id)} download className="result-evidence-link">
+                    {item.originalName}
+                    <EvidenceIcon download />
+                  </a>
+                  <p className="result-file-meta">
+                    <span>Версія {item.revision}</span>
+                    <time dateTime={item.createdAt}>{dateTime(item.createdAt)}</time>
+                  </p>
+                </div>
+              </div>
               <details className="result-digest"><summary>SHA-256</summary><code>{item.sha256}</code></details>
             </div>
-            {canCheck && (
-              <button type="button" className="secondary" disabled={checking} onClick={() => check(item)}>
-                Перевірити цілісність
-              </button>
+            {(selectPreview || canCheck) && (
+              <div className="result-evidence-actions">
+                {selectPreview && (
+                  <button type="button" className="secondary" aria-pressed={previewFile?.id === item.id}
+                    onClick={() => setPreviewId(item.id)}>Переглянути</button>
+                )}
+                {canCheck && (
+                  <button type="button" className="secondary" disabled={checking} onClick={() => check(item)}>
+                    Перевірити цілісність
+                  </button>
+                )}
+              </div>
             )}
           </li>
         ))}
@@ -632,9 +781,14 @@ function EvidenceArea({ api, canCheck, disabled, editable, onUpload, result }) {
   }
 
   return (
-    <div className="result-evidence">
+    <section className="result-evidence">
       <h4>Докази</h4>
-      {current.length ? evidenceList(current) : <p className="result-muted">Актуальних файлів немає.</p>}
+      {previewFile ? (
+        <>
+          {evidenceList(current, current.length > 1)}
+          <EvidencePreview key={previewFile.id} file={previewFile} />
+        </>
+      ) : <p className="result-evidence-empty">Актуальних файлів немає.</p>}
       {older.length > 0 && <details><summary>Історія версій файлів</summary>{evidenceList(older)}</details>}
       <RequestError error={checkError} />
       {checked && (
@@ -666,12 +820,13 @@ function EvidenceArea({ api, canCheck, disabled, editable, onUpload, result }) {
                 onChange={(event) => setFile(event.target.files[0] || null)}
               />
             </label>
-            <p className="result-muted">PDF, PNG, JPEG або TXT · до 5 МіБ</p>
-            <button className="secondary" disabled={!file}>Завантажити доказ</button>
+            <p className="result-muted">PDF, PNG, JPEG або TXT · до {evidenceLimitMiB} МіБ</p>
+            {exceedsLimit && <p role="alert">Файл перевищує {evidenceLimitMiB} МіБ.</p>}
+            <button className="secondary" disabled={!file || exceedsLimit}>Завантажити доказ</button>
           </fieldset>
         </form>
       )}
-    </div>
+    </section>
   );
 }
 

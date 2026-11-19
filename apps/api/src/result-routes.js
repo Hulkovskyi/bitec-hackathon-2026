@@ -34,8 +34,8 @@ function resultJson(row) {
   };
 }
 
-function resultDetail(db, result, user, evidenceStore) {
-  const evidenceHistory = evidenceStore.history(result.id, user);
+async function resultDetail(db, result, user, evidenceStore) {
+  const evidenceHistory = await evidenceStore.history(result.id, user);
   const latest = new Map();
   for (const file of evidenceHistory) {
     if (
@@ -43,7 +43,7 @@ function resultDetail(db, result, user, evidenceStore) {
       file.revision > (latest.get(file.logicalFileId)?.revision ?? 0)
     ) latest.set(file.logicalFileId, file);
   }
-  const reviews = db.prepare(
+  const reviews = await db.prepare(
     `SELECT r.id, r.decision, r.comment, r.actor_id AS actorId, u.display_name AS actorName,
             r.created_at AS createdAt, r.result_version AS resultVersion
      FROM result_reviews r JOIN users u ON u.id=r.actor_id
@@ -57,7 +57,7 @@ function resultDetail(db, result, user, evidenceStore) {
   };
 }
 
-function resultAudit(db, result, user, query) {
+async function resultAudit(db, result, user, query) {
   const { page, pageSize } = pagination(query);
   const executor = user.role === "executor";
   const where = `(a.entity_type='result' AND a.entity_id=?) OR (
@@ -67,17 +67,17 @@ function resultAudit(db, result, user, query) {
     )
   )`;
   const params = executor ? [result.id, result.id, user.id] : [result.id, result.id];
-  const total = db.prepare(
+  const { n: total } = await db.prepare(
     `SELECT count(*) AS n FROM audit_events a WHERE ${where}`,
-  ).get(...params).n;
-  const items = db.prepare(
+  ).get(...params);
+  const rows = await db.prepare(
     `SELECT a.id, a.actor_id AS actorId, u.display_name AS actorName, a.action, a.entity_type AS entityType,
             a.entity_id AS entityId, a.before_json, a.after_json,
             a.occurred_at AS occurredAt
      FROM audit_events a JOIN users u ON u.id=a.actor_id WHERE ${where}
      ORDER BY a.occurred_at, a.id LIMIT ? OFFSET ?`,
-  ).all(...params, pageSize, (page - 1) * pageSize)
-    .map(({ before_json, after_json, ...event }) => ({
+  ).all(...params, pageSize, (page - 1) * pageSize);
+  const items = rows.map(({ before_json, after_json, ...event }) => ({
       ...event,
       before: JSON.parse(before_json),
       after: JSON.parse(after_json),
@@ -86,9 +86,10 @@ function resultAudit(db, result, user, query) {
 }
 
 export function mountResultRoutes(app, db, { today, evidence }) {
-  app.get("/api/measures/:id/results", (req, res) => {
+  app.get("/api/measures/:id/results", async (req, res) => {
     keys(req.query, []);
-    const items = listResults(db, req.user, req.params.id).map((result) => ({
+    const results = await db.transaction(() => listResults(db, req.user, req.params.id), { readOnly: true });
+    const items = results.map((result) => ({
       id: result.id,
       periodKey: result.period_key,
       revision: result.revision,
@@ -99,51 +100,58 @@ export function mountResultRoutes(app, db, { today, evidence }) {
     }));
     res.json({ items });
   });
-  app.post("/api/measures/:id/results", (req, res) => {
+  app.post("/api/measures/:id/results", async (req, res) => {
     keys(req.query, []);
-    const result = createResult(db, req.user, req.params.id, req.body);
+    const result = await createResult(db, req.user, req.params.id, req.body);
     res.status(201).location("/api/results/" + result.id).json(resultJson(result));
   });
-  app.get("/api/measures/:id/assignment", (req, res) => {
+  app.get("/api/measures/:id/assignment", async (req, res) => {
     keys(req.query, ["periodKey"], ["periodKey"]);
-    res.json(readAssignment(db, req.user, req.params.id, req.query.periodKey));
+    const assignment = await db.transaction(() => readAssignment(db, req.user, req.params.id, req.query.periodKey), { readOnly: true });
+    res.json(assignment);
   });
-  app.put("/api/measures/:id/assignment", (req, res) => {
+  app.put("/api/measures/:id/assignment", async (req, res) => {
     keys(req.query, []);
-    res.json(assignExecutor(db, req.user, req.params.id, req.body));
+    res.json(await assignExecutor(db, req.user, req.params.id, req.body));
   });
-  app.get("/api/results/:id", (req, res) => {
+  app.get("/api/results/:id", async (req, res) => {
     keys(req.query, []);
-    const result = readResultForUser(db, req.user, req.params.id);
-    res.json(resultDetail(db, result, req.user, evidence));
+    const value = await db.transaction(async (db) => {
+      const result = await readResultForUser(db, req.user, req.params.id);
+      return resultDetail(db, result, req.user, evidence);
+    }, { readOnly: true });
+    res.json(value);
   });
-  app.patch("/api/results/:id", (req, res) => {
+  app.patch("/api/results/:id", async (req, res) => {
     keys(req.query, []);
-    res.json(resultJson(patchResult(db, req.user, req.params.id, req.body, { today })));
+    res.json(resultJson(await patchResult(db, req.user, req.params.id, req.body, { today })));
   });
-  app.post("/api/results/:id/submit", (req, res) => {
+  app.post("/api/results/:id/submit", async (req, res) => {
     keys(req.query, []);
     keys(req.body, ["version"], ["version"]);
-    const result = transitionResult(db, req.user.id, req.params.id, {
+    const result = await transitionResult(db, req.user.id, req.params.id, {
       action: "submit",
       version: req.body.version,
     }, { today });
     res.json(resultJson(result));
   });
-  app.post("/api/results/:id/review", (req, res) => {
+  app.post("/api/results/:id/review", async (req, res) => {
     keys(req.query, []);
     keys(req.body, ["version", "decision", "comment"], ["version", "decision"]);
-    const result = transitionResult(db, req.user.id, req.params.id, {
+    const result = await transitionResult(db, req.user.id, req.params.id, {
       action: choice(req.body.decision, ["return", "approve"]),
       version: req.body.version,
       comment: req.body.comment,
     }, { today, verifyEvidence: (file) => evidence.verify(file) });
     res.json(resultJson(result));
   });
-  app.get("/api/results/:id/audit", (req, res) => {
+  app.get("/api/results/:id/audit", async (req, res) => {
     if (["leader", "analyst"].includes(req.user.role)) forbidden();
     keys(req.query, ["page", "pageSize"]);
-    const result = readResultForUser(db, req.user, req.params.id);
-    res.json(resultAudit(db, result, req.user, req.query));
+    const value = await db.transaction(async (db) => {
+      const result = await readResultForUser(db, req.user, req.params.id);
+      return resultAudit(db, result, req.user, req.query);
+    }, { readOnly: true });
+    res.json(value);
   });
 }

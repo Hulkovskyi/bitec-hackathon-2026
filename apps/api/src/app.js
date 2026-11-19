@@ -1,7 +1,7 @@
 import express from "express";
 import { fileURLToPath } from "node:url";
 import { randomBytes, createHash } from "node:crypto";
-import { transaction } from "./database.js";
+import { adaptDatabase, databaseConstraintKind } from "./database.js";
 import { ApiError, keys, uuid, pagination, invalid } from "./validation.js";
 import {
   access,
@@ -13,9 +13,11 @@ import {
   missing,
   forbidden,
   kyivDate,
+  programAllowed,
 } from "./registry.js";
 import { createEvidenceStore, mountEvidenceRoutes } from "./evidence.js";
 import { mountResultRoutes } from "./result-routes.js";
+import { mountDashboardRoutes } from "./dashboard.js";
 const webBuild = fileURLToPath(new URL("../../web/dist/", import.meta.url));
 const defaultEvidenceDirectory = fileURLToPath(new URL("../../../data/evidence", import.meta.url));
 const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -33,6 +35,10 @@ export function createApp(
     demoMode = false,
     today = kyivDate,
     evidenceDirectory = defaultEvidenceDirectory,
+    evidenceStore,
+    secureCookies = false,
+    serveWeb = true,
+    checkReadiness,
     allowedOrigins = [
       "http://127.0.0.1:3001",
       "http://localhost:3001",
@@ -42,9 +48,9 @@ export function createApp(
   } = {},
 ) {
   const app = express();
-  const evidence = createEvidenceStore(database, { directory: evidenceDirectory });
+  const evidence = evidenceStore ?? createEvidenceStore(database, { directory: evidenceDirectory });
   if (
-    !demoMode &&
+    !demoMode && !database.dialect &&
     database
       .prepare(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
@@ -52,14 +58,16 @@ export function createApp(
       .get()
   )
     database.prepare("DELETE FROM sessions WHERE auth_kind='demo'").run();
+  database = adaptDatabase(database);
   app.disable("x-powered-by");
   app.use("/api", (_req, res, next) => {
     res.set("Cache-Control", "no-store");
     next();
   });
-  app.get("/api/health", (_req, res) => {
+  app.get("/api/health", async (_req, res) => {
     try {
-      database.prepare("SELECT 1").get();
+      await database.prepare("SELECT 1").get();
+      await checkReadiness?.();
       res.json({ status: "ok", database: "ready" });
     } catch {
       res.status(503).json({ status: "unavailable", database: "unavailable" });
@@ -78,36 +86,36 @@ export function createApp(
     next();
   });
   app.use(express.json({ limit: "1mb" }));
-  app.get("/api/demo/users", (req, res) => {
+  app.get("/api/demo/users", async (req, res) => {
     keys(req.query, []);
     res.json({
-      items: database
+      items: await database
         .prepare(
           "SELECT id,display_name AS displayName,role FROM users WHERE active=1 ORDER BY display_name,id",
         )
         .all(),
     });
   });
-  app.post("/api/demo/session", (req, res) => {
+  app.post("/api/demo/session", async (req, res) => {
     keys(req.body, ["userId"], ["userId"]);
     const userId = uuid(req.body.userId);
     if (
-      !database
+      !(await database
         .prepare("SELECT 1 FROM users WHERE id=? AND active=1")
-        .get(userId)
+        .get(userId))
     )
       throw new ApiError(401, "unauthenticated", "Користувач недоступний");
     const token = randomBytes(32).toString("hex");
-    transaction(database, () => {
+    await database.transaction(async (database) => {
       const oldToken = tokenFrom(req);
       if (oldToken)
-        database
+        await database
           .prepare("DELETE FROM sessions WHERE id_hash=?")
           .run(hash(oldToken));
-      database
+      await database
         .prepare("DELETE FROM sessions WHERE expires_at<=?")
         .run(new Date().toISOString());
-      database
+      await database
         .prepare(
           "INSERT INTO sessions (id_hash,user_id,expires_at,auth_kind) VALUES (?,?,?,'demo')",
         )
@@ -121,19 +129,19 @@ export function createApp(
       .cookie(cookieName, token, {
         httpOnly: true,
         sameSite: "strict",
-        secure: req.secure,
+        secure: secureCookies || req.secure,
         path: "/",
         maxAge: 8 * 60 * 60 * 1000,
       })
       .status(201)
       .json({ userId });
   });
-  app.use("/api", (req, _res, next) => {
+  app.use("/api", async (req, _res, next) => {
     const token = tokenFrom(req);
     req.user =
       demoMode &&
       token &&
-      database
+      await database
         .prepare(
           "SELECT u.id,u.display_name AS displayName,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id_hash=? AND s.expires_at>? AND u.active=1",
         )
@@ -142,156 +150,154 @@ export function createApp(
       throw new ApiError(401, "unauthenticated", "Увійдіть у демосесію");
     next();
   });
-  app.delete("/api/session", (req, res) => {
-    database
+  app.delete("/api/session", async (req, res) => {
+    await database
       .prepare("DELETE FROM sessions WHERE id_hash=?")
       .run(hash(tokenFrom(req)));
     res
       .clearCookie(cookieName, {
         httpOnly: true,
         sameSite: "strict",
-        secure: req.secure,
+        secure: secureCookies || req.secure,
         path: "/",
       })
       .status(204)
       .end();
   });
-  app.get("/api/me", (req, res) => {
+  app.get("/api/me", async (req, res) => {
     keys(req.query, []);
     res.json({
       ...req.user,
-      scopes: database
+      scopes: await database
         .prepare(
           "SELECT program_id AS programId,department_id AS departmentId FROM user_scopes WHERE user_id=?",
         )
         .all(req.user.id),
     });
   });
-  const programAllowed = (user, id) => {
-    const row = database
-      .prepare(
-        `SELECT p.id FROM programs p WHERE p.id=? ${user.role === "admin" ? "" : "AND EXISTS (SELECT 1 FROM user_scopes us WHERE us.program_id=p.id AND us.user_id=?)"}`,
-      )
-      .get(...(user.role === "admin" ? [id] : [id, user.id]));
-    if (!row) missing();
-  };
-  app.get("/api/programs", (req, res) => {
+  app.get("/api/programs", async (req, res) => {
     keys(req.query, []);
     const admin = req.user.role === "admin";
     res.json({
-      items: database
+      items: await database
         .prepare(
           `SELECT p.id,p.code,p.title,p.period_start AS periodStart,p.period_end AS periodEnd FROM programs p ${admin ? "" : "WHERE EXISTS (SELECT 1 FROM user_scopes us WHERE us.program_id=p.id AND us.user_id=?)"} ORDER BY p.code,p.id`,
         )
         .all(...(admin ? [] : [req.user.id])),
     });
   });
-  app.get("/api/programs/:id/registry-options", (req, res) => {
-    keys(req.query, []);
-    const id = uuid(req.params.id);
-    programAllowed(req.user, id);
-    const admin = req.user.role === "admin";
-    const sections = database
-      .prepare(
-        "SELECT id,program_id AS programId,code,title FROM sections WHERE program_id=? ORDER BY code",
-      )
-      .all(id);
-    const risks = database
-      .prepare(
-        "SELECT id,program_id AS programId,code,title FROM risks WHERE program_id=? ORDER BY code",
-      )
-      .all(id);
-    const departments = database
-      .prepare(
-        `SELECT d.id,d.program_id AS programId,d.code,d.title FROM departments d WHERE d.program_id=? ${admin ? "" : "AND EXISTS (SELECT 1 FROM user_scopes us WHERE us.department_id=d.id AND us.program_id=d.program_id AND us.user_id=?)"} ORDER BY d.code`,
-      )
-      .all(...(admin ? [id] : [id, req.user.id]));
-    const executors = ["coordinator", "admin"].includes(req.user.role)
-      ? database
-          .prepare(
-            `SELECT u.id,u.display_name AS displayName,us.department_id AS departmentId FROM users u JOIN user_scopes us ON us.user_id=u.id WHERE u.active=1 AND u.role='executor' AND us.program_id=? ${admin ? "" : "AND EXISTS (SELECT 1 FROM user_scopes own WHERE own.user_id=? AND own.program_id=us.program_id AND own.department_id=us.department_id)"} ORDER BY u.display_name,u.id`,
-          )
-          .all(...(admin ? [id] : [id, req.user.id]))
-      : [];
-    const executorMap = new Map();
-    for (const row of executors) {
-      if (!executorMap.has(row.id))
-        executorMap.set(row.id, {
-          id: row.id,
-          displayName: row.displayName,
-          departmentIds: [],
-        });
-      executorMap.get(row.id).departmentIds.push(row.departmentId);
-    }
-    res.json({
-      sections,
-      departments,
-      risks,
-      executors: [...executorMap.values()],
-    });
-  });
-  app.get("/api/measures", (req, res) => {
-    keys(
-      req.query,
-      [
-        "programId",
-        "sectionId",
-        "departmentId",
-        "executorId",
-        "active",
-        "periodKey",
-        "page",
-        "pageSize",
-      ],
-      ["programId"],
-    );
-    const programId = uuid(req.query.programId);
-    programAllowed(req.user, programId);
-    const { page, pageSize } = pagination(req.query),
-      rule = access(req.user, { periodKey: req.query.periodKey, today: today() });
-    const conditions = ["s.program_id=?", rule.sql],
-      params = [programId, ...rule.params];
-    for (const [key, column] of [
-      ["sectionId", "m.section_id"],
-      ["departmentId", "m.department_id"],
-    ])
-      if (Object.hasOwn(req.query, key)) {
-        conditions.push(`${column}=?`);
-        params.push(uuid(req.query[key]));
+  app.get("/api/programs/:id/registry-options", async (req, res) => {
+    const body = await database.transaction(async (database) => {
+      keys(req.query, []);
+      const id = uuid(req.params.id);
+      await programAllowed(database, req.user, id);
+      const admin = req.user.role === "admin";
+      const sections = await database
+        .prepare(
+          "SELECT id,program_id AS programId,code,title FROM sections WHERE program_id=? ORDER BY code",
+        )
+        .all(id);
+      const risks = await database
+        .prepare(
+          "SELECT id,program_id AS programId,code,title FROM risks WHERE program_id=? ORDER BY code",
+        )
+        .all(id);
+      const departments = await database
+        .prepare(
+          `SELECT d.id,d.program_id AS programId,d.code,d.title FROM departments d WHERE d.program_id=? ${admin ? "" : "AND EXISTS (SELECT 1 FROM user_scopes us WHERE us.department_id=d.id AND us.program_id=d.program_id AND us.user_id=?)"} ORDER BY d.code`,
+        )
+        .all(...(admin ? [id] : [id, req.user.id]));
+      const executors = ["coordinator", "admin"].includes(req.user.role)
+        ? await database
+            .prepare(
+              `SELECT u.id,u.display_name AS displayName,us.department_id AS departmentId FROM users u JOIN user_scopes us ON us.user_id=u.id WHERE u.active=1 AND u.role='executor' AND us.program_id=? ${admin ? "" : "AND EXISTS (SELECT 1 FROM user_scopes own WHERE own.user_id=? AND own.program_id=us.program_id AND own.department_id=us.department_id)"} ORDER BY u.display_name,u.id`,
+            )
+            .all(...(admin ? [id] : [id, req.user.id]))
+        : [];
+      const executorMap = new Map();
+      for (const row of executors) {
+        if (!executorMap.has(row.id))
+          executorMap.set(row.id, {
+            id: row.id,
+            displayName: row.displayName,
+            departmentIds: [],
+          });
+        executorMap.get(row.id).departmentIds.push(row.departmentId);
       }
-    if (Object.hasOwn(req.query, "executorId")) {
-      conditions.push(`${rule.executor}=?`);
-      params.push(rule.period, uuid(req.query.executorId));
-    }
-    if (Object.hasOwn(req.query, "active")) {
-      if (!["true", "false"].includes(req.query.active)) invalid();
-      conditions.push("m.active=?");
-      params.push(Number(req.query.active === "true"));
-    }
-    const where = conditions.join(" AND ");
-    const total = database
-      .prepare(
-        `SELECT count(*) AS n FROM measures m JOIN sections s ON s.id=m.section_id WHERE ${where}`,
-      )
-      .get(...params).n;
-    const items = database
-      .prepare(
-        `${selectPeriodMeasure(rule)} WHERE ${where} ORDER BY m.code,m.id LIMIT ? OFFSET ?`,
-      )
-      .all(rule.period, ...params, pageSize, (page - 1) * pageSize)
-      .map((row) => periodMeasure(row, req.user, rule.period));
-    res.json({ items, total, page, pageSize });
+      return {
+        sections,
+        departments,
+        risks,
+        executors: [...executorMap.values()],
+      };
+    }, { readOnly: true });
+    res.json(body);
   });
-  app.get("/api/measures/:id", (req, res) => {
+  app.get("/api/measures", async (req, res) => {
+    const body = await database.transaction(async (database) => {
+      keys(
+        req.query,
+        [
+          "programId",
+          "sectionId",
+          "departmentId",
+          "executorId",
+          "active",
+          "periodKey",
+          "page",
+          "pageSize",
+        ],
+        ["programId"],
+      );
+      const programId = uuid(req.query.programId);
+      await programAllowed(database, req.user, programId);
+      const { page, pageSize } = pagination(req.query),
+        rule = access(req.user, { periodKey: req.query.periodKey, today: today() });
+      const conditions = ["s.program_id=?", rule.sql],
+        params = [programId, ...rule.params];
+      for (const [key, column] of [
+        ["sectionId", "m.section_id"],
+        ["departmentId", "m.department_id"],
+      ])
+        if (Object.hasOwn(req.query, key)) {
+          conditions.push(`${column}=?`);
+          params.push(uuid(req.query[key]));
+        }
+      if (Object.hasOwn(req.query, "executorId")) {
+        conditions.push(`${rule.executor}=?`);
+        params.push(rule.period, uuid(req.query.executorId));
+      }
+      if (Object.hasOwn(req.query, "active")) {
+        if (!["true", "false"].includes(req.query.active)) invalid();
+        conditions.push("m.active=?");
+        params.push(Number(req.query.active === "true"));
+      }
+      const where = conditions.join(" AND ");
+      const { n: total } = await database
+        .prepare(
+          `SELECT count(*) AS n FROM measures m JOIN sections s ON s.id=m.section_id WHERE ${where}`,
+        )
+        .get(...params);
+      const rows = await database
+        .prepare(
+          `${selectPeriodMeasure(rule)} WHERE ${where} ORDER BY m.code,m.id LIMIT ? OFFSET ?`,
+        )
+        .all(rule.period, ...params, pageSize, (page - 1) * pageSize);
+      const items = rows.map((row) => periodMeasure(row, req.user, rule.period));
+      return { items, total, page, pageSize };
+    }, { readOnly: true });
+    res.json(body);
+  });
+  app.get("/api/measures/:id", async (req, res) => {
     keys(req.query, ["periodKey"]);
-    res.json(getMeasure(database, req.user, uuid(req.params.id), {
+    res.json(await getMeasure(database, req.user, uuid(req.params.id), {
       periodKey: req.query.periodKey,
       today: today(),
     }));
   });
-  app.post("/api/measures", (req, res) => {
+  app.post("/api/measures", async (req, res) => {
     keys(req.query, []);
-    const value = saveMeasure(database, req.user, req.body, undefined, {
+    const value = await saveMeasure(database, req.user, req.body, undefined, {
       today,
     });
     res
@@ -299,73 +305,80 @@ export function createApp(
       .location("/api/measures/" + value.id)
       .json(value);
   });
-  app.patch("/api/measures/:id", (req, res) => {
+  app.patch("/api/measures/:id", async (req, res) => {
     keys(req.query, []);
     res.json(
-      saveMeasure(database, req.user, req.body, uuid(req.params.id), { today }),
+      await saveMeasure(database, req.user, req.body, uuid(req.params.id), { today }),
     );
   });
-  app.get("/api/measures/:id/audit", (req, res) => {
-    if (["leader", "analyst"].includes(req.user.role)) forbidden();
-    keys(req.query, ["page", "pageSize", "entityType", "periodKey"]);
-    const { entityType, periodKey } = req.query;
-    if (entityType !== undefined && !["measure", "period_assignment"].includes(entityType)) invalid();
-    const canReadAssignments = ["coordinator", "admin"].includes(req.user.role);
-    if (entityType === "period_assignment" && !canReadAssignments) forbidden();
-    const id = uuid(req.params.id);
-    getMeasure(database, req.user, id, { periodKey, today: today() });
-    const { page, pageSize } = pagination(req.query);
+  app.get("/api/measures/:id/audit", async (req, res) => {
+    const body = await database.transaction(async (database) => {
+      if (["leader", "analyst"].includes(req.user.role)) forbidden();
+      keys(req.query, ["page", "pageSize", "entityType", "periodKey"]);
+      const { entityType, periodKey } = req.query;
+      if (entityType !== undefined && !["measure", "period_assignment"].includes(entityType)) invalid();
+      const canReadAssignments = ["coordinator", "admin"].includes(req.user.role);
+      if (entityType === "period_assignment" && !canReadAssignments) forbidden();
+      const id = uuid(req.params.id);
+      await getMeasure(database, req.user, id, { periodKey, today: today() });
+      const { page, pageSize } = pagination(req.query);
 
-    const conditions = ["a.entity_id=?"];
-    const params = [id];
-    if (entityType || !canReadAssignments) {
-      conditions.push("a.entity_type=?");
-      params.push(entityType ?? "measure");
-    } else {
-      conditions.push("a.entity_type IN ('measure','period_assignment')");
-    }
-    if (periodKey !== undefined) {
-      conditions.push("(a.entity_type<>'period_assignment' OR json_extract(a.after_json, '$.periodKey')=?)");
-      params.push(periodKey);
-    }
-    const where = conditions.join(" AND ");
-    const total = database
-      .prepare(`SELECT count(*) AS n FROM audit_events a WHERE ${where}`)
-      .get(...params).n;
-    const items = database
-      .prepare(
-        `SELECT a.id,a.actor_id AS actorId,actor.display_name AS actorName,a.action,
-                a.entity_type AS entityType,a.entity_id AS entityId,a.before_json,a.after_json,
-                a.occurred_at AS occurredAt,previous.display_name AS before_name,
-                replacement.display_name AS after_name
-         FROM audit_events a JOIN users actor ON actor.id=a.actor_id
-         LEFT JOIN users previous ON a.entity_type='period_assignment'
-           AND previous.id=json_extract(a.before_json, '$.executorId')
-         LEFT JOIN users replacement ON a.entity_type='period_assignment'
-           AND replacement.id=json_extract(a.after_json, '$.executorId')
-         WHERE ${where} ORDER BY a.occurred_at,a.id LIMIT ? OFFSET ?`,
-      )
-      .all(...params, pageSize, (page - 1) * pageSize)
-      .map(({ before_json, after_json, before_name, after_name, ...row }) => {
-        const before = JSON.parse(before_json);
-        const after = JSON.parse(after_json);
-        if (row.entityType === "period_assignment") {
-          if (before) before.executorName = before_name;
-          if (after) after.executorName = after_name;
-        }
-        return { ...row, before, after };
-      });
-    res.json({ items, total, page, pageSize });
+      const conditions = ["a.entity_id=?"];
+      const params = [id];
+      if (entityType || !canReadAssignments) {
+        conditions.push("a.entity_type=?");
+        params.push(entityType ?? "measure");
+      } else {
+        conditions.push("a.entity_type IN ('measure','period_assignment')");
+      }
+      const jsonField = (column, field) => database.dialect === "postgres"
+        ? `CAST(${column} AS jsonb)->>'${field}'`
+        : `json_extract(${column}, '$.${field}')`;
+      if (periodKey !== undefined) {
+        conditions.push(`(a.entity_type<>'period_assignment' OR (${jsonField("a.after_json", "periodKey")})=?)`);
+        params.push(periodKey);
+      }
+      const where = conditions.join(" AND ");
+      const { n: total } = await database
+        .prepare(`SELECT count(*) AS n FROM audit_events a WHERE ${where}`)
+        .get(...params);
+      const rows = await database
+        .prepare(
+          `SELECT a.id,a.actor_id AS actorId,actor.display_name AS actorName,a.action,
+                  a.entity_type AS entityType,a.entity_id AS entityId,a.before_json,a.after_json,
+                  a.occurred_at AS occurredAt,previous.display_name AS before_name,
+                  replacement.display_name AS after_name
+           FROM audit_events a JOIN users actor ON actor.id=a.actor_id
+           LEFT JOIN users previous ON a.entity_type='period_assignment'
+             AND previous.id=(${jsonField("a.before_json", "executorId")})
+           LEFT JOIN users replacement ON a.entity_type='period_assignment'
+             AND replacement.id=(${jsonField("a.after_json", "executorId")})
+           WHERE ${where} ORDER BY a.occurred_at,a.id LIMIT ? OFFSET ?`,
+        )
+        .all(...params, pageSize, (page - 1) * pageSize);
+      const items = rows.map(({ before_json, after_json, before_name, after_name, ...row }) => {
+          const before = JSON.parse(before_json);
+          const after = JSON.parse(after_json);
+          if (row.entityType === "period_assignment") {
+            if (before) before.executorName = before_name;
+            if (after) after.executorName = after_name;
+          }
+          return { ...row, before, after };
+        });
+      return { items, total, page, pageSize };
+    }, { readOnly: true });
+    res.json(body);
   });
-  app.post("/api/imports/registry", (req, res) => {
+  app.post("/api/imports/registry", async (req, res) => {
     if (req.user.role !== "admin") forbidden();
     keys(req.query, []);
-    res.status(201).json(importRegistry(database, req.user.id, req.body));
+    res.status(201).json(await importRegistry(database, req.user.id, req.body));
   });
   mountResultRoutes(app, database, { today, evidence });
   mountEvidenceRoutes(app, database, evidence);
+  mountDashboardRoutes(app, database, { today, evidence });
   app.use("/api", (_req, _res) => missing());
-  app.use(express.static(webBuild));
+  if (serveWeb) app.use(express.static(webBuild));
   app.use((error, _req, res, next) => {
     if (res.headersSent) return next(error);
     let status = error.status || 500,
@@ -379,18 +392,16 @@ export function createApp(
       status = 400;
       code = "validation_error";
       message = "Некоректний JSON";
-    } else if (error.code?.startsWith("ERR_SQLITE")) {
-      if (error.errcode === 1555 || error.errcode === 2067) {
+    } else {
+      const constraint = databaseConstraintKind(error);
+      if (constraint === "unique") {
         status = 409;
         code = "duplicate_code";
         message = "Ідентифікатор або код уже існує";
-      } else if ([787, 275, 1299].includes(error.errcode)) {
+      } else if (constraint === "invalid") {
         status = 400;
         code = "validation_error";
         message = "Некоректні посилання або значення";
-      } else {
-        status = 500;
-        code = "internal_error";
       }
     }
     if (status >= 500 && !(error instanceof ApiError && code === "insufficient_storage")) {

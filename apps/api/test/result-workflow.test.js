@@ -12,11 +12,11 @@ const coordinator = id(205);
 const resultDate = "2026-11-17";
 const timestamp = "2026-11-17T12:00:00.000Z";
 
-function setup(t) {
+async function setup(t) {
   const db = new DatabaseSync(":memory:");
   t.after(() => db.close());
   migrate(db);
-  seed(db, { demoMode: true });
+  await seed(db, { demoMode: true });
   return db;
 }
 
@@ -73,25 +73,25 @@ function snapshot(db, resultId) {
   return { result, reviews, audit };
 }
 
-test("executor submits and coordinator returns then approves with a complete audit trail", (t) => {
-  const db = setup(t);
+test("executor submits and coordinator returns then approves with a complete audit trail", async (t) => {
+  const db = await setup(t);
   const resultId = createDraft(db);
   const returnComment = "Уточніть причину невиконання";
-  const submitted = transition(db, resultId, executor, "submit", 1);
+  const submitted = await transition(db, resultId, executor, "submit", 1);
   assert.equal(submitted.status, "submitted");
   assert.equal(submitted.version, 2);
   assert.ok(submitted.submitted_at);
   assert.equal(JSON.parse(submitted.plan_snapshot_json).code, "M-501");
 
-  const returned = transition(db, resultId, coordinator, "return", 2, returnComment);
+  const returned = await transition(db, resultId, coordinator, "return", 2, returnComment);
   assert.equal(returned.status, "returned");
   assert.equal(returned.version, 3);
 
-  const resubmitted = transition(db, resultId, executor, "submit", 3);
+  const resubmitted = await transition(db, resultId, executor, "submit", 3);
   assert.equal(resubmitted.status, "submitted");
   assert.equal(resubmitted.version, 4);
 
-  const approved = transition(db, resultId, coordinator, "approve", 4);
+  const approved = await transition(db, resultId, coordinator, "approve", 4);
   assert.equal(approved.status, "approved");
   assert.equal(approved.version, 5);
   assert.equal(approved.outcome, "not_completed");
@@ -123,32 +123,32 @@ test("executor submits and coordinator returns then approves with a complete aud
   ]);
 });
 
-test("transition access, return comments and optimistic versions are enforced without side effects", (t) => {
-  const db = setup(t);
+test("transition access, return comments and optimistic versions are enforced without side effects", async (t) => {
+  const db = await setup(t);
   const resultId = createDraft(db);
   const beforeDraft = snapshot(db, resultId);
-  assert.throws(() => transition(db, resultId, coordinator, "approve", 1));
-  assert.throws(() => transition(db, resultId, id(202), "submit", 1), {
+  await assert.rejects(() => transition(db, resultId, coordinator, "approve", 1));
+  await assert.rejects(() => transition(db, resultId, id(202), "submit", 1), {
     status: 404,
     code: "not_found",
   });
-  assert.throws(() => transition(db, randomUUID(), coordinator, "approve", 1), {
+  await assert.rejects(() => transition(db, randomUUID(), coordinator, "approve", 1), {
     status: 404,
     code: "not_found",
   });
   assert.deepEqual(snapshot(db, resultId), beforeDraft);
 
-  transition(db, resultId, executor, "submit", 1);
+  await transition(db, resultId, executor, "submit", 1);
   const beforeReview = snapshot(db, resultId);
-  assert.throws(() => transition(db, resultId, id(208), "approve", 2), {
+  await assert.rejects(() => transition(db, resultId, id(208), "approve", 2), {
     status: 403,
     code: "forbidden",
   });
-  assert.throws(() => transition(db, resultId, coordinator, "approve", 1), {
+  await assert.rejects(() => transition(db, resultId, coordinator, "approve", 1), {
     status: 409,
     code: "version_conflict",
   });
-  assert.throws(() => transition(db, resultId, coordinator, "return", 2, "  "), {
+  await assert.rejects(() => transition(db, resultId, coordinator, "return", 2, "  "), {
     status: 400,
     code: "validation_error",
   });
@@ -159,9 +159,9 @@ test("transition access, return comments and optimistic versions are enforced wi
     executorId: id(203),
     periodKey: "2026-H2",
   });
-  transition(db, otherResult, id(203), "submit", 1);
+  await transition(db, otherResult, id(203), "submit", 1);
   const beforeOther = snapshot(db, otherResult);
-  assert.throws(() => transition(db, otherResult, coordinator, "approve", 2), {
+  await assert.rejects(() => transition(db, otherResult, coordinator, "approve", 2), {
     status: 404,
     code: "not_found",
   });
@@ -169,22 +169,22 @@ test("transition access, return comments and optimistic versions are enforced wi
 
   // The former executor still owns the result even after a role change.
   db.prepare("UPDATE users SET role='coordinator' WHERE id=?").run(executor);
-  assert.throws(() => transition(db, resultId, executor, "approve", 2), {
+  await assert.rejects(() => transition(db, resultId, executor, "approve", 2), {
     status: 403,
     code: "forbidden",
   });
   assert.deepEqual(snapshot(db, resultId), beforeReview);
 });
 
-test("a second open revision is rejected and a new draft leaves the approved revision intact", (t) => {
-  const db = setup(t);
+test("a second open revision is rejected and a new draft leaves the approved revision intact", async (t) => {
+  const db = await setup(t);
   const first = createDraft(db);
   assert.throws(() => createDraft(db, { revision: 2, supersedesId: first }), /UNIQUE constraint/);
-  transition(db, first, executor, "submit", 1);
-  transition(db, first, coordinator, "approve", 2);
+  await transition(db, first, executor, "submit", 1);
+  await transition(db, first, coordinator, "approve", 2);
   const before = snapshot(db, first);
 
-  assert.throws(() => transition(db, first, coordinator, "return", 3, "Спроба зміни"));
+  await assert.rejects(() => transition(db, first, coordinator, "return", 3, "Спроба зміни"));
   const next = createDraft(db, { revision: 2, supersedesId: first });
   const nextResult = snapshot(db, next).result;
   assert.equal(nextResult.status, "draft");
@@ -193,8 +193,8 @@ test("a second open revision is rejected and a new draft leaves the approved rev
   assert.deepEqual(snapshot(db, first), before);
 });
 
-test("approval verifies only the current executor's latest evidence after reassignment", (t) => {
-  const db = setup(t);
+test("approval verifies only the current executor's latest evidence after reassignment", async (t) => {
+  const db = await setup(t);
   const resultId = createDraft(db);
   const replacement = id(202);
   db.prepare(
@@ -223,8 +223,8 @@ test("approval verifies only the current executor's latest evidence after reassi
   }
 
   const formerEvidence = addVersion(executor, randomUUID(), 1);
-  transition(db, resultId, executor, "submit", 1);
-  transition(db, resultId, coordinator, "return", 2, "Уточніть результат");
+  await transition(db, resultId, executor, "submit", 1);
+  await transition(db, resultId, coordinator, "return", 2, "Уточніть результат");
 
   // Model the reassignment already recorded by the future assignment service.
   db.prepare(
@@ -233,11 +233,11 @@ test("approval verifies only the current executor's latest evidence after reassi
   db.prepare("UPDATE results SET executor_id=?, version=version+1 WHERE id=?")
     .run(replacement, resultId);
   const returned = snapshot(db, resultId);
-  assert.throws(() => transition(db, resultId, executor, "submit", 4), {
+  await assert.rejects(() => transition(db, resultId, executor, "submit", 4), {
     status: 404,
     code: "not_found",
   });
-  assert.throws(() => transition(db, resultId, replacement, "submit", 4), {
+  await assert.rejects(() => transition(db, resultId, replacement, "submit", 4), {
     status: 400,
     code: "validation_error",
   });
@@ -246,7 +246,7 @@ test("approval verifies only the current executor's latest evidence after reassi
   const replacementEvidence = randomUUID();
   addVersion(replacement, replacementEvidence, 1);
   const latest = addVersion(replacement, replacementEvidence, 2);
-  transition(db, resultId, replacement, "submit", 4);
+  await transition(db, resultId, replacement, "submit", 4);
   const submitted = snapshot(db, resultId);
 
   function approveWith(verifyEvidence) {
@@ -258,12 +258,12 @@ test("approval verifies only the current executor's latest evidence after reassi
       { today: () => resultDate, verifyEvidence },
     );
   }
-  assert.throws(() => approveWith(undefined), { status: 400, code: "validation_error" });
-  assert.throws(() => approveWith(() => false), { status: 400, code: "validation_error" });
+  await assert.rejects(() => approveWith(undefined), { status: 400, code: "validation_error" });
+  await assert.rejects(() => approveWith(() => false), { status: 400, code: "validation_error" });
   assert.deepEqual(snapshot(db, resultId), submitted);
 
   const checked = [];
-  const approved = approveWith((file) => {
+  const approved = await approveWith((file) => {
     checked.push(file.id);
     return true;
   });
@@ -274,10 +274,10 @@ test("approval verifies only the current executor's latest evidence after reassi
   assert.equal(former.uploaded_by, executor);
 });
 
-test("a failed audit write rolls back both the approval and the review row", (t) => {
-  const db = setup(t);
+test("a failed audit write rolls back both the approval and the review row", async (t) => {
+  const db = await setup(t);
   const resultId = createDraft(db);
-  transition(db, resultId, executor, "submit", 1);
+  await transition(db, resultId, executor, "submit", 1);
   const before = snapshot(db, resultId);
   db.exec(`
     CREATE TEMP TRIGGER reject_result_audit BEFORE INSERT ON audit_events
@@ -287,11 +287,11 @@ test("a failed audit write rolls back both the approval and the review row", (t)
     END;
   `);
 
-  assert.throws(() => transition(db, resultId, coordinator, "approve", 2), /synthetic audit failure/);
+  await assert.rejects(() => transition(db, resultId, coordinator, "approve", 2), /synthetic audit failure/);
   assert.deepEqual(snapshot(db, resultId), before);
 
   db.exec("DROP TRIGGER reject_result_audit");
-  transition(db, resultId, coordinator, "approve", 2);
+  await transition(db, resultId, coordinator, "approve", 2);
   const after = snapshot(db, resultId);
   assert.equal(after.result.status, "approved");
   assert.equal(after.result.version, 3);

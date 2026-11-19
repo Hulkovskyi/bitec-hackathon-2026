@@ -19,7 +19,7 @@ async function setup(t) {
   const directory = await mkdtemp(join(tmpdir(), "dacm-result-api-"));
   const db = new DatabaseSync(":memory:");
   migrate(db);
-  seed(db, { demoMode: true });
+  await seed(db, { demoMode: true });
   const server = createApp(db, {
     demoMode: true,
     today: () => date,
