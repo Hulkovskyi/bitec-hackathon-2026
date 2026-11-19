@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { HalfYearReport } from "./HalfYearReport.jsx";
 import { ProgramDashboard } from "./ProgramDashboard.jsx";
 import { ResultPanel } from "./ResultPanel.jsx";
 import { halfYears } from "./periods.js";
@@ -404,7 +405,9 @@ function Program({ program, user, shell, sessionError }) {
           </button>
         )}
       </header>}
-      {view !== "registry" ? (
+      {view === "report" ? (
+        <HalfYearReport program={program} api={api} onOpenMeasure={openDashboardMeasure} />
+      ) : view !== "registry" ? (
         <ProgramDashboard key={viewMode} mode={viewMode} program={program} userRole={user.role}
           programContext={programContext} departments={options?.departments ?? []}
           api={api} onOpenMeasure={openDashboardMeasure} />
