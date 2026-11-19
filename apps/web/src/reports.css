@@ -11,7 +11,7 @@
   gap: 12px 20px;
 }
 
-.report-toolbar h3 {
+.report-toolbar h1 {
   margin: 0;
   align-self: center;
   font-size: var(--type-card);
@@ -67,7 +67,16 @@
   margin-top: 24px;
 }
 
-.report-section h3 {
+.report-section h2,
+.report-brief h2 {
+  font-size: var(--type-subhead);
+}
+
+.report-brief h3 {
+  font-size: var(--type-body);
+}
+
+.report-section h2 {
   max-width: 72ch;
   margin: 0 0 8px;
 }
@@ -116,8 +125,8 @@
   border-top: 1px solid var(--line);
 }
 
-.report-brief h3,
-.report-brief h4 {
+.report-brief h2,
+.report-brief h3 {
   margin: 0 0 6px;
 }
 
@@ -162,7 +171,7 @@
     grid-template-columns: minmax(0, 1fr) auto;
   }
 
-  .report-toolbar h3 {
+  .report-toolbar h1 {
     grid-column: 1 / -1;
   }
 }
@@ -220,6 +229,11 @@
   }
 }
 
+@page half-year-report {
+  size: A4 portrait;
+  margin: 12mm;
+}
+
 @media print {
   :root:has(.report-document),
   body:has(.report-document) {
@@ -228,6 +242,7 @@
   }
 
   .workspace:has(.report-document) {
+    page: half-year-report;
     display: block;
     min-height: 0;
   }
@@ -278,9 +293,9 @@
     padding: 4pt 0;
   }
 
-  .report-section h3,
-  .report-brief h3,
-  .report-brief h4 {
+  .report-section h2,
+  .report-brief h2,
+  .report-brief h3 {
     break-after: avoid;
   }
 

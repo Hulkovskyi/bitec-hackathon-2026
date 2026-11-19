@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import { HalfYearReport } from "./HalfYearReport.jsx";
 import { ProgramDashboard } from "./ProgramDashboard.jsx";
 import { ResultPanel } from "./ResultPanel.jsx";
-import { halfYears } from "./periods.js";
+import { halfYears, kyivToday } from "./periods.js";
 import { Glyph, SignIn, Workspace } from "./Workspace.jsx";
 import "./styles.css";
 
@@ -24,15 +24,17 @@ async function api(path, options = {}) {
       ...options.headers,
     },
   });
-  const data = response.status === 204 ? null : await response.json();
+  if (response.status === 204) return null;
   if (!response.ok) {
+    const data = await response.json().catch(() => null);
     const error = new Error(
-      data?.error?.message || "Не вдалося виконати запит",
+      data?.error?.message || `Не вдалося виконати запит (HTTP ${response.status}).`,
     );
     error.code = data?.error?.code;
+    error.status = response.status;
     throw error;
   }
-  return data;
+  return response.json();
 }
 function ErrorMessage({ error }) {
   return error ? (
@@ -47,18 +49,41 @@ function App() {
     [choice, setChoice] = useState("");
   const [loading, setLoading] = useState(true),
     [error, setError] = useState(null);
+  const [attempt, setAttempt] = useState(0);
+  const sessionChannel = useRef(null);
+  const refreshSession = useCallback(() => {
+    setLoading(true);
+    setUser(null);
+    setAttempt((value) => value + 1);
+  }, []);
+  useEffect(() => {
+    if (!window.BroadcastChannel) return;
+    const channel = new BroadcastChannel("dacm-demo-session");
+    sessionChannel.current = channel;
+    channel.onmessage = ({ data }) => {
+      if (data === "changed") refreshSession();
+    };
+    return () => {
+      sessionChannel.current = null;
+      channel.close();
+    };
+  }, [refreshSession]);
   useEffect(() => {
     const controller = new AbortController();
+    setLoading(true);
+    setError(null);
     Promise.all([
       api("/demo/users", { signal: controller.signal }),
       api("/me", { signal: controller.signal }).catch((e) => {
-        if (e.code === "unauthenticated") return null;
+        if (e.status === 401) return null;
         throw e;
       }),
     ])
       .then(([result, current]) => {
+        if (controller.signal.aborted) return;
         setUsers(result.items);
-        setChoice(current?.id || result.items[0]?.id || "");
+        const coordinator = result.items.find((entry) => entry.role === "coordinator");
+        setChoice(current?.id || coordinator?.id || result.items[0]?.id || "");
         setUser(current);
       })
       .catch((e) => {
@@ -73,21 +98,32 @@ function App() {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, []);
+  }, [attempt]);
+
+  const sessionApi = useCallback(async (path, options) => {
+    try {
+      return await api(path, options);
+    } catch (cause) {
+      if (cause.status === 401 && !options?.signal?.aborted) {
+        setUser((current) => current === user ? null : current);
+      }
+      throw cause;
+    }
+  }, [user]);
+
   async function login(event) {
     event.preventDefault();
     setLoading(true);
     setError(null);
-    setUser(null);
     try {
       await api("/demo/session", {
         method: "POST",
         body: JSON.stringify({ userId: choice }),
       });
-      setUser(await api("/me"));
+      sessionChannel.current?.postMessage("changed");
+      refreshSession();
     } catch (e) {
       setError(e);
-    } finally {
       setLoading(false);
     }
   }
@@ -95,15 +131,24 @@ function App() {
     setLoading(true);
     setError(null);
     try {
-      await api("/session", { method: "DELETE" });
-      setUser(null);
+      await api("/session", { method: "DELETE" }).catch((e) => {
+        if (e.status !== 401) throw e;
+      });
+      sessionChannel.current?.postMessage("changed");
+      refreshSession();
     } catch (e) {
       setError(e);
-    } finally {
       setLoading(false);
     }
   }
-  const sessionForm = (
+  const sessionForm = !users.length && !loading ? (
+    <div>
+      {!error && <p role="status">Немає активних демокористувачів.</p>}
+      <button type="button" className="secondary" onClick={() => setAttempt((value) => value + 1)}>
+        Оновити список користувачів
+      </button>
+    </div>
+  ) : (
     <form className="session-form" onSubmit={login}>
       <label>
         Демокористувач
@@ -120,17 +165,21 @@ function App() {
   );
   const errorMessage = <ErrorMessage error={error} />;
   return user ? (
-    <Registry key={user.id} user={user} sessionForm={sessionForm} logout={logout} busy={loading} sessionError={errorMessage} />
+    <Registry key={user.id} api={sessionApi} user={user} sessionForm={sessionForm} logout={logout} busy={loading} sessionError={errorMessage} />
   ) : <SignIn sessionForm={sessionForm} loading={loading} error={errorMessage} />;
 }
-function Registry({ user, sessionForm, logout, busy, sessionError }) {
-  const [programs, setPrograms] = useState([]),
+function Registry({ api, user, sessionForm, logout, busy, sessionError }) {
+  const [attempt, setAttempt] = useState(0);
+  const [programs, setPrograms] = useState(null),
     [programId, setProgramId] = useState(""),
     [error, setError] = useState(null);
   useEffect(() => {
     const controller = new AbortController();
+    setError(null);
+    setPrograms(null);
     api("/programs", { signal: controller.signal })
       .then((r) => {
+        if (controller.signal.aborted) return;
         setPrograms(r.items);
         setProgramId(r.items[0]?.id || "");
       })
@@ -138,26 +187,31 @@ function Registry({ user, sessionForm, logout, busy, sessionError }) {
         if (!controller.signal.aborted) setError(e);
       });
     return () => controller.abort();
-  }, []);
+  }, [api, attempt]);
   const programPicker = (
     <label className="program-select">
       <span>Програма</span>
-      <select value={programId} onChange={(event) => setProgramId(event.target.value)} disabled={!programs.length}>
-        {programs.map((program) => (
+      <select value={programId} onChange={(event) => setProgramId(event.target.value)} disabled={!programs?.length}>
+        {programs?.map((program) => (
           <option key={program.id} value={program.id}>{program.title}</option>
         ))}
       </select>
     </label>
   );
   const shell = { user, role: roleNames[user.role], sessionForm, logout, busy, programPicker };
-  const program = programs.find(({ id }) => id === programId);
+  const program = programs?.find(({ id }) => id === programId);
   return program ? (
-    <Program key={program.id} program={program} user={user} shell={shell} sessionError={sessionError} />
+    <Program key={program.id} api={api} program={program} user={user} shell={shell} sessionError={sessionError} />
   ) : (
     <Workspace {...shell}>
       {sessionError}
       <ErrorMessage error={error} />
-      {!error && <p role="status">Програм немає або вони завантажуються.</p>}
+      {!error && <p role="status">{programs ? "Немає доступних програм." : "Завантаження програм…"}</p>}
+      {(error || programs) && (
+        <button type="button" className="secondary" onClick={() => setAttempt((value) => value + 1)}>
+          Оновити список програм
+        </button>
+      )}
     </Workspace>
   );
 }
@@ -171,7 +225,7 @@ function formatRegistryDate(value) {
 }
 
 // Search uses the same server-filtered list and loads its pages only when needed.
-async function registryPage(query, searching, signal) {
+async function registryPage(api, query, searching, signal) {
   const parameters = new URLSearchParams(query);
   if (!searching) return api("/measures?" + parameters, { signal });
   parameters.set("page", "1");
@@ -186,7 +240,8 @@ async function registryPage(query, searching, signal) {
   return { ...first, items };
 }
 
-function Program({ program, user, shell, sessionError }) {
+function Program({ api, program, user, shell, sessionError }) {
+  const [reportPeriod, setReportPeriod] = useState(null);
   const [view, setView] = useState(user.role === "admin" ? "registry" : "dashboard");
   const [options, setOptions] = useState(null),
     [result, setResult] = useState(null),
@@ -200,7 +255,8 @@ function Program({ program, user, shell, sessionError }) {
     [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState(null),
     [editing, setEditing] = useState(false),
-    [detailLoading, setDetailLoading] = useState(false);
+    [detailLoading, setDetailLoading] = useState(false),
+    [detailError, setDetailError] = useState(null);
   const detailRequest = useRef(null);
   const detailView = useRef(0);
   const detailHeading = useRef(null);
@@ -239,7 +295,7 @@ function Program({ program, user, shell, sessionError }) {
       api(`/programs/${program.id}/registry-options`, {
         signal: controller.signal,
       }),
-      registryPage(query, searching, controller.signal),
+      registryPage(api, query, searching, controller.signal),
     ])
       .then(([o, r]) => {
         if (controller.signal.aborted) return;
@@ -260,13 +316,14 @@ function Program({ program, user, shell, sessionError }) {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [program.id, serverPage, section, active, periodKey, refresh, searching]);
+  }, [api, program.id, serverPage, section, active, periodKey, refresh, searching]);
   function clearDetail() {
     detailView.current += 1;
     detailRequest.current?.abort();
     detailRequest.current = null;
     focusOnDetail.current = false;
     setDetailLoading(false);
+    setDetailError(null);
     setSelected(null);
     setEditing(false);
   }
@@ -284,7 +341,6 @@ function Program({ program, user, shell, sessionError }) {
     const controller = new AbortController();
     detailRequest.current = controller;
     setDetailLoading(true);
-    setError(null);
     try {
       const query = requestedPeriod
         ? `?${new URLSearchParams({ periodKey: requestedPeriod })}` : "";
@@ -296,7 +352,9 @@ function Program({ program, user, shell, sessionError }) {
         setSelected({ ...measure, sourceResultId });
       }
     } catch (e) {
-      if (!controller.signal.aborted) setError(e);
+      if (!controller.signal.aborted) {
+        setDetailError({ cause: e, retry: () => open(id, { requestedPeriod, focusHeading, sourceResultId }) });
+      }
     } finally {
       if (!controller.signal.aborted) {
         detailRequest.current = null;
@@ -380,6 +438,14 @@ function Program({ program, user, shell, sessionError }) {
       measure={selected} sourceResultId={selected.sourceResultId} program={program} user={user} options={options} api={api} onPlanLockChange={reflectPlanLock} />
   );
 
+  const detailFailure = detailError && (
+    <>
+      <ErrorMessage error={detailError.cause} />
+      <button className="secondary" type="button" onClick={detailError.retry}>
+        Повторити завантаження картки
+      </button>
+    </>
+  );
   if (view === "review") {
     return (
       <Workspace {...shell} activeView="approvals" onNavigate={navigate}>
@@ -395,7 +461,7 @@ function Program({ program, user, shell, sessionError }) {
             До черги погодження
           </button>
         </header>
-        <ErrorMessage error={error} />
+        {detailFailure}
         {detailLoading && <p className="count" role="status">Завантаження результату…</p>}
         {resultPanel}
       </Workspace>
@@ -410,17 +476,20 @@ function Program({ program, user, shell, sessionError }) {
           <h1>Реєстр заходів</h1>
           {programContext}
         </div>
-        {user.role === "coordinator" && options && (
+        {user.role === "coordinator" && options && (program.periodEnd < kyivToday() ? (
+          <p className="count">Період програми завершено.</p>
+        ) : (
           <button type="button" className="with-icon" onClick={() => {
             clearDetail();
             setEditing(true);
           }}>
             <Glyph name="plus" size={18} /> Додати захід
           </button>
-        )}
+        ))}
       </header>}
       {view === "report" ? (
-        <HalfYearReport program={program} api={api} onOpenMeasure={openDashboardMeasure} />
+        <HalfYearReport program={program} api={api} selectedPeriod={reportPeriod}
+          onPeriodChange={setReportPeriod} onOpenMeasure={openDashboardMeasure} />
       ) : view !== "registry" ? (
         <ProgramDashboard key={viewMode} mode={viewMode} program={program} userRole={user.role}
           programContext={programContext} departments={options?.departments ?? []}
@@ -511,6 +580,7 @@ function Program({ program, user, shell, sessionError }) {
                     )}
                   </>
                 )}
+                {detailFailure}
                 {detailLoading && <p className="count" role="status">Завантаження картки…</p>}
               </div>
             </section>
@@ -565,7 +635,7 @@ function Program({ program, user, shell, sessionError }) {
             </div>
           )}
           {editing && options && (
-            <MeasureForm key={selected?.id || "new"} original={selected} options={options} program={program}
+            <MeasureForm api={api} key={selected?.id || "new"} original={selected} options={options} program={program}
               onSaveStart={beginSave} onCancel={closeForm} onReload={() => open(selected.id)} />
           )}
         </>
@@ -619,6 +689,7 @@ function RegistryTable({ items, selectedId, departments = [], disabled, onOpen }
 }
 
 function MeasureForm({
+  api,
   original,
   options,
   program,
@@ -662,6 +733,8 @@ function MeasureForm({
   const change = (key, v) => setValue((old) => ({ ...old, [key]: v }));
   const indicator = (key, v) =>
     setValue((old) => ({ ...old, indicator: { ...old.indicator, [key]: v } }));
+  const today = kyivToday();
+  const effectiveFrom = original?.effectiveFrom ?? (today > program.periodStart ? today : program.periodStart);
   const riskRequired =
     options.sections.find((s) => s.id === value.sectionId)?.code === 2;
   async function submit(event) {
@@ -833,7 +906,7 @@ function MeasureForm({
               <input
                 type="date"
                 required
-                min={program.periodStart}
+                min={effectiveFrom}
                 max={program.periodEnd}
                 value={value.plannedDate || ""}
                 onChange={(e) => change("plannedDate", e.target.value)}

@@ -89,7 +89,7 @@ async function setup(t, measures, today = () => "2026-11-17") {
     await rm(directory, { recursive: true, force: true });
   });
   migrate(db);
-  seed(db, { demoMode: true, manifest: { ...fixture, measures } });
+  await seed(db, { demoMode: true, manifest: { ...fixture, measures } });
   server = createApp(db, { demoMode: true, today, evidenceDirectory: directory }).listen(0, "127.0.0.1");
   await once(server, "listening");
   const base = `http://127.0.0.1:${server.address().port}/api`;
@@ -281,6 +281,10 @@ test("missing approvals distinguish future deadlines from due records and preser
   assert.deepEqual(report.summary.counts, {
     completed: 0, partial: 0, not_completed: 0, not_due: 1, not_approved: 2,
   });
+  const csv = checked(await coordinator(reportUrl(2, { format: "csv" })));
+  for (const row of parseCsv(csv).slice(1)) {
+    assert.deepEqual(row.slice(-5), [future.indicator.unit, "0", "100", "", ""]);
+  }
 });
 
 test("a future half-year shows plans without copying approved outcomes into them", async (t) => {
@@ -300,6 +304,22 @@ test("a future half-year shows plans without copying approved outcomes into them
   assert.equal(row.reviewStatus, null);
   assert.equal(row.indicator.actual, null);
   assert.equal(row.carriedForward, false);
+});
+
+test("undated drafts use their Kyiv creation day at a half-year boundary", async (t) => {
+  const june = measure(501, "JUNE");
+  const july = measure(502, "JULY");
+  const { db, login } = await setup(t, [june, july]);
+  const draft = { status: "draft", outcome: null, resultDate: null, measuredValue: null };
+  const creationTime = db.prepare("UPDATE results SET created_at=? WHERE id=?");
+  creationTime.run("2026-06-30T20:59:59.999Z", result(db, 601, june, draft));
+  creationTime.run("2026-06-30T21:00:00.000Z", result(db, 602, july, draft));
+
+  const coordinator = await login(205);
+  const h1 = checked(await coordinator(reportUrl(1)));
+  assert.equal(rowFor(h1, june.id).reviewStatus, "draft");
+  assert.equal(rowFor(h1, july.id).reviewStatus, null);
+  assert.equal(rowFor(checked(await coordinator(reportUrl(2))), july.id).reviewStatus, "draft");
 });
 
 test("report scopes isolate departments and programs and reject invalid or unauthorized requests", async (t) => {
@@ -350,7 +370,7 @@ test("approved snapshots drive report values and CSV exports the same safe scope
       indicator: { ...first.indicator, baseline: 10, target: 80 },
     }),
   });
-  result(db, 602, second, { outcome: "partial", measuredValue: 40 });
+  result(db, 602, second, { outcome: "partial", measuredValue: 0 });
   result(db, 603, hidden, { description: "PRIVATE CONTENT" });
   const before = db.prepare("SELECT count(*) AS count FROM audit_events").get().count;
   const coordinator = await login(205);
@@ -375,6 +395,11 @@ test("approved snapshots drive report values and CSV exports the same safe scope
   assert.ok(exportedRows.every((row) => row.length === csv[0].length));
   assert.ok(exportedRows[0].includes("'" + description));
   assert.ok(exportedRows[0].includes("'+Синтетична \"історична\" назва"));
+  assert.deepEqual(csv[0].slice(-5), [
+    "Одиниця виміру", "Базове значення", "Цільове значення", "Фактичне значення", "Ціль досягнуто",
+  ]);
+  assert.deepEqual(exportedRows[0].slice(-5), [first.indicator.unit, "10", "80", "80", "Так"]);
+  assert.deepEqual(exportedRows[1].slice(-5), [second.indicator.unit, "0", "100", "0", "Ні"]);
   assert.equal(response.text.includes("PRIVATE"), false);
   assert.equal(response.text.includes(hidden.id), false);
   assert.equal(db.prepare("SELECT count(*) AS count FROM audit_events").get().count, before);

@@ -89,7 +89,7 @@ export function Workspace({ user, role, sessionForm, logout, busy, programPicker
           <div className="workspace-tools">
             <span className="demo">Синтетичні дані</span>
             <details className="workspace-account">
-              <summary aria-label="Демосесія">
+              <summary aria-label={`Демосесія · ${user.displayName} · ${role}`}>
                 <span className="account-avatar" aria-hidden="true">{initials}</span>
                 <span className="account-name"><strong>{user.displayName}</strong><span>{role}</span></span>
                 <Glyph name="chevron" size={16} />

@@ -4,7 +4,7 @@ import {
   formatReportCsv,
   reportFilename,
 } from "../../../shared/half-year-report.mjs";
-import { halfYears } from "./periods.js";
+import { halfYears, kyivToday } from "./periods.js";
 import "./reports.css";
 
 const reportStates = ["completed", "partial", "not_completed", "not_due", "not_approved"];
@@ -13,6 +13,7 @@ const ukDateTime = new Intl.DateTimeFormat("uk-UA", {
   timeStyle: "short",
   timeZone: "Europe/Kyiv",
 });
+const pluralRules = new Intl.PluralRules("uk-UA");
 const ukPercent = new Intl.NumberFormat("uk-UA", {
   style: "percent",
   maximumFractionDigits: 1,
@@ -37,11 +38,11 @@ function downloadReport(report) {
 function ReportBrief({ summary, onOpenMeasure }) {
   return (
     <section className="report-brief" aria-labelledby="report-brief-title">
-      <h3 id="report-brief-title">Аналітична довідка</h3>
+      <h2 id="report-brief-title">Аналітична довідка</h2>
       <p>
         {summary.completionRate == null
           ? "Немає даних"
-          : `Повністю виконано ${summary.counts.completed} з ${summary.total} заходів (${ukPercent.format(summary.completionRate)}).`}
+          : `Повністю виконано ${summary.counts.completed} з ${summary.total} ${pluralRules.select(summary.total) === "one" ? "заходу" : "заходів"} (${ukPercent.format(summary.completionRate)}).`}
       </p>
       <dl className="report-totals">
         {reportStates.map((state) => (
@@ -53,7 +54,7 @@ function ReportBrief({ summary, onOpenMeasure }) {
       </dl>
       {summary.problemRows.length > 0 && (
         <>
-          <h4>Заходи, що потребують уваги</h4>
+          <h3>Заходи, що потребують уваги</h3>
           <ul className="report-problems">
             {summary.problemRows.map((row) => (
               <li key={row.measureId}>
@@ -64,9 +65,8 @@ function ReportBrief({ summary, onOpenMeasure }) {
                   <small>{row.departmentTitle}</small>
                 </div>
                 <span>
-                  {row.targetReached === false && row.executionState === "completed"
-                    ? "Цілі індикатора не досягнуто"
-                    : executionStateLabels[row.executionState]}
+                  {executionStateLabels[row.executionState]}
+                  {row.targetReached === false && " · Цілі індикатора не досягнуто"}
                 </span>
               </li>
             ))}
@@ -81,7 +81,7 @@ function ReportSection({ section }) {
   const headingId = `report-section-${section.code}`;
   return (
     <section className="report-section" aria-labelledby={headingId}>
-      <h3 id={headingId}>{section.title}</h3>
+      <h2 id={headingId}>{section.title}</h2>
       {section.rows.length === 0 ? (
         <p className="count">У цьому розділі немає заходів за обраний період.</p>
       ) : (
@@ -142,12 +142,10 @@ function ReportSection({ section }) {
   );
 }
 
-export function HalfYearReport({ program, api, onOpenMeasure }) {
+export function HalfYearReport({ program, api, selectedPeriod, onPeriodChange, onOpenMeasure }) {
   const periods = halfYears(program.periodStart, program.periodEnd);
-  const [periodKey, setPeriodKey] = useState(() => {
-    const today = new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Kyiv" }).format();
-    return periods.findLast(({ start }) => start <= today)?.key ?? periods[0]?.key;
-  });
+  const today = kyivToday();
+  const periodKey = selectedPeriod ?? periods.findLast(({ start }) => start <= today)?.key ?? periods[0]?.key;
   const [response, setResponse] = useState(null);
   const [reload, setReload] = useState(0);
   const current = response?.periodKey === periodKey && response?.reload === reload
@@ -175,7 +173,7 @@ export function HalfYearReport({ program, api, onOpenMeasure }) {
   return (
     <section className="report" aria-labelledby="report-title">
       <div className="report-toolbar">
-        <h3 id="report-title">Піврічний звіт</h3>
+        <h1 id="report-title">Піврічний звіт</h1>
         <label>
           Звітний період
           <select
@@ -183,7 +181,7 @@ export function HalfYearReport({ program, api, onOpenMeasure }) {
             onChange={(event) => {
               if (event.target.value === periodKey) return;
               setResponse(null);
-              setPeriodKey(event.target.value);
+              onPeriodChange(event.target.value);
             }}
             disabled={!periods.length}
           >
@@ -211,7 +209,7 @@ export function HalfYearReport({ program, api, onOpenMeasure }) {
       )}
       {report && (
         <div className="report-document">
-          <h3 className="report-print-title">Піврічний звіт · {report.program.title}</h3>
+          <h1 className="report-print-title">Піврічний звіт · {report.program.title}</h1>
           <div className="report-meta">
             <p>
               <strong>{halfLabel(report.period.key)}</strong>

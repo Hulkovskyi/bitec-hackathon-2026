@@ -3,7 +3,7 @@ import {
   formatReportCsv,
   reportFilename,
 } from "../../../shared/half-year-report.mjs";
-import { forbidden, measureScope, programAllowed, selectMeasure } from "./registry.js";
+import { forbidden, kyivDate, measureScope, programAllowed, selectMeasure } from "./registry.js";
 import { workInterval } from "./result-access.js";
 import { meetsIndicatorTarget } from "./risk-flags.js";
 import { choice, invalid, keys, uuid } from "./validation.js";
@@ -32,7 +32,7 @@ function reportQuery(query, today) {
   };
 }
 
-function selectResults(revisions) {
+function selectResults(revisions, cutoff) {
   // Revisions arrive newest first. A report prefers result date, then revision.
   let approved = null;
   for (const result of revisions) {
@@ -41,7 +41,9 @@ function selectResults(revisions) {
       approved = result;
     }
   }
-  return { approved, reviewStatus: revisions[0]?.status ?? null };
+  const latest = revisions.find((result) =>
+    result.result_date !== null || kyivDate(new Date(result.created_at)) <= cutoff);
+  return { approved, reviewStatus: latest?.status ?? null };
 }
 
 function compareText(left, right) {
@@ -55,7 +57,8 @@ async function reportEntry(plan, period, readRevisions) {
   if (recurrent ? !interval : plan.effective_from > period.end) return null;
 
   const deadline = recurrent ? interval[1] : plan.planned_date;
-  const { approved, reviewStatus } = selectResults(await readRevisions.all(plan.id, periodKey, period.cutoff));
+  const revisions = await readRevisions.all(plan.id, periodKey, period.cutoff);
+  const { approved, reviewStatus } = selectResults(revisions, period.cutoff);
   if (!recurrent && (
     (deadline > period.end && !approved) ||
     (approved?.outcome === "completed" && approved.actual_date < period.start)
@@ -151,10 +154,10 @@ async function buildReport(db, user, { programId, period }) {
     JOIN departments d ON d.id=plan.department_id
   `).all(programId, ...visible.params);
   const readRevisions = db.prepare(`
-    SELECT id, revision, status, outcome, result_date, actual_date, description,
+    SELECT id, revision, status, outcome, result_date, actual_date, created_at, description,
            non_completion_reason, measured_value, plan_snapshot_json
     FROM results WHERE measure_id=? AND period_key=?
-      AND COALESCE(result_date, substr(created_at, 1, 10)) <= ?
+      AND (result_date <= ? OR result_date IS NULL)
     ORDER BY revision DESC
   `);
   const sections = sectionTitles.map((title, index) => ({ code: index + 1, title, rows: [] }));
