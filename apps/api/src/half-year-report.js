@@ -71,10 +71,13 @@ async function reportEntry(plan, period, readRevisions) {
   const actual = result?.measured_value ?? null;
   const historicalDeadline = recurrent ? deadline : snapshot?.plannedDate ?? deadline;
   const executionState = result?.outcome ?? (historicalDeadline > period.cutoff ? "not_due" : "not_approved");
-  const details = result
-    ? [result.description, result.outcome === "completed" ? null : result.non_completion_reason]
-        .filter(Boolean).join("\n")
-    : "Погоджений результат відсутній";
+  let details = "";
+  if (result) {
+    details = [result.description, result.outcome === "completed" ? null : result.non_completion_reason]
+      .filter(Boolean).join("\n");
+  } else if (executionState !== "not_due") {
+    details = "Погоджений результат відсутній";
+  }
 
   return {
     sectionCode: snapshot?.sectionCode ?? plan.section_code,
@@ -88,7 +91,7 @@ async function reportEntry(plan, period, readRevisions) {
       title: snapshot?.title ?? plan.title,
       effectiveFrom: snapshot?.effectiveFrom ?? plan.effective_from,
       plannedDate: historicalDeadline,
-      actualDate: result ? (recurrent ? period.end : result.actual_date) : null,
+      actualDate: recurrent ? period.end : result?.actual_date ?? null,
       executionState,
       resultDescription: details,
       resultId: result?.id ?? null,
