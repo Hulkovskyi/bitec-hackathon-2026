@@ -111,6 +111,17 @@ function evidenceFlag(source, result, evidenceByResult) {
   };
 }
 
+export function meetsIndicatorTarget(actual, target, direction) {
+  if (!Number.isFinite(actual) || !Number.isFinite(target)) return null;
+  const measured = Number(actual.toFixed(6));
+  const expected = Number(target.toFixed(6));
+  return {
+    increase: measured >= expected,
+    decrease: measured <= expected,
+    maintain: measured === expected,
+  }[direction] ?? null;
+}
+
 function indicatorFlags(source, plan, result) {
   if (result.outcome !== "completed" && result.outcome !== "partial") return [];
   if (!Number.isFinite(result.measured_value)) return [];
@@ -124,11 +135,7 @@ function indicatorFlags(source, plan, result) {
     resultId: result.id,
     sourceValues: { revision: result.revision, baseline, target, actual, direction },
   };
-  const targetMissed = {
-    increase: actual < target,
-    decrease: actual > target,
-    maintain: actual !== target,
-  }[direction];
+  const targetMissed = meetsIndicatorTarget(actual, target, direction) === false;
   const noImprovement = {
     increase: actual <= baseline,
     decrease: actual >= baseline,

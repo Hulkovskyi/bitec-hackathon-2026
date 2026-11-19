@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { HalfYearReport } from "./HalfYearReport.jsx";
 import { ProgramDashboard } from "./ProgramDashboard.jsx";
 import { ResultPanel } from "./ResultPanel.jsx";
 import { halfYears } from "./periods.js";
@@ -162,6 +163,8 @@ function Registry({ user, sessionForm, logout, busy, sessionError }) {
 }
 
 const registryPageSize = 20;
+const lastRegistryPage = (total) => Math.max(1, Math.ceil(total / registryPageSize));
+
 function formatRegistryDate(value) {
   if (!value) return "—";
   return value.split("-").reverse().join(".");
@@ -241,6 +244,13 @@ function Program({ program, user, shell, sessionError }) {
       .then(([o, r]) => {
         if (controller.signal.aborted) return;
         setOptions(o);
+        const lastPage = lastRegistryPage(r.total);
+        if (!searching && serverPage > lastPage) {
+          // A save can remove the only row on the current server page.
+          setResult(null);
+          setPage(lastPage);
+          return;
+        }
         setResult(r);
       })
       .catch((e) => {
@@ -353,8 +363,13 @@ function Program({ program, user, shell, sessionError }) {
     ? result.items.filter((item) => `${item.code} ${item.title}`.toLocaleLowerCase("uk").includes(searchTerm))
     : null;
   const total = matches?.length ?? result?.total ?? 0;
+  const lastPage = lastRegistryPage(total);
+  const visiblePage = matches ? Math.min(page, lastPage) : page;
+  useEffect(() => {
+    if (page !== visiblePage) setPage(visiblePage);
+  }, [page, visiblePage]);
   const rows = matches
-    ? matches.slice((page - 1) * registryPageSize, page * registryPageSize)
+    ? matches.slice((visiblePage - 1) * registryPageSize, visiblePage * registryPageSize)
     : result?.items ?? [];
   const viewMode = view === "dashboard" ? "overview" : view;
   const programContext = (
@@ -404,7 +419,9 @@ function Program({ program, user, shell, sessionError }) {
           </button>
         )}
       </header>}
-      {view !== "registry" ? (
+      {view === "report" ? (
+        <HalfYearReport program={program} api={api} onOpenMeasure={openDashboardMeasure} />
+      ) : view !== "registry" ? (
         <ProgramDashboard key={viewMode} mode={viewMode} program={program} userRole={user.role}
           programContext={programContext} departments={options?.departments ?? []}
           api={api} onOpenMeasure={openDashboardMeasure} />
@@ -483,12 +500,12 @@ function Program({ program, user, shell, sessionError }) {
                         ? "За цим запитом заходів немає."
                         : "За вибраними фільтрами немає доступних заходів."}</p>
                     )}
-                    {total > registryPageSize && (
+                    {lastPage > 1 && (
                       <nav className="register-pagination" aria-label="Сторінки реєстру">
-                        <button className="secondary" type="button" disabled={page === 1 || loading}
+                        <button className="secondary" type="button" disabled={visiblePage === 1 || loading}
                           onClick={() => changePage(-1)}>Попередня</button>
-                        <span>Сторінка {page}</span>
-                        <button className="secondary" type="button" disabled={page * registryPageSize >= total || loading}
+                        <span>Сторінка {visiblePage}</span>
+                        <button className="secondary" type="button" disabled={visiblePage >= lastPage || loading}
                           onClick={() => changePage(1)}>Наступна</button>
                       </nav>
                     )}

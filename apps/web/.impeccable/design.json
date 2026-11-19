@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-18T14:52:39.549Z",
+  "title": "Design System: Digital Anti-Corruption Monitor",
+  "extensions": {
+    "colorMeta": {
+      "accent": {
+        "role": "primary",
+        "displayName": "Фіолетовий для дій"
+      },
+      "navigation": {
+        "role": "neutral",
+        "displayName": "Темна навігація"
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Робоча панель"
+      }
+    },
+    "breakpoints": [
+      {
+        "name": "registry-rows",
+        "value": "480px"
+      },
+      {
+        "name": "navigation-stack",
+        "value": "740px"
+      },
+      {
+        "name": "registry-inspector-stack",
+        "value": "950px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Основна дія",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Відкриває форму створення заходу.",
+      "html": "<button>Додати захід</button>",
+      "css": "button{min-height:42px;padding:8px 14px;border:1px solid transparent;border-radius:8px;background:#5946c9;color:#fff;font:660 16px system-ui}button:hover{background:#4634af}button:focus-visible{outline:3px solid #8270e3;outline-offset:3px}"
+    }
+  ],
+  "narrative": {
+    "northStar": "Робочий кабінет із джерелами даних",
+    "overview": "Темна навігація, світле поле й панелі з деталізацією. Фіолетовий позначає активний розділ або дію. Доказ і рішення доступні поруч.",
+    "keyCharacteristics": [
+      "Фокус на діях і строках",
+      "Точний період заходу",
+      "Підтверджені дані"
+    ]
+  }
+}
