@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from "node:crypto";
-import { transaction } from "./database.js";
+import { adaptDatabase } from "./database.js";
 import {
   ApiError,
   invalid,
@@ -31,26 +31,35 @@ export const missing = () => {
 export const forbidden = () => {
   throw new ApiError(403, "forbidden", "Дія недоступна");
 };
-export function scope(db, user, programId, departmentId) {
-  return (
-    user.role === "admin" ||
-    !!db
-      .prepare(
-        "SELECT 1 FROM user_scopes WHERE user_id=? AND program_id=? AND department_id=?",
-      )
-      .get(user.id, programId, departmentId)
-  );
+export async function scope(database, user, programId, departmentId) {
+  if (user.role === "admin") return true;
+  const row = await adaptDatabase(database).prepare(
+    "SELECT 1 FROM user_scopes WHERE user_id=? AND program_id=? AND department_id=?",
+  ).get(user.id, programId, departmentId);
+  return Boolean(row);
 }
-export function access(user, { periodKey, today = kyivDate() } = {}) {
-  const conditions = [];
-  const params = [];
-  if (user.role !== "admin") {
-    conditions.push(`EXISTS (
+export async function programAllowed(database, user, id) {
+  const admin = user.role === "admin";
+  const value = await adaptDatabase(database).prepare(`
+    SELECT p.id FROM programs p WHERE p.id=?
+    ${admin ? "" : "AND EXISTS (SELECT 1 FROM user_scopes us WHERE us.program_id=p.id AND us.user_id=?)"}
+  `).get(...(admin ? [id] : [id, user.id]));
+  if (!value) missing();
+}
+
+export function measureScope(user) {
+  return user.role === "admin" ? { sql: "1=1", params: [] } : {
+    sql: `EXISTS (
       SELECT 1 FROM user_scopes us
       WHERE us.user_id=? AND us.program_id=s.program_id AND us.department_id=m.department_id
-    )`);
-    params.push(user.id);
-  }
+    )`,
+    params: [user.id],
+  };
+}
+
+export function access(user, { periodKey, today = kyivDate() } = {}) {
+  const { sql, params } = measureScope(user);
+  const conditions = [sql];
 
   const currentHalf = `${today.slice(0, 4)}-H${today.slice(5, 7) <= "06" ? "1" : "2"}`;
   const period = periodKey === undefined ? currentHalf : periodKey;
@@ -79,7 +88,7 @@ export function access(user, { periodKey, today = kyivDate() } = {}) {
     conditions.push(`${executor}=?`);
     params.push(period, user.id);
   }
-  return { sql: conditions.join(" AND ") || "1=1", params, executor, period };
+  return { sql: conditions.join(" AND "), params, executor, period };
 }
 const measureColumns = "m.*,s.program_id,i.id AS indicator_id,i.title AS indicator_title,i.unit,i.baseline,i.target,i.direction";
 const measureTables = "FROM measures m JOIN sections s ON s.id=m.section_id JOIN indicators i ON i.measure_id=m.id";
@@ -115,15 +124,16 @@ export function measure(row) {
     },
   };
 }
-export function getMeasure(db, user, id, options) {
+export async function getMeasure(database, user, id, options) {
+  const db = adaptDatabase(database);
   const rule = access(user, options);
-  const row = db
+  const row = await db
     .prepare(`${selectPeriodMeasure(rule)} WHERE m.id=? AND ${rule.sql}`)
     .get(rule.period, id, ...rule.params);
   if (!row) missing();
   const value = periodMeasure(row, user, rule.period);
   return user.role === "coordinator"
-    ? { ...value, planFrozen: planIsFrozen(db, id) }
+    ? { ...value, planFrozen: await planIsFrozen(db, id) }
     : value;
 }
 
@@ -138,18 +148,21 @@ export function periodMeasure(row, user, period) {
 
 // Plan writes and their audit use the stored assignment, independent of the
 // current half-year or a coordinator's period filter.
-function getBaseMeasure(db, user, id) {
+async function getBaseMeasure(db, user, id) {
   const rule = access(user);
-  const row = db.prepare(`${selectMeasure} WHERE m.id=? AND ${rule.sql}`)
+  const row = await db.prepare(`${selectMeasure} WHERE m.id=? AND ${rule.sql}`)
     .get(id, ...rule.params);
   return row ? measure(row) : missing();
 }
 
-const planIsFrozen = (db, id) => Boolean(db.prepare(
-  "SELECT 1 FROM results WHERE measure_id=? AND status IN ('submitted','approved') LIMIT 1",
-).get(id));
-export function audit(db, actor, action, entityType, entityId, before, after) {
-  db.prepare("INSERT INTO audit_events VALUES (?,?,?,?,?,?,?,?)").run(
+async function planIsFrozen(db, id) {
+  const row = await db.prepare(
+    "SELECT 1 FROM results WHERE measure_id=? AND status IN ('submitted','approved') LIMIT 1",
+  ).get(id);
+  return Boolean(row);
+}
+export async function audit(database, actor, action, entityType, entityId, before, after) {
+  await adaptDatabase(database).prepare("INSERT INTO audit_events VALUES (?,?,?,?,?,?,?,?)").run(
     randomUUID(),
     actor,
     action,
@@ -168,13 +181,14 @@ export function kyivDate(now = new Date()) {
     day: "2-digit",
   }).format(now);
 }
-export function validateMeasure(
-  db,
+export async function validateMeasure(
+  database,
   input,
   user,
   oldProgram,
   today = kyivDate(),
 ) {
+  const db = adaptDatabase(database);
   const value = {
     ...input,
     sectionId: uuid(input.sectionId),
@@ -186,21 +200,21 @@ export function validateMeasure(
     description: text(input.description, 4000, true),
     scheduleType: choice(input.scheduleType, ["one_time", "continuous"]),
   };
-  const section = db
+  const section = await db
     .prepare(
       "SELECT s.*,p.period_start,p.period_end FROM sections s JOIN programs p ON p.id=s.program_id WHERE s.id=?",
     )
     .get(value.sectionId);
   if (!section || (oldProgram && oldProgram !== section.program_id))
     invalid("Некоректний розділ");
-  const department = db
+  const department = await db
     .prepare("SELECT * FROM departments WHERE id=?")
     .get(value.departmentId);
   if (!department || department.program_id !== section.program_id)
     invalid("Некоректний підрозділ");
-  if (user && !scope(db, user, section.program_id, value.departmentId))
+  if (user && !(await scope(db, user, section.program_id, value.departmentId)))
     forbidden();
-  const executor = db
+  const executor = await db
     .prepare(
       "SELECT 1 FROM users u JOIN user_scopes us ON us.user_id=u.id WHERE u.id=? AND u.active=1 AND u.role='executor' AND us.program_id=? AND us.department_id=?",
     )
@@ -209,9 +223,9 @@ export function validateMeasure(
   if (section.code === 2) {
     if (
       !value.riskId ||
-      !db
+      !(await db
         .prepare("SELECT 1 FROM risks WHERE id=? AND program_id=?")
-        .get(value.riskId, section.program_id)
+        .get(value.riskId, section.program_id))
     )
       invalid("Оберіть ризик цієї програми");
   } else if (value.riskId !== null)
@@ -264,14 +278,14 @@ export function stableIndicatorId(measureId) {
     .digest("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
-function insertMeasure(
+async function insertMeasure(
   db,
   value,
   id = randomUUID(),
   indicatorId = randomUUID(),
 ) {
   const now = new Date().toISOString();
-  db.prepare("INSERT INTO measures VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+  await db.prepare("INSERT INTO measures VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
     id,
     value.sectionId,
     value.departmentId,
@@ -289,7 +303,7 @@ function insertMeasure(
     now,
   );
   const i = value.indicator;
-  db.prepare("INSERT INTO indicators VALUES (?,?,?,?,?,?,?)").run(
+  await db.prepare("INSERT INTO indicators VALUES (?,?,?,?,?,?,?)").run(
     indicatorId,
     id,
     i.title,
@@ -300,7 +314,7 @@ function insertMeasure(
   );
   return id;
 }
-export function saveMeasure(db, user, input, id, { today = kyivDate } = {}) {
+export async function saveMeasure(database, user, input, id, { today = kyivDate } = {}) {
   if (user.role !== "coordinator") forbidden();
   keys(
     input,
@@ -309,16 +323,16 @@ export function saveMeasure(db, user, input, id, { today = kyivDate } = {}) {
   );
   if (id) positive(input.version);
   if (Object.hasOwn(input, "active")) flag(input.active);
-  return transaction(db, () => {
+  return adaptDatabase(database).transaction(async (db) => {
     const dateToday = today();
-    const before = id ? getBaseMeasure(db, user, id) : null;
+    const before = id ? await getBaseMeasure(db, user, id) : null;
     if (before && before.version !== input.version)
       throw new ApiError(
         409,
         "version_conflict",
         "Запис змінено. Оновіть картку та повторіть редагування.",
       );
-    if (before && planIsFrozen(db, id)) {
+    if (before && await planIsFrozen(db, id)) {
       throw new ApiError(409, "plan_frozen", "План заходу зафіксовано після подання результату");
     }
     const combined = before
@@ -326,7 +340,7 @@ export function saveMeasure(db, user, input, id, { today = kyivDate } = {}) {
       : input;
     if (before && !Object.hasOwn(input, "indicator"))
       delete combined.indicator.id;
-    const value = validateMeasure(
+    const value = await validateMeasure(
       db,
       combined,
       user,
@@ -337,7 +351,7 @@ export function saveMeasure(db, user, input, id, { today = kyivDate } = {}) {
       value.departmentId !== before.departmentId ||
       value.executorId !== before.executorId ||
       value.scheduleType !== before.scheduleType
-    ) && db.prepare(
+    ) && await db.prepare(
       `SELECT 1 FROM results WHERE measure_id=?
        UNION ALL SELECT 1 FROM period_assignments WHERE measure_id=? LIMIT 1`,
     ).get(id, id)) {
@@ -347,9 +361,9 @@ export function saveMeasure(db, user, input, id, { today = kyivDate } = {}) {
         "Результат або призначення вже існує. Змінюйте виконавця через призначення на період.",
       );
     }
-    if (!id) id = insertMeasure(db, value);
-    else {
-      const result = db
+    const persistedId = id ?? await insertMeasure(db, value);
+    if (id) {
+      const result = await db
         .prepare(
           "UPDATE measures SET section_id=?,department_id=?,executor_id=?,risk_id=?,code=?,title=?,description=?,schedule_type=?,planned_date=?,active=?,version=version+1,updated_at=? WHERE id=? AND version=?",
         )
@@ -371,21 +385,21 @@ export function saveMeasure(db, user, input, id, { today = kyivDate } = {}) {
       if (!result.changes)
         throw new ApiError(409, "version_conflict", "Запис змінено");
       const i = value.indicator;
-      db.prepare(
+      await db.prepare(
         "UPDATE indicators SET title=?,unit=?,baseline=?,target=?,direction=? WHERE measure_id=?",
       ).run(i.title, i.unit, i.baseline, i.target, i.direction, id);
     }
-    const after = getBaseMeasure(db, user, id);
-    audit(
+    const after = await getBaseMeasure(db, user, persistedId);
+    await audit(
       db,
       user.id,
       before ? "update" : "create",
       "measure",
-      id,
+      persistedId,
       before,
       after,
     );
-    return getMeasure(db, user, id, { today: dateToday });
+    return getMeasure(db, user, persistedId, { today: dateToday });
   });
 }
 
@@ -398,8 +412,8 @@ const importGroups = [
   "risks",
   "measures",
 ];
-export function importRegistry(
-  db,
+export async function importRegistry(
+  database,
   actor,
   payload,
   { seed = false, inTransaction = false } = {},
@@ -429,14 +443,15 @@ export function importRegistry(
         throw new ApiError(409, "duplicate_code", "Повторний ідентифікатор");
       ids.add(id);
     }
-  const perform = () => {
+  const db = adaptDatabase(database);
+  const perform = async (db) => {
     if (!seed) {
       for (const id of ids)
         for (const table of [
           ...importGroups.filter((g) => g !== "scopes"),
           "indicators",
         ]) {
-          if (db.prepare(`SELECT 1 FROM ${table} WHERE id=?`).get(id))
+          if (await db.prepare(`SELECT 1 FROM ${table} WHERE id=?`).get(id))
             throw new ApiError(
               409,
               "duplicate_code",
@@ -447,8 +462,8 @@ export function importRegistry(
     const created = Object.fromEntries(
       [...importGroups, "indicators"].map((g) => [g, 0]),
     );
-    const record = (group, row, insert) => {
-      insert();
+    const record = async (group, insert) => {
+      await insert();
       created[group]++;
     };
     for (const r of payload.programs) {
@@ -462,7 +477,7 @@ export function importRegistry(
       if (start > end) invalid();
       if (payload.sections.filter((s) => s.programId === r.id).length !== 3)
         invalid("Для програми потрібні три розділи");
-      record("programs", r, () =>
+      await record("programs", () =>
         db
           .prepare("INSERT INTO programs VALUES (?,?,?,?,?)")
           .run(uuid(r.id), text(r.code, 50), text(r.title), start, end),
@@ -474,7 +489,7 @@ export function importRegistry(
         ["id", "displayName", "role", "active"],
         ["id", "displayName", "role", "active"],
       );
-      record("users", r, () =>
+      await record("users", () =>
         db
           .prepare("INSERT INTO users VALUES (?,?,?,?)")
           .run(
@@ -492,7 +507,7 @@ export function importRegistry(
           ["id", "programId", "code", "title"],
           ["id", "programId", "code", "title"],
         );
-        record(group, r, () =>
+        await record(group, () =>
           db
             .prepare(`INSERT INTO ${group} VALUES (?,?,?,?)`)
             .run(
@@ -512,7 +527,7 @@ export function importRegistry(
         ["userId", "programId", "departmentId"],
       );
       const args = [uuid(r.userId), uuid(r.programId), uuid(r.departmentId)];
-      db.prepare("INSERT INTO user_scopes VALUES (?,?,?)").run(...args);
+      await db.prepare("INSERT INTO user_scopes VALUES (?,?,?)").run(...args);
       created.scopes++;
     }
     for (const r of payload.measures) {
@@ -521,9 +536,9 @@ export function importRegistry(
         ["id", "effectiveFrom", ...measureFields],
         ["id", "effectiveFrom", ...measureFields],
       );
-      record("measures", r, () => {
-        const value = validateMeasure(db, r, null);
-        insertMeasure(
+      await record("measures", async () => {
+        const value = await validateMeasure(db, r, null);
+        await insertMeasure(
           db,
           value,
           uuid(r.id),
@@ -537,9 +552,9 @@ export function importRegistry(
         for (const row of payload[group]) {
           const after =
             group === "measures"
-              ? getBaseMeasure(db, { id: actor, role: "admin" }, uuid(row.id))
+              ? await getBaseMeasure(db, { id: actor, role: "admin" }, uuid(row.id))
               : row;
-          audit(
+          await audit(
             db,
             actor,
             "import_create",
@@ -549,7 +564,7 @@ export function importRegistry(
             after,
           );
           if (group === "measures")
-            audit(
+            await audit(
               db,
               actor,
               "import_create",
@@ -559,9 +574,9 @@ export function importRegistry(
               after.indicator,
             );
         }
-      audit(db, actor, "import", "registry", randomUUID(), null, created);
+      await audit(db, actor, "import", "registry", randomUUID(), null, created);
     }
     return { created };
   };
-  return inTransaction ? perform() : transaction(db, perform);
+  return inTransaction ? perform(db) : db.transaction(perform);
 }

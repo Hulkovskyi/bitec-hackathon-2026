@@ -30,3 +30,7 @@ Thumbs.db
 *.db-*
 
 *.evidence/
+
+# Hosted demo tooling
+.vercel/
+/supabase/.temp/

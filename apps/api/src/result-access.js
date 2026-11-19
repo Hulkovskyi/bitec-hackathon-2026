@@ -1,3 +1,4 @@
+import { adaptDatabase } from "./database.js";
 import { forbidden, missing, scope, selectMeasure } from "./registry.js";
 import { ApiError, invalid, uuid } from "./validation.js";
 
@@ -9,8 +10,8 @@ export function validPeriodKey(value) {
   return value;
 }
 
-export function getMeasurePlan(db, id) {
-  return db.prepare(
+export async function getMeasurePlan(database, id) {
+  return adaptDatabase(database).prepare(
     `SELECT plan.*, p.period_start, p.period_end,
             s.code AS section_code, s.title AS section_title,
             d.code AS department_code, d.title AS department_title
@@ -21,9 +22,9 @@ export function getMeasurePlan(db, id) {
   ).get(id);
 }
 
-export function planForScope(db, user, id) {
-  const plan = getMeasurePlan(db, uuid(id));
-  if (!plan || !scope(db, user, plan.program_id, plan.department_id)) missing();
+export async function planForScope(db, user, id) {
+  const plan = await getMeasurePlan(db, uuid(id));
+  if (!plan || !(await scope(db, user, plan.program_id, plan.department_id))) missing();
   return plan;
 }
 
@@ -49,35 +50,39 @@ export function assertPeriod(plan, periodKey) {
   return interval;
 }
 
-export function effectiveAssignment(db, plan, periodKey) {
-  return db.prepare(
-    "SELECT executor_id AS executorId, version FROM period_assignments WHERE measure_id=? AND period_key=?",
-  ).get(plan.id, periodKey) ?? { executorId: plan.executor_id, version: 0 };
+export async function effectiveAssignment(database, plan, periodKey) {
+  const row = await adaptDatabase(database).prepare(
+    'SELECT executor_id AS "executorId", version FROM period_assignments WHERE measure_id=? AND period_key=?',
+  ).get(plan.id, periodKey);
+  return row ?? { executorId: plan.executor_id, version: 0 };
 }
 
 // This helper expects an authenticated user. Existing approved revisions are
 // authorized independently from the current execution assignment.
-export function canReadResult(db, user, result, plan) {
-  if (!plan || !scope(db, user, plan.program_id, plan.department_id)) return false;
+export async function canReadResult(db, user, result, plan) {
+  if (!plan || !(await scope(db, user, plan.program_id, plan.department_id))) return false;
   if (user.role !== "executor") return true;
   return result.executor_id === user.id && (
     result.status === "approved" ||
-    effectiveAssignment(db, plan, result.period_key).executorId === user.id
+    (await effectiveAssignment(db, plan, result.period_key)).executorId === user.id
   );
 }
 
-export function readResultForUser(db, user, resultId) {
-  const result = db.prepare("SELECT * FROM results WHERE id=?").get(uuid(resultId));
-  if (!result || !canReadResult(db, user, result, getMeasurePlan(db, result.measure_id))) missing();
+export async function readResultForUser(database, user, resultId) {
+  const db = adaptDatabase(database);
+  const result = await db.prepare("SELECT * FROM results WHERE id=?").get(uuid(resultId));
+  if (!result) missing();
+  const plan = await getMeasurePlan(db, result.measure_id);
+  if (!(await canReadResult(db, user, result, plan))) missing();
   return result;
 }
 
-export function assertResultEditor(db, user, result) {
+export async function assertResultEditor(db, user, result) {
   if (user.role !== "executor") forbidden();
-  const plan = planForScope(db, user, result.measure_id);
+  const plan = await planForScope(db, user, result.measure_id);
   if (
     result.executor_id !== user.id ||
-    effectiveAssignment(db, plan, result.period_key).executorId !== user.id
+    (await effectiveAssignment(db, plan, result.period_key)).executorId !== user.id
   ) missing();
   if (!["draft", "returned"].includes(result.status))
     throw new ApiError(409, "invalid_transition", "Редагування для цього стану недоступне");

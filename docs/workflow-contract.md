@@ -1,6 +1,6 @@
 # Контракт наскрізного сценарію MVP
 
-Результати, докази й погодження реалізовано на етапі 2. Сигнали, панелі та звітність нижче описують вимоги наступних етапів. [Поточний стан](PROGRESS.md)
+Результати, докази й погодження реалізовано на етапі 2. Правила строків і рольові панелі описані в [контракті аналітики](analytics.md). Розділ звітності фіксує вимоги наступного етапу. [Поточний стан](PROGRESS.md)
 Базові UUID, помилки, сесії, scopes, optimistic locking і аудит визначені в [контракті реєстру](registry-contract.md). Усі API нижче успадковують їх. Не приймати роль, actor чи scope з тіла запиту. Усі списки, count, докази, агрегати й експорт обмежені серверним доступом.
 
 ## Issue #2 — результат, докази, погодження
@@ -56,8 +56,8 @@ Leader/analyst/coordinator читають результати та докази
 
 ### Зберігання файлів
 
-Лише синтетичні PDF, PNG, JPEG і TXT до 5 MiB, максимум 10 логічних файлів на виконавця в результаті та 20 версій на логічний файл. Потрібні обмеження потоку до буферизації, перевірка MIME/сигнатури, відхилення HTML/SVG/executable і безпечне відображення назви. storage_key — випадковий серверний UUID; original_name ніколи не використовується як шлях. Каталог поза static web root, download лише через авторизований API, nosniff; не відкривати inline.
-Потік спочатку записується в temp, сервер обчислює SHA-256. Після валідації файл переноситься в незмінний final key, потім SQL-транзакція фіксує metadata/version/audit. При невдачі SQL новий файл прибирається; при аварії можливий orphan, але не видимий запис із незбереженим файлом. Відновлення видаляє лише старі непосилані temp/orphan після grace period, не файли активного завантаження. Нестачу місця, missing файл і checksum mismatch явно показувати. Backup включає SQLite та пов'язані файли узгодженого стану.
+Синтетичні PDF, PNG, JPEG і TXT до 5 МіБ локально та 4 МіБ в онлайн-демо, максимум 10 логічних файлів на виконавця в результаті та 20 версій на логічний файл. Потрібні обмеження потоку до буферизації, перевірка MIME/сигнатури, відхилення HTML/SVG/executable і безпечне відображення назви. storage_key — випадковий серверний UUID; original_name ніколи не використовується як шлях. Каталог поза static web root, download лише через авторизований API, nosniff; не відкривати inline.
+Сервер обмежує потік, перевіряє тип і сигнатуру та обчислює SHA‑256. Перевірені байти записуються під новим ключем локально або в приватний bucket Supabase. SQL-транзакція повторно перевіряє права й версію результату та фіксує метадані, версію й аудит. Якщо запис метаданих точно не завершився, сервер прибирає файл. Локальне сховище прибирає старі непосилані файли після проміжку для активних завантажень. Для резервної копії зберігайте метадані й відповідні байти доказів.
 
 ## Issue #3 — сигнали й панелі
 
@@ -80,12 +80,14 @@ target_not_met/closed_without_improvement обчислюються для ост
 
 GET /api/dashboard?programId=... -> {asOf,counts:{measures,completed,overdue,overdueMeasures,dueSoon,pendingReview},items:[...]}; scope як у реєстрі. counts.measures/completed та частка виконання рахують поточні активні зобов'язання (measureId,periodKey), once включається, якщо effective_from<=today. Частка = completed / measures, порожній знаменник -> null з «Немає заходів». counts.overdue — кількість прострочених пар (measureId,periodKey) за ВСІ доступні періоди; окреме overdueMeasures — кількість унікальних заходів серед них. У dueSoon та pendingReview також рахувати пари, не revisions. Заголовки панелі пояснюють ці одиниці; один захід може мати два прострочені періоди. Кожний агрегат має фільтр drill-down, який повертає ті самі id.
 GET /api/risk-flags?programId=... -> {asOf,items:[{measureId,resultId?,periodKey,ruleCode,sourceValues,explanation,suggestedAction}]} з pagination за загальним контрактом.
-Міграція 003 додає flag_decisions(id,measure_id,result_id nullable,period_key,rule_code,source_snapshot_json,decision_text,assignee_id,due_date,actor_id,created_at). POST /api/risk-flags/decisions приймає {measureId,resultId?,periodKey,ruleCode,decisionText,assigneeId,dueDate}; coordinator у scope, сервер повторно обчислює сигнал і зберігає source snapshot + аудит. Рішення не вимикає правило; якщо сигнал уже не чинний — 409. Довільний ruleCode відхиляється.
+### Заплановане керування рішеннями та демоакаунтами
+
+Запланована міграція 003 додає flag_decisions(id,measure_id,result_id nullable,period_key,rule_code,source_snapshot_json,decision_text,assignee_id,due_date,actor_id,created_at). POST /api/risk-flags/decisions приймає {measureId,resultId?,periodKey,ruleCode,decisionText,assigneeId,dueDate}; coordinator у scope, сервер повторно обчислює сигнал і зберігає source snapshot + аудит. Рішення не вимикає правило; якщо сигнал уже не чинний — 409. Довільний ruleCode відхиляється.
 
 Адмінпанель: GET/POST/PATCH /api/admin/users та /api/admin/scopes, admin-only; users мають version для PATCH, токени не повертаються. Зміну ролі/active/scopes аудитувати атомарно, усі сесії користувача анулювати. Не дозволяти вимкнути/понизити останнього активного admin. Довідники редагувати тільки без порушення FK та frozen плану; конкретні CRUD payload узгодити додатком до контракту перед їх реалізацією. Це не блокує read-only дашборди.
 Нагадування MVP — у застосунку; email/SMS/push не підключені.
 
-## Issue #4 — звіт і аналітична довідка
+## Запланований звіт і аналітична довідка
 
 GET /api/reports/half-year?programId=...&year=2026&half=1&format=json|csv.
 Доступ: coordinator/leader/analyst у scope; admin — усі; executor не має експорту програми (403). HTML для друку будується з того самого JSON snapshot. Обраний період має перетинатися з програмою.

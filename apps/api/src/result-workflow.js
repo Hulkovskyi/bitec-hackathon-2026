@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { transaction } from "./database.js";
+import { adaptDatabase } from "./database.js";
 import {
   audit,
   forbidden,
@@ -27,7 +27,8 @@ const nextStatus = {
   approve: "approved",
 };
 
-function currentEvidence(db, result) {
+export async function currentEvidence(database, result) {
+  const db = adaptDatabase(database);
   return db.prepare(
     `SELECT e.* FROM evidence_versions e
      WHERE e.result_id=? AND e.uploaded_by=?
@@ -42,7 +43,7 @@ function currentEvidence(db, result) {
 
 const outcomes = ["completed", "partial", "not_completed"];
 
-function validateResultDates(db, result, plan, today) {
+async function validateResultDates(db, result, plan, today) {
   const [start, end] = assertPeriod(plan, result.period_key);
   const resultDate = result.result_date === null ? null : date(result.result_date);
   const actualDate = result.actual_date === null ? null : date(result.actual_date);
@@ -51,7 +52,7 @@ function validateResultDates(db, result, plan, today) {
   )) invalid("Дата результату поза робочим інтервалом");
 
   if (result.supersedes_id !== null) {
-    const previous = db.prepare("SELECT * FROM results WHERE id=?").get(result.supersedes_id);
+    const previous = await db.prepare("SELECT * FROM results WHERE id=?").get(result.supersedes_id);
     if (
       !previous || previous.status !== "approved" || previous.outcome === "completed" ||
       previous.revision + 1 !== result.revision ||
@@ -62,14 +63,14 @@ function validateResultDates(db, result, plan, today) {
 
 }
 
-function validateForDecision(db, result, plan, today, verifyEvidence) {
+async function validateForDecision(db, result, plan, today, verifyEvidence) {
   const outcome = choice(result.outcome, outcomes);
   text(result.description, 4000);
   if (outcome !== "completed") text(result.non_completion_reason, 4000);
   date(result.result_date);
-  validateResultDates(db, result, plan, today);
+  await validateResultDates(db, result, plan, today);
 
-  const evidence = currentEvidence(db, result);
+  const evidence = await currentEvidence(db, result);
   if (
     outcome !== "not_completed" &&
     (result.actual_date !== result.result_date || !Number.isFinite(result.measured_value) || evidence.length === 0)
@@ -77,8 +78,12 @@ function validateForDecision(db, result, plan, today, verifyEvidence) {
   if (result.measured_value !== null && !Number.isFinite(result.measured_value))
     invalid("Некоректне виміряне значення");
 
-  if (verifyEvidence && evidence.some((file) => verifyEvidence(file) !== true))
-    invalid("Не вдалося підтвердити цілісність доказу");
+  if (verifyEvidence) {
+    for (const file of evidence) {
+      if (await verifyEvidence(file) !== true)
+        invalid("Не вдалося підтвердити цілісність доказу");
+    }
+  }
 }
 
 function planSnapshot(row) {
@@ -114,10 +119,10 @@ function latestResult(db, measureId, periodKey) {
   ).get(measureId, periodKey);
 }
 
-function hasPlanAssignment(db, plan, userId) {
+async function hasPlanAssignment(db, plan, userId) {
   if (plan.schedule_type === "one_time")
-    return effectiveAssignment(db, plan, "once").executorId === userId;
-  const overrides = db.prepare(
+    return (await effectiveAssignment(db, plan, "once")).executorId === userId;
+  const overrides = await db.prepare(
     "SELECT executor_id FROM period_assignments WHERE measure_id=?",
   ).all(plan.id);
   if (overrides.some((row) => row.executor_id === userId)) return true;
@@ -128,49 +133,54 @@ function hasPlanAssignment(db, plan, userId) {
   return overrides.length < available;
 }
 
-function assignmentForUser(db, plan, user, periodKey) {
+async function assignmentForUser(db, plan, user, periodKey) {
   if (!workInterval(plan, periodKey)) {
-    if (user.role === "executor" && !hasPlanAssignment(db, plan, user.id)) missing();
+    if (user.role === "executor" && !(await hasPlanAssignment(db, plan, user.id))) missing();
     invalid("Період не належить заходу");
   }
-  const assignment = effectiveAssignment(db, plan, periodKey);
+  const assignment = await effectiveAssignment(db, plan, periodKey);
   if (user.role === "executor" && assignment.executorId !== user.id) missing();
   return assignment;
 }
 
-export function listResults(db, user, measureId) {
-  const plan = planForScope(db, user, measureId);
-  const items = db.prepare(
+export async function listResults(database, user, measureId) {
+  const db = adaptDatabase(database);
+  const plan = await planForScope(db, user, measureId);
+  const results = await db.prepare(
     "SELECT * FROM results WHERE measure_id=? ORDER BY period_key DESC, revision DESC",
-  ).all(plan.id).filter((result) => canReadResult(db, user, result, plan));
-  if (user.role === "executor" && items.length === 0 && !hasPlanAssignment(db, plan, user.id))
+  ).all(plan.id);
+  const items = [];
+  for (const result of results) {
+    if (await canReadResult(db, user, result, plan)) items.push(result);
+  }
+  if (user.role === "executor" && items.length === 0 && !(await hasPlanAssignment(db, plan, user.id)))
     missing();
   return items;
 }
 
-export function createResult(db, user, measureId, input) {
+export async function createResult(db, user, measureId, input) {
   if (user.role !== "executor") forbidden();
   keys(input, ["periodKey"], ["periodKey"]);
   const periodKey = validPeriodKey(input.periodKey);
-  return transaction(db, () => {
-    const plan = planForScope(db, user, measureId);
-    assignmentForUser(db, plan, user, periodKey);
+  return adaptDatabase(db).transaction(async (db) => {
+    const plan = await planForScope(db, user, measureId);
+    await assignmentForUser(db, plan, user, periodKey);
     if (!plan.active) inactiveMeasure();
 
-    const previous = latestResult(db, plan.id, periodKey);
+    const previous = await latestResult(db, plan.id, periodKey);
     if (previous && previous.status !== "approved")
       throw new ApiError(409, "result_open", "Для періоду вже є відкритий результат");
     if (previous?.outcome === "completed")
       throw new ApiError(409, "already_completed", "Захід уже виконано в цьому періоді");
 
     const now = new Date().toISOString();
-    const result = db.prepare(
+    const result = await db.prepare(
       `INSERT INTO results
          (id, measure_id, period_key, revision, supersedes_id, executor_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     ).get(randomUUID(), plan.id, periodKey, (previous?.revision ?? 0) + 1,
       previous?.id ?? null, user.id, now, now);
-    audit(db, user.id, "create", "result", result.id, null, result);
+    await audit(db, user.id, "create", "result", result.id, null, result);
     return result;
   });
 }
@@ -187,57 +197,58 @@ const resultFields = {
   }],
 };
 
-export function patchResult(db, user, resultId, input, { today = kyivDate } = {}) {
+export async function patchResult(db, user, resultId, input, { today = kyivDate } = {}) {
   if (user.role !== "executor") forbidden();
   keys(input, ["version", ...Object.keys(resultFields)], ["version"]);
   const version = positive(input.version);
   const fields = Object.entries(resultFields).filter(([key]) => Object.hasOwn(input, key));
   if (!fields.length) invalid("Немає полів для оновлення");
 
-  return transaction(db, () => {
-    const result = readResultForUser(db, user, resultId);
-    assertResultEditor(db, user, result);
+  return adaptDatabase(db).transaction(async (db) => {
+    const result = await readResultForUser(db, user, resultId);
+    await assertResultEditor(db, user, result);
     if (result.version !== version) throw versionConflict();
     const changes = fields.map(([key, [column, validate]]) => [column, validate(input[key])]);
     const updated = { ...result, ...Object.fromEntries(changes) };
-    validateResultDates(db, updated, getMeasurePlan(db, result.measure_id), today());
+    await validateResultDates(db, updated, await getMeasurePlan(db, result.measure_id), today());
 
-    const after = db.prepare(
+    const after = await db.prepare(
       `UPDATE results
        SET ${changes.map(([column]) => column + "=?").join(", ")}, version=version+1, updated_at=?
        WHERE id=? AND version=? RETURNING *`,
     ).get(...changes.map(([, value]) => value), new Date().toISOString(), result.id, version);
     if (!after) throw versionConflict();
-    audit(db, user.id, "update", "result", result.id, result, after);
+    await audit(db, user.id, "update", "result", result.id, result, after);
     return after;
   });
 }
 
-export function readAssignment(db, user, measureId, periodKey) {
+export async function readAssignment(database, user, measureId, periodKey) {
+  const db = adaptDatabase(database);
   validPeriodKey(periodKey);
-  const plan = planForScope(db, user, measureId);
+  const plan = await planForScope(db, user, measureId);
   return assignmentForUser(db, plan, user, periodKey);
 }
 
-export function assignExecutor(db, user, measureId, input) {
+export async function assignExecutor(db, user, measureId, input) {
   if (user.role !== "coordinator") forbidden();
   keys(input, ["periodKey", "executorId", "version"], ["periodKey", "executorId", "version"]);
   const executorId = uuid(input.executorId);
   const version = input.version === 0 ? 0 : positive(input.version);
-  return transaction(db, () => {
-    const plan = planForScope(db, user, measureId);
+  return adaptDatabase(db).transaction(async (db) => {
+    const plan = await planForScope(db, user, measureId);
     const periodKey = input.periodKey;
     assertPeriod(plan, periodKey);
     if (!plan.active) inactiveMeasure();
-    const before = effectiveAssignment(db, plan, periodKey);
+    const before = await effectiveAssignment(db, plan, periodKey);
     if (version !== before.version) throw versionConflict();
 
-    const result = latestResult(db, plan.id, periodKey);
+    const result = await latestResult(db, plan.id, periodKey);
     if (result?.status === "submitted" ||
         (result?.status === "approved" && result.outcome === "completed"))
       throw new ApiError(409, "invalid_transition", "Зміна виконавця для цього стану недоступна");
 
-    const eligible = db.prepare(
+    const eligible = await db.prepare(
       `SELECT 1 FROM users u
        JOIN user_scopes us ON us.user_id=u.id
        WHERE u.id=? AND u.role='executor' AND u.active=1
@@ -246,11 +257,11 @@ export function assignExecutor(db, user, measureId, input) {
     if (!eligible) invalid("Виконавець не має доступу до підрозділу");
 
     const assignment = version === 0
-      ? db.prepare(
+      ? await db.prepare(
         `INSERT INTO period_assignments (measure_id, period_key, executor_id)
          VALUES (?, ?, ?) RETURNING executor_id AS executorId, version`,
       ).get(plan.id, periodKey, executorId)
-      : db.prepare(
+      : await db.prepare(
         `UPDATE period_assignments SET executor_id=?, version=version+1
          WHERE measure_id=? AND period_key=? AND version=?
          RETURNING executor_id AS executorId, version`,
@@ -258,20 +269,20 @@ export function assignExecutor(db, user, measureId, input) {
     if (!assignment) throw versionConflict();
 
     if (result && ["draft", "returned"].includes(result.status) && result.executor_id !== executorId) {
-      const updated = db.prepare(
+      const updated = await db.prepare(
         `UPDATE results SET executor_id=?, version=version+1, updated_at=?
          WHERE id=? AND version=? RETURNING *`,
       ).get(executorId, new Date().toISOString(), result.id, result.version);
       if (!updated) throw versionConflict();
-      audit(db, user.id, "reassign", "result", result.id, result, updated);
+      await audit(db, user.id, "reassign", "result", result.id, result, updated);
     }
-    audit(db, user.id, "assign", "period_assignment", plan.id,
+    await audit(db, user.id, "assign", "period_assignment", plan.id,
       { periodKey, ...before }, { periodKey, ...assignment });
     return assignment;
   });
 }
 
-export function transitionResult(
+export async function transitionResult(
   db,
   actorId,
   resultId,
@@ -285,19 +296,19 @@ export function transitionResult(
   const submit = action === "submit";
   const approve = action === "approve";
 
-  return transaction(db, () => {
-    const actor = db.prepare("SELECT id, role FROM users WHERE id=? AND active=1").get(uuid(actorId));
+  return adaptDatabase(db).transaction(async (db) => {
+    const actor = await db.prepare("SELECT id, role FROM users WHERE id=? AND active=1").get(uuid(actorId));
     if (!actor) throw new ApiError(401, "unauthenticated", "Користувач недоступний");
     if (actor.role !== (submit ? "executor" : "coordinator")) forbidden();
 
     const readResult = db.prepare("SELECT * FROM results WHERE id=?");
-    const result = readResult.get(uuid(resultId));
+    const result = await readResult.get(uuid(resultId));
     if (!result) missing();
-    const plan = getMeasurePlan(db, result.measure_id);
-    if (!plan || !scope(db, actor, plan.program_id, plan.department_id)) missing();
+    const plan = await getMeasurePlan(db, result.measure_id);
+    if (!plan || !(await scope(db, actor, plan.program_id, plan.department_id))) missing();
     if (submit) {
       if (result.executor_id !== actor.id ||
-          effectiveAssignment(db, plan, result.period_key).executorId !== actor.id)
+          (await effectiveAssignment(db, plan, result.period_key)).executorId !== actor.id)
         missing();
       if (!plan.active) inactiveMeasure();
     } else if (result.executor_id === actor.id) {
@@ -310,10 +321,10 @@ export function transitionResult(
       throw new ApiError(409, "invalid_transition", "Перехід для цього стану недоступний");
 
     if (submit || approve)
-      validateForDecision(db, result, plan, today(), approve ? (verifyEvidence ?? (() => false)) : null);
+      await validateForDecision(db, result, plan, today(), approve ? (verifyEvidence ?? (() => false)) : null);
 
     const now = new Date().toISOString();
-    const updated = db.prepare(
+    const updated = await db.prepare(
       `UPDATE results
        SET status=?, version=version+1, plan_snapshot_json=?, submitted_at=?, approved_at=?, updated_at=?
        WHERE id=? AND version=?`,
@@ -328,12 +339,12 @@ export function transitionResult(
     );
     if (updated.changes !== 1) throw versionConflict();
 
-    const after = readResult.get(result.id);
-    if (!submit) db.prepare(
+    const after = await readResult.get(result.id);
+    if (!submit) await db.prepare(
       `INSERT INTO result_reviews (id, result_id, decision, comment, actor_id, created_at, result_version)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).run(randomUUID(), result.id, action, comment, actor.id, now, after.version);
-    audit(db, actor.id, action, "result", result.id, result, after);
+    await audit(db, actor.id, action, "result", result.id, result, after);
     return after;
   });
 }

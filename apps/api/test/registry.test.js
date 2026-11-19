@@ -12,7 +12,7 @@ const origin = "http://127.0.0.1:3001";
 async function setup(t, { demoMode = true } = {}) {
   const db = new DatabaseSync(":memory:");
   migrate(db);
-  seed(db, { demoMode: true });
+  await seed(db, { demoMode: true });
   const server = createApp(db, { demoMode, today: () => "2026-11-17" }).listen(
     0,
     "127.0.0.1",
@@ -104,12 +104,12 @@ const importBody = () => {
   return result;
 };
 
-test("migration and explicit seed are repeatable without overwriting data", () => {
+test("migration and explicit seed are repeatable without overwriting data", async () => {
   const db = new DatabaseSync(":memory:");
   try {
     migrate(db);
-    assert.throws(() => seed(db), /DEMO_MODE/);
-    seed(db, { demoMode: true });
+    await assert.rejects(() => seed(db), /DEMO_MODE/);
+    await seed(db, { demoMode: true });
     const before = counts(db);
     const indicatorIds = db
       .prepare("SELECT id FROM indicators ORDER BY id")
@@ -119,7 +119,7 @@ test("migration and explicit seed are repeatable without overwriting data", () =
       id(501),
     );
     migrate(db);
-    seed(db, { demoMode: true });
+    await seed(db, { demoMode: true });
     assert.deepEqual(counts(db), before);
     assert.deepEqual(
       db.prepare("SELECT id FROM indicators ORDER BY id").all(),
@@ -536,7 +536,7 @@ test("import is create-only, bounded, validated, admin-only and fully transactio
   assert.deepEqual(counts(db), before);
 });
 
-test("seed manifest refuses collisions, partial failure, missing records and changed versions", () => {
+test("seed manifest refuses collisions, partial failure, missing records and changed versions", async () => {
   const db = new DatabaseSync(":memory:");
   migrate(db);
   try {
@@ -548,7 +548,7 @@ test("seed manifest refuses collisions, partial failure, missing records and cha
       "2026-12-31",
     );
     const before = counts(db);
-    assert.throws(() => seed(db, { demoMode: true }), {
+    await assert.rejects(() => seed(db, { demoMode: true }), {
       code: "seed_conflict",
     });
     assert.deepEqual(counts(db), before);
@@ -562,20 +562,20 @@ test("seed manifest refuses collisions, partial failure, missing records and cha
       "CREATE TRIGGER fail_last_seed BEFORE INSERT ON seed_batches BEGIN SELECT RAISE(ABORT,'last insert failed'); END;",
     );
     const empty = counts(clean);
-    assert.throws(() => seed(clean, { demoMode: true }));
+    await assert.rejects(() => seed(clean, { demoMode: true }));
     assert.deepEqual(counts(clean), empty);
     clean.exec("DROP TRIGGER fail_last_seed");
-    seed(clean, { demoMode: true });
+    await seed(clean, { demoMode: true });
     const applied = counts(clean),
       changed = structuredClone(fixture);
     changed.users[0].displayName = "Змінений manifest";
-    assert.throws(() => seed(clean, { demoMode: true, manifest: changed }), {
+    await assert.rejects(() => seed(clean, { demoMode: true, manifest: changed }), {
       code: "seed_version_conflict",
     });
     assert.deepEqual(counts(clean), applied);
     clean.prepare("DELETE FROM indicators WHERE measure_id=?").run(id(501));
     const broken = counts(clean);
-    assert.throws(() => seed(clean, { demoMode: true }), {
+    await assert.rejects(() => seed(clean, { demoMode: true }), {
       code: "seed_inconsistent",
     });
     assert.deepEqual(counts(clean), broken);

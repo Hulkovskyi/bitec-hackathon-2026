@@ -18,7 +18,7 @@ async function setup(t) {
   const evidenceDirectory = await mkdtemp(join(tmpdir(), "dacm-test-evidence-"));
   const db = new DatabaseSync(":memory:");
   migrate(db);
-  seed(db, { demoMode: true });
+  await seed(db, { demoMode: true });
   const server = createApp(db, {
     evidenceDirectory,
     demoMode: true,
