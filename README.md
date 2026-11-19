@@ -23,7 +23,7 @@
 
 ## Як запустити
 
-Потрібні Git, Node.js 24 і npm. Клонуйте репозиторій. До злиття звітності виконайте `git switch codex/stage-04-integrated-reporting` після клонування, щоб перевірити нову гілку.
+Потрібні Git, Node.js 24 і npm. Клонуйте основну гілку репозиторію.
 
 ```bash
 git clone https://github.com/Hulkovskyi/bitec-hackathon-2026.git && cd bitec-hackathon-2026
