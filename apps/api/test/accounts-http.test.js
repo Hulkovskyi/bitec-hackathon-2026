@@ -9,11 +9,13 @@ import { migrate } from "../src/database.js";
 import { fixture, seed } from "../src/seed.js";
 
 const origin = "http://127.0.0.1:3001";
-const applicant = {
-  username: "apply.test", password: "synthetic-applicant-passphrase",
+const employee = {
+  username: "employee.test", password: "synthetic-employee-passphrase",
   fullName: "Олена Тестова", department: "Перший відділ", position: "Фахівець",
 };
-const administrator = { ...applicant, username: "local.admin", fullName: "Тестовий Адміністратор" };
+const administrator = { ...employee, username: "local.admin", fullName: "Тестовий Адміністратор" };
+const departmentIds = [fixture.measures[0].departmentId];
+const unknownId = "0b1ba9b8-a7fa-4e5a-8593-a79563d948ef";
 
 async function setup(t, options = {}) {
   const db = new DatabaseSync(":memory:");
@@ -26,7 +28,7 @@ async function setup(t, options = {}) {
     await new Promise((resolve) => server.close(resolve));
     db.close();
   });
-  const base = `http://127.0.0.1:${server.address().port}/api`;
+  const base = "http://127.0.0.1:" + server.address().port + "/api";
   async function request(path, { method = "GET", cookie, body, from = origin } = {}) {
     const response = await fetch(base + path, {
       method,
@@ -38,106 +40,155 @@ async function setup(t, options = {}) {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const setCookie = response.headers.get("set-cookie");
-    return { status: response.status, data: response.status === 204 ? null : await response.json(),
-      cookie: setCookie?.split(";")[0], setCookie };
+    return {
+      status: response.status, data: response.status === 204 ? null : await response.json(),
+      cookie: setCookie?.split(";")[0], setCookie,
+    };
   }
-  const login = ({ username, password }, cookie) => request("/auth/login", { method: "POST", cookie, body: { username, password } });
-  return { db, request, login, admin };
+  const login = ({ username, password }, cookie) =>
+    request("/auth/login", { method: "POST", cookie, body: { username, password } });
+  const provision = (body, cookie, from) =>
+    request("/admin/accounts", { method: "POST", cookie, body, from });
+  const enrollment = { ...employee, managerId: admin.id, roleId: "analyst", departmentIds };
+  return { db, request, login, admin, provision, enrollment };
 }
 
-test("registration and login gate application decisions and apply role updates to existing sessions", async (t) => {
-  const { db, request, login, admin } = await setup(t);
-  assert.deepEqual((await request("/auth/options")).data, { demoEnabled: false, registrationEnabled: true });
+test("an administrator provisions a complete account with immediate, scoped password access", async (t) => {
+  const { db, request, login, admin, provision, enrollment } = await setup(t);
+  assert.deepEqual((await request("/auth/options")).data, { demoEnabled: false, registrationEnabled: false });
   assert.equal((await request("/demo/users")).status, 404);
-  assert.equal((await request("/auth/register", { method: "POST", body: applicant, from: "https://foreign.example" })).status, 403);
-  assert.equal((await request("/auth/register", { method: "POST", body: { ...applicant, role: "admin" } })).status, 400);
-  assert.deepEqual((await request("/auth/register", { method: "POST", body: applicant })).data, { status: "draft" });
-  assert.equal((await request("/auth/register", { method: "POST", body: { ...applicant, username: "APPLY.TEST" } })).status, 409);
-  assert.equal((await login({ ...applicant, password: "wrong" })).status, 401);
-  const stored = db.prepare("SELECT password_hash FROM credential_accounts WHERE username=?").get(applicant.username);
-  assert.match(stored.password_hash, /^[a-f0-9]{32}:[a-f0-9]{128}$/);
-
-  const signedIn = await login({ ...applicant, username: "APPLY.TEST" });
-  const cookie = signedIn.cookie;
-  assert.equal(signedIn.status, 201);
-  assert.match(signedIn.setCookie, /HttpOnly/);
-  assert.match(signedIn.setCookie, /Secure/);
-  assert.match(signedIn.setCookie, /SameSite=Strict/);
-  assert.equal(db.prepare("SELECT id_hash FROM account_sessions WHERE user_id=?").get(signedIn.data.userId).id_hash,
-    createHash("sha256").update(cookie.split("=")[1]).digest("hex"));
-  const draft = await request("/me", { cookie });
-  assert.equal(draft.data.status, "draft");
-  assert.deepEqual(draft.data.profile, { username: applicant.username, fullName: applicant.fullName,
-    department: applicant.department, position: applicant.position });
-  assert.equal((await request("/programs", { cookie })).status, 403);
+  assert.equal((await request("/demo/session", { method: "POST", body: { userId: fixture.users[0].id } })).status, 404);
+  const registration = await request("/auth/register", { method: "POST", body: employee });
+  assert.equal(registration.status, 403);
+  assert.equal(registration.data.error.code, "registration_disabled");
+  assert.equal((await provision(enrollment)).status, 401);
+  assert.equal((await login(employee)).status, 401);
 
   const adminSession = await login(administrator);
   assert.equal(adminSession.data.userId, admin.id);
   const adminCookie = adminSession.cookie;
   const management = () => request("/admin/access", { cookie: adminCookie });
-  assert.deepEqual((await management()).data.accounts.map(({ id }) => id), [admin.id]);
-  assert.equal((await request("/access-application/submit", { method: "POST", cookie, body: {} })).data.status, "pending");
-  assert.equal((await request("/access-application/submit", { method: "POST", cookie, body: {} })).status, 200);
-  assert.equal((await request("/admin/access", { cookie })).status, 403);
-  const pending = (await management()).data.accounts.find(({ status }) => status === "pending");
-  assert.equal(pending.fullName, applicant.fullName);
+  const initial = (await management()).data.accounts;
+  assert.deepEqual(initial.map(({ id, managerId }) => ({ id, managerId })), [{ id: admin.id, managerId: null }]);
+  assert.equal((await provision(enrollment, adminCookie, "https://foreign.example")).status, 403);
 
   const role = await request("/admin/roles", { method: "POST", cookie: adminCookie,
     body: { name: "Користувацький аналітик", baseRole: "analyst", permissions: ["reports.read"] } });
   assert.equal(role.status, 201);
   assert.equal((await request("/admin/roles/admin", { method: "PATCH", cookie: adminCookie,
     body: { name: "Без прав", permissions: [] } })).status, 403);
-  const departmentIds = [fixture.measures[0].departmentId];
-  const decision = `/admin/applications/${pending.id}/decision`;
-  assert.equal((await request(decision, { method: "POST", cookie: adminCookie,
-    body: { decision: "approve", roleId: role.data.id, departmentIds: ["0b1ba9b8-a7fa-4e5a-8593-a79563d948ef"] } })).status, 400);
-  assert.equal((await request(decision, { method: "POST", cookie: adminCookie,
-    body: { decision: "approve", roleId: role.data.id, departmentIds } })).status, 200);
-  assert.equal((await request(decision, { method: "POST", cookie: adminCookie,
-    body: { decision: "reject", reason: "Повторне рішення" } })).status, 409);
+  const created = await provision({ ...enrollment, roleId: role.data.id }, adminCookie);
+  assert.equal(created.status, 201);
+  assert.equal(created.data.status, "approved");
+  assert.equal(created.data.roleId, role.data.id);
+  assert.deepEqual(created.data.departmentIds, departmentIds);
+  assert.equal(created.data.managerId, admin.id);
+  assert.equal(created.data.managerName, administrator.fullName);
+  assert.ok(!JSON.stringify(created.data).includes(employee.password));
+  assert.equal((await login({ ...employee, password: "wrong" })).status, 401);
+
+  const { password_hash: hash } = db.prepare("SELECT password_hash FROM credential_accounts WHERE username=?").get(employee.username);
+  assert.match(hash, /^[a-f0-9]{32}:[a-f0-9]{128}$/);
+  const creationEvent = db.prepare("SELECT actor_id, after_json FROM audit_events WHERE entity_id=?").get(created.data.id);
+  assert.equal(creationEvent.actor_id, admin.id);
+  assert.ok(!creationEvent.after_json.includes(employee.password) && !creationEvent.after_json.includes(hash));
+
+  const signedIn = await login({ ...employee, username: "EMPLOYEE.TEST" });
+  assert.equal(signedIn.status, 201);
+  assert.equal(signedIn.data.userId, created.data.id);
+  assert.match(signedIn.setCookie, /HttpOnly/);
+  assert.match(signedIn.setCookie, /Secure/);
+  assert.match(signedIn.setCookie, /SameSite=Strict/);
+  const cookie = signedIn.cookie;
+  assert.equal(db.prepare("SELECT id_hash FROM account_sessions WHERE user_id=?").get(created.data.id).id_hash,
+    createHash("sha256").update(cookie.split("=")[1]).digest("hex"));
 
   const approved = (await request("/me", { cookie })).data;
   assert.equal(approved.status, "approved");
   assert.equal(approved.roleName, role.data.name);
   assert.deepEqual(approved.permissions, ["reports.read"]);
+  assert.deepEqual(approved.profile, {
+    username: employee.username, fullName: employee.fullName, department: employee.department,
+    position: employee.position, managerId: admin.id, managerName: administrator.fullName,
+  });
+  assert.equal((await request("/admin/access", { cookie })).status, 403);
+  assert.equal((await provision({ ...enrollment, username: "unauthorized.admin", roleId: "admin" }, cookie)).status, 403);
+
+  const subordinate = await provision({
+    ...enrollment, fullName: "Іван Тестовий", username: "reporting.test", managerId: created.data.id,
+  }, adminCookie);
+  assert.equal(subordinate.status, 201);
+  const managed = (await management()).data.accounts.find(({ id }) => id === subordinate.data.id);
+  assert.equal(managed.managerId, created.data.id);
+  assert.equal(managed.managerName, employee.fullName);
+
   const { programId } = approved.scopes[0];
-  const report = `/reports/half-year?programId=${programId}&year=2026&half=2`;
+  const report = "/reports/half-year?programId=" + programId + "&year=2026&half=2";
   assert.equal((await request(report, { cookie })).status, 200);
   const foreignMeasure = fixture.measures.find(({ departmentId }) => !departmentIds.includes(departmentId));
-  assert.equal((await request(`/measures/${foreignMeasure.id}`, { cookie })).status, 404);
-  assert.equal((await request(`/admin/roles/${role.data.id}`, { method: "PATCH", cookie: adminCookie,
+  assert.equal((await request("/measures/" + foreignMeasure.id, { cookie })).status, 404);
+  assert.equal((await request("/admin/roles/" + role.data.id, { method: "PATCH", cookie: adminCookie,
     body: { name: role.data.name, permissions: ["registry.write"] } })).status, 200);
   assert.equal((await request(report, { cookie })).status, 403);
   const { id: _id, effectiveFrom: _start, ...measure } = fixture.measures[0];
   assert.equal((await request("/measures", { method: "POST", cookie,
     body: { ...measure, code: "CUSTOM-ROLE-TEST" } })).status, 201);
 
-  const assignment = `/admin/accounts/${pending.id}`;
+  const assignment = "/admin/accounts/" + created.data.id;
   assert.equal((await request(assignment, { method: "PATCH", cookie: adminCookie,
     body: { roleId: "leader", departmentIds } })).status, 200);
   assert.equal((await request(report, { cookie })).status, 200);
   assert.equal((await request("/measures", { method: "POST", cookie,
     body: { ...measure, code: "ROLE-REVOKED-TEST" } })).status, 403);
-  assert.equal((await request(`/admin/accounts/${admin.id}`, { method: "PATCH", cookie: adminCookie,
+  assert.equal((await request("/admin/accounts/" + admin.id, { method: "PATCH", cookie: adminCookie,
     body: { roleId: "leader", departmentIds } })).status, 403);
   assert.equal((await request(assignment, { method: "PATCH", cookie: adminCookie,
     body: { roleId: "leader", departmentIds: [] } })).status, 200);
   assert.deepEqual((await request("/programs", { cookie })).data.items, []);
-  const rotated = await login(applicant, cookie);
+  const rotated = await login(employee, cookie);
   assert.notEqual(rotated.cookie, cookie);
   assert.equal((await request("/me", { cookie })).status, 401);
   assert.equal((await request("/session", { method: "DELETE", cookie: rotated.cookie })).status, 204);
   assert.equal((await request("/me", { cookie: rotated.cookie })).status, 401);
 });
 
-test("synthetic demo sessions reject credential accounts and registration is blocked", async (t) => {
-  const { db, request, admin } = await setup(t, { demoMode: true, registrationEnabled: true });
+test("invalid provisioning and duplicate usernames leave no partial account, scope or audit row", async (t) => {
+  const { db, login, provision, enrollment } = await setup(t);
+  const { cookie } = await login(administrator);
+  const countWrites = () => ["users", "credential_accounts", "user_scopes", "audit_events"].map((table) =>
+    db.prepare("SELECT COUNT(*) AS n FROM " + table).get().n);
+  const before = countWrites();
+  for (const field of ["fullName", "username", "password", "department", "position", "managerId"]) {
+    const incomplete = { ...enrollment };
+    delete incomplete[field];
+    assert.equal((await provision(incomplete, cookie)).status, 400, field);
+  }
+  for (const payload of [
+    { ...enrollment, managerId: null },
+    { ...enrollment, managerId: unknownId },
+    { ...enrollment, managerId: fixture.users[0].id },
+    { ...enrollment, roleId: "unknown" },
+    { ...enrollment, departmentIds: [unknownId] },
+  ]) {
+    assert.equal((await provision(payload, cookie)).status, 400);
+  }
+  assert.deepEqual(countWrites(), before);
+
+  assert.equal((await provision(enrollment, cookie)).status, 201);
+  const after = countWrites();
+  const duplicate = await provision({ ...enrollment, username: "EMPLOYEE.TEST" }, cookie);
+  assert.equal(duplicate.status, 409);
+  assert.equal(duplicate.data.error.code, "username_taken");
+  assert.deepEqual(countWrites(), after);
+});
+
+test("synthetic demo users cannot provision accounts or impersonate credential accounts", async (t) => {
+  const { db, request, admin, provision, enrollment } = await setup(t, { demoMode: true });
   await assert.rejects(createFirstAdministrator(db, { ...administrator, username: "other.admin" }), { code: "admin_exists" });
   assert.deepEqual((await request("/auth/options")).data, { demoEnabled: true, registrationEnabled: false });
-  const registration = await request("/auth/register", { method: "POST", body: applicant });
+  const registration = await request("/auth/register", { method: "POST", body: employee });
   assert.equal(registration.status, 403);
   assert.equal(registration.data.error.code, "registration_disabled");
-  assert.equal(db.prepare("SELECT COUNT(*) AS total FROM credential_accounts").get().total, 1);
   const demoUsers = (await request("/demo/users")).data.items;
   assert.ok(demoUsers.every(({ id }) => id !== admin.id));
   assert.equal((await request("/demo/session", { method: "POST", body: { userId: admin.id } })).status, 401);
@@ -145,29 +196,32 @@ test("synthetic demo sessions reject credential accounts and registration is blo
   const demo = await request("/demo/session", { method: "POST", body: { userId: demoAdminId } });
   assert.equal(demo.status, 201);
   assert.equal((await request("/admin/access", { cookie: demo.cookie })).status, 403);
+  assert.equal((await provision(enrollment, demo.cookie)).status, 403);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM credential_accounts").get().n, 1);
 });
 
-test("working environments can close registration and retain password login", async (t) => {
-  const { request, login } = await setup(t, { registrationEnabled: false });
-  assert.deepEqual((await request("/auth/options")).data, { demoEnabled: false, registrationEnabled: false });
-  assert.equal((await request("/auth/register", { method: "POST", body: applicant })).status, 403);
-  assert.equal((await login(administrator)).status, 201);
-});
-
-test("rejected applications remain blocked", async (t) => {
-  const { db, request, login } = await setup(t);
-  assert.equal((await request("/auth/register", { method: "POST", body: applicant })).status, 201);
-  const { cookie, data: { userId } } = await login(applicant);
-  await request("/access-application/submit", { method: "POST", cookie, body: {} });
-  const admin = await login(administrator);
-  const reason = "Потрібно уточнити підрозділ";
-  assert.equal((await request(`/admin/applications/${userId}/decision`, { method: "POST", cookie: admin.cookie,
-    body: { decision: "reject", reason } })).status, 200);
-  const rejected = (await request("/me", { cookie })).data;
-  assert.equal(rejected.status, "rejected");
-  assert.equal(rejected.decisionReason, reason);
-  assert.equal((await request("/programs", { cookie })).status, 403);
-  assert.equal((await request("/access-application/submit", { method: "POST", cookie, body: {} })).status, 409);
-  assert.deepEqual(db.prepare("SELECT action,actor_id FROM audit_events WHERE entity_id=? ORDER BY occurred_at").all(userId)
-    .map(({ action, actor_id }) => [action, actor_id]), [["submit", userId], ["reject", admin.data.userId]]);
+test("legacy applicants require approval and fresh login after self-service closes", async (t) => {
+  const { db, request, login, provision, enrollment } = await setup(t);
+  const { cookie: adminCookie } = await login(administrator);
+  const prior = await provision(enrollment, adminCookie);
+  assert.equal(prior.status, 201);
+  const { cookie } = await login(employee);
+  const updateStatus = db.prepare("UPDATE credential_accounts SET status=?,role_id=NULL WHERE user_id=?");
+  for (const status of ["draft", "pending", "rejected"]) {
+    updateStatus.run(status, prior.data.id);
+    const signedIn = await login(employee);
+    assert.equal(signedIn.status, 401, status);
+    assert.equal(signedIn.data.error.code, "invalid_credentials");
+    assert.equal((await request("/me", { cookie })).status, 401, status);
+  }
+  assert.equal((await request("/access-application/submit", {
+    method: "POST", cookie: adminCookie, body: {},
+  })).status, 404);
+  updateStatus.run("pending", prior.data.id);
+  const decision = await request("/admin/applications/" + prior.data.id + "/decision", {
+    method: "POST", cookie: adminCookie, body: { decision: "approve", roleId: "analyst", departmentIds },
+  });
+  assert.equal(decision.status, 200);
+  assert.equal((await request("/me", { cookie })).status, 401);
+  assert.equal((await login(employee)).status, 201);
 });

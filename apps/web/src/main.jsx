@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { AccountEntry, ApplicationStatus } from "./AccountEntry.jsx";
+import { AccountEntry } from "./AccountEntry.jsx";
 import { AdminAccess } from "./AdminAccess.jsx";
 import { HalfYearReport } from "./HalfYearReport.jsx";
 import { ProgramDashboard } from "./ProgramDashboard.jsx";
@@ -43,11 +43,7 @@ function ErrorMessage({ error }) {
   ) : null;
 }
 function App() {
-  const [authOptions, setAuthOptions] = useState({ demoEnabled: false, registrationEnabled: false });
-  const { demoEnabled, registrationEnabled } = authOptions;
-  const [users, setUsers] = useState([]),
-    [user, setUser] = useState(null),
-    [choice, setChoice] = useState("");
+  const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true),
     [error, setError] = useState(null);
   const [attempt, setAttempt] = useState(0);
@@ -73,28 +69,17 @@ function App() {
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    Promise.all([
-      api("/auth/options", { signal: controller.signal }),
-      api("/me", { signal: controller.signal }).catch((e) => {
-        if (e.status === 401) return null;
-        throw e;
-      }),
-    ])
-      .then(async ([options, current]) => {
+    api("/me", { signal: controller.signal })
+      .then((current) => {
         if (controller.signal.aborted) return;
-        setAuthOptions(options);
-        setUser(current);
-        const result = options.demoEnabled
-          ? await api("/demo/users", { signal: controller.signal })
-          : { items: [] };
-        if (controller.signal.aborted) return;
-        setUsers(result.items);
-        const coordinator = result.items.find((entry) => entry.role === "coordinator");
-        setChoice(current?.authKind === "demo" && result.items.some((entry) => entry.id === current.id)
-          ? current.id : coordinator?.id ?? result.items[0]?.id ?? "");
+        if (current.authKind === "password" && current.status === "approved") {
+          setUser(current);
+        } else if (current.authKind === "password") {
+          setError("Адміністратор ще не відкрив доступ до цього облікового запису.");
+        }
       })
       .catch((e) => {
-        if (!controller.signal.aborted) setError(e);
+        if (!controller.signal.aborted && e.status !== 401) setError(e);
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
@@ -113,44 +98,15 @@ function App() {
     }
   }, [user]);
 
-  async function authenticate(path, credentials) {
+  async function authenticate(credentials) {
     setLoading(true);
     setError(null);
     try {
-      await api(path, { method: "POST", body: JSON.stringify(credentials) });
+      await api("/auth/login", { method: "POST", body: JSON.stringify(credentials) });
       sessionChannel.current?.postMessage("changed");
       refreshSession();
     } catch (e) {
       setError(e);
-      setLoading(false);
-    }
-  }
-  async function register(credentials) {
-    setLoading(true);
-    setError(null);
-    try {
-      await api("/auth/register", { method: "POST", body: JSON.stringify(credentials) });
-      return true;
-    } catch (cause) {
-      setError(cause);
-      return false;
-    } finally {
-      setLoading(false);
-    }
-  }
-  async function checkApplication({ submit = false } = {}) {
-    setLoading(true);
-    setError(null);
-    try {
-      if (submit) {
-        const update = await sessionApi("/access-application/submit", { method: "POST", body: "{}" });
-        setUser((current) => current ? { ...current, status: update.status } : current);
-      } else {
-        setUser(await sessionApi("/me"));
-      }
-    } catch (cause) {
-      setError(cause);
-    } finally {
       setLoading(false);
     }
   }
@@ -168,45 +124,14 @@ function App() {
       setLoading(false);
     }
   }
-  const sessionForm = !demoEnabled ? null : !users.length && !loading ? (
-    <div>
-      {!error && <p role="status">Немає активних демокористувачів.</p>}
-      <button type="button" className="secondary" onClick={() => setAttempt((value) => value + 1)}>
-        Оновити список користувачів
-      </button>
-    </div>
-  ) : (
-    <form className="session-form" onSubmit={(event) => {
-      event.preventDefault();
-      authenticate("/demo/session", { userId: choice });
-    }}>
-      <label>
-        Демокористувач
-        <select value={choice} onChange={(event) => setChoice(event.target.value)} disabled={loading || !users.length}>
-          {users.map((entry) => (
-            <option key={entry.id} value={entry.id}>
-              {entry.displayName} · {roleNames[entry.role]}
-            </option>
-          ))}
-        </select>
-      </label>
-      <button disabled={loading || !choice}>{user ? "Змінити користувача" : "Увійти в демосесію"}</button>
-    </form>
-  );
   const errorMessage = <ErrorMessage error={error} />;
   if (!user) {
-    return <AccountEntry demoForm={sessionForm} registrationEnabled={registrationEnabled} loading={loading} error={errorMessage}
-      onLogin={(credentials) => authenticate("/auth/login", credentials)} onRegister={register}
-      onClearError={() => setError(null)} />;
-  }
-  if (user.authKind === "password" && user.status !== "approved") {
-    return <ApplicationStatus user={user} loading={loading} error={errorMessage}
-      onSubmit={() => checkApplication({ submit: true })} onRefresh={() => checkApplication()} onLogout={logout} />;
+    return <AccountEntry loading={loading} error={errorMessage} onLogin={authenticate} />;
   }
   return <Registry key={user.id} api={sessionApi} user={user}
-    sessionForm={user.authKind === "demo" ? sessionForm : null} logout={logout} busy={loading} sessionError={errorMessage} />;
+    logout={logout} busy={loading} sessionError={errorMessage} />;
 }
-function Registry({ api, user, sessionForm, logout, busy, sessionError }) {
+function Registry({ api, user, logout, busy, sessionError }) {
   const manageAccess = user.authKind === "password" && user.role === "admin";
   const importRegistry = hasPermission(user, "registry.import", user.role === "admin");
   const [navigation, setNavigation] = useState(manageAccess ? "access" : null);
@@ -240,8 +165,8 @@ function Registry({ api, user, sessionForm, logout, busy, sessionError }) {
     </label>
   );
   const shell = {
-    user, role: user.roleName ?? roleNames[user.role], sessionForm, logout, busy, programPicker,
-    manageAccess, importRegistry, demo: user.authKind === "demo",
+    user, role: user.roleName ?? roleNames[user.role], logout, busy, programPicker,
+    manageAccess, importRegistry,
   };
   const program = programs?.find(({ id }) => id === programId);
   const showAccess = manageAccess && navigation === "access";

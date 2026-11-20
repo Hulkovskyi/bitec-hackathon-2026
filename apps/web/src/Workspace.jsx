@@ -46,7 +46,7 @@ const navigation = [
   { key: "report", label: "Звіти", visible: (user) => hasPermission(user, "reports.read", user.role !== "executor") },
 ];
 
-export function SignIn({ title, demo, children }) {
+export function SignIn({ title, children }) {
   return (
     <main className="sign-in">
       <div className="sign-in-layout">
@@ -55,7 +55,6 @@ export function SignIn({ title, demo, children }) {
           <span className="sign-in-team">Digital Anti-Corruption Monitor<br />ITT-Zholudi</span>
         </div>
         <section className="sign-in-panel">
-          {demo && <span className="demo">Синтетичні дані</span>}
           <h1>{title}</h1>
           {children}
         </section>
@@ -65,18 +64,15 @@ export function SignIn({ title, demo, children }) {
 }
 
 export function Workspace({
-  user, role, sessionForm, logout, busy, programPicker, activeView, onNavigate,
-  programNavigation = true, manageAccess = false, importRegistry = false, demo = false, children,
+  user, role, logout, busy, programPicker, activeView, onNavigate,
+  programNavigation = true, manageAccess = false, importRegistry = false, children,
 }) {
   const initials = user.displayName.split(/\s+/).slice(0, 2).map((part) => part[0]).join("");
   return (
     <div className="workspace">
       <a className="skip-link" href="#workspace-content">До вмісту</a>
       <aside className="workspace-sidebar">
-        <div className="workspace-brand-row">
-          <Brand />
-          {demo && <span className="demo workspace-demo-mobile">Синтетичні дані</span>}
-        </div>
+        <Brand />
         {onNavigate && (
           <nav className="workspace-nav" aria-label="Подання програми">
             {programNavigation && navigation.filter(({ visible }) => visible(user)).map(({ key, label }) => (
@@ -108,15 +104,21 @@ export function Workspace({
         <header className="workspace-topbar">
           {programPicker}
           <div className="workspace-tools">
-            {demo && <span className="demo">Синтетичні дані</span>}
             <details className="workspace-account">
-              <summary aria-label={`${demo ? "Демосесія" : "Обліковий запис"} · ${user.displayName} · ${role}`}>
+              <summary aria-label={`Обліковий запис · ${user.displayName} · ${role}`}>
                 <span className="account-avatar" aria-hidden="true">{initials}</span>
                 <span className="account-name"><strong>{user.displayName}</strong><span>{role}</span></span>
                 <Glyph name="chevron" size={16} />
               </summary>
               <div className="account-menu">
-                {sessionForm}
+                {user.profile && (
+                  <dl className="account-profile">
+                    <dt>Логін</dt><dd>{user.profile.username}</dd>
+                    <dt>Підрозділ</dt><dd>{user.profile.department}</dd>
+                    <dt>Посада</dt><dd>{user.profile.position}</dd>
+                    <dt>Керівник</dt><dd>{user.profile.managerName ?? "—"}</dd>
+                  </dl>
+                )}
                 <button type="button" className="secondary" onClick={logout} disabled={busy}>Вийти</button>
               </div>
             </details>

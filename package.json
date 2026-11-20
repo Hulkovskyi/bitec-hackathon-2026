@@ -16,6 +16,7 @@
     "test": "npm test --workspace @dacm/api",
     "start": "npm start --workspace @dacm/api",
     "create-admin": "node scripts/create-admin.mjs",
+    "reset-accounts": "node scripts/reset-accounts.mjs",
     "seed": "node apps/api/src/seed.js",
     "setup:hosted-demo": "node scripts/setup-hosted-demo.mjs"
   }

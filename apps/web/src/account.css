@@ -15,10 +15,6 @@
   color: var(--accent-dark);
 }
 
-.sign-in-panel .account-password-help {
-  margin-block: -6px 14px;
-}
-
 .account-profile {
   grid-template-columns: minmax(5rem, .65fr) minmax(0, 1fr);
   align-items: baseline;

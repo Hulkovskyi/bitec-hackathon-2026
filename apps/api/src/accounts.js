@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from "no
 import { promisify } from "node:util";
 import { adaptDatabase, databaseConstraintKind } from "./database.js";
 import { rolePermissions } from "./permissions.js";
-import { audit, forbidden, missing } from "./registry.js";
+import { audit, missing } from "./registry.js";
 import { ApiError, invalid, keys, text, uuid } from "./validation.js";
 
 const cookieName = "dacm_session";
@@ -19,7 +19,7 @@ function usernameKey(value) {
   return username;
 }
 
-function passwordText(value, minimum = 12) {
+export function validateAccountPassword(value, minimum = 12) {
   if (typeof value !== "string" || value.length < minimum || value.length > 128 || !value.trim()) {
     invalid(minimum === 12 ? "Пароль має містити від 12 до 128 символів" : "Введіть пароль");
   }
@@ -68,11 +68,22 @@ async function deleteSession(db, token) {
   await db.prepare("DELETE FROM sessions WHERE id_hash=?").run(hash);
 }
 
-async function startSession(db, req, res, options, userId, kind) {
+function invalidCredentials() {
+  throw new ApiError(401, "invalid_credentials", "Невірний логін або пароль");
+}
+
+async function startSession(db, req, res, options, userId, kind, verifiedPasswordHash) {
   const token = randomBytes(32).toString("hex");
   const now = Date.now();
   const expiresAt = new Date(now + sessionDuration).toISOString();
   await db.transaction(async (tx) => {
+    if (kind === "password") {
+      const current = await tx.prepare(`
+        SELECT 1 FROM credential_accounts a JOIN users u ON u.id=a.user_id
+        WHERE a.user_id=? AND a.password_hash=? AND a.status='approved' AND u.active=1
+      `).get(userId, verifiedPasswordHash);
+      if (!current) invalidCredentials();
+    }
     await deleteSession(tx, tokenFrom(req));
     const table = kind === "password" ? "account_sessions" : "sessions";
     await tx.prepare(`DELETE FROM ${table} WHERE expires_at<=?`).run(new Date(now).toISOString());
@@ -114,30 +125,42 @@ function rateLimit(requests, windowMs) {
   };
 }
 
-async function insertAccount(db, values, hash, administrator) {
+export async function prepareAccountCredentials(values) {
+  const data = profile(values);
+  return { ...data, passwordHash: await passwordHash(validateAccountPassword(values.password)) };
+}
+
+export async function insertApprovedAccount(db, values, { roleId, baseRole, managerId = null, reviewedBy = null }) {
   const id = randomUUID();
   const now = new Date().toISOString();
-  const role = administrator ? "admin" : "executor";
-  await db.prepare("INSERT INTO users (id,display_name,role,active) VALUES (?,?,?,?)")
-    .run(id, values.fullName, role, Number(administrator));
-  await db.prepare(`
-    INSERT INTO credential_accounts (user_id,username,password_hash,department,position,role_id,status,created_at)
-    VALUES (?,?,?,?,?,?,?,?)
-  `).run(id, values.username, hash, values.department, values.position,
-    administrator ? role : null, administrator ? "approved" : "draft", now);
+  await db.prepare("INSERT INTO users (id,display_name,role,active) VALUES (?,?,?,1)")
+    .run(id, values.fullName, baseRole);
+  try {
+    await db.prepare(`
+      INSERT INTO credential_accounts (
+        user_id,username,password_hash,department,position,role_id,status,created_at,manager_id,reviewed_at,reviewed_by
+      ) VALUES (?,?,?,?,?,?,'approved',?,?,?,?)
+    `).run(id, values.username, values.passwordHash, values.department, values.position,
+      roleId, now, managerId, reviewedBy ? now : null, reviewedBy);
+  } catch (error) {
+    if (error.code === "42703" && error.message.includes("manager_id")) {
+      throw new ApiError(503, "account_migration_required", "Для створення облікових записів застосуйте міграцію керівників у базі даних");
+    }
+    if (databaseConstraintKind(error) !== "unique") throw error;
+    throw new ApiError(409, "username_taken", "Такий логін уже зареєстровано");
+  }
   return id;
 }
 
 export async function createFirstAdministrator(database, values) {
-  const data = profile(values);
-  const hash = await passwordHash(passwordText(values.password));
+  const data = await prepareAccountCredentials(values);
   return adaptDatabase(database).transaction(async (db) => {
     const existing = await db.prepare(`
       SELECT 1 FROM credential_accounts a JOIN users u ON u.id=a.user_id
       WHERE a.status='approved' AND u.role='admin' AND u.active=1 LIMIT 1
     `).get();
     if (existing) throw new ApiError(409, "admin_exists", "Активний адміністратор уже існує");
-    const id = await insertAccount(db, data, hash, true);
+    const id = await insertApprovedAccount(db, data, { roleId: "admin", baseRole: "admin" });
     await audit(db, id, "bootstrap", "account", id, null, { username: data.username, roleId: "admin" });
     return { id, username: data.username, role: "admin" };
   });
@@ -149,42 +172,24 @@ export function mountLoginRoutes(app, db, options) {
   )`;
   app.get("/api/auth/options", (req, res) => {
     keys(req.query, []);
-    res.json({ demoEnabled: options.demoMode, registrationEnabled: options.registrationEnabled });
+    res.json({ demoEnabled: options.demoMode, registrationEnabled: false });
   });
-  const requireRegistration = (_req, _res, next) => {
-    if (!options.registrationEnabled) {
-      throw new ApiError(403, "registration_disabled", "Реєстрація в цьому середовищі недоступна");
-    }
-    next();
-  };
-  app.post("/api/auth/register", requireRegistration, rateLimit(30, 10 * 60_000), async (req, res) => {
-    keys(req.query, []);
-    const fields = ["username", "password", "fullName", "department", "position"];
-    keys(req.body, fields, fields);
-    const values = profile(req.body);
-    const hash = await passwordHash(passwordText(req.body.password));
-    try {
-      await db.transaction((tx) => insertAccount(tx, values, hash, false));
-    } catch (error) {
-      if (databaseConstraintKind(error) !== "unique") throw error;
-      throw new ApiError(409, "username_taken", "Такий логін уже зареєстровано");
-    }
-    res.status(201).json({ status: "draft" });
+  app.post("/api/auth/register", () => {
+    throw new ApiError(403, "registration_disabled", "Облікові записи створює адміністратор");
   });
   app.post("/api/auth/login", rateLimit(60, 10 * 60_000), async (req, res) => {
     keys(req.query, []);
     keys(req.body, ["username", "password"], ["username", "password"]);
     const username = usernameKey(req.body.username);
-    const password = passwordText(req.body.password, 1);
+    const password = validateAccountPassword(req.body.password, 1);
     const account = await db.prepare(`
-      SELECT a.user_id, a.password_hash, a.status, u.active
-      FROM credential_accounts a JOIN users u ON u.id=a.user_id WHERE a.username=?
+      SELECT a.user_id, a.password_hash
+      FROM credential_accounts a JOIN users u ON u.id=a.user_id
+      WHERE a.username=? AND a.status='approved' AND u.active=1
     `).get(username);
     const valid = await passwordMatches(password, account?.password_hash);
-    if (!valid || !account || (account.status === "approved" && !account.active)) {
-      throw new ApiError(401, "invalid_credentials", "Невірний логін або пароль");
-    }
-    await startSession(db, req, res, options, account.user_id, "password");
+    if (!valid || !account) invalidCredentials();
+    await startSession(db, req, res, options, account.user_id, "password", account.password_hash);
   });
 
   app.use("/api/demo", (_req, _res, next) => {
@@ -208,6 +213,12 @@ export function mountLoginRoutes(app, db, options) {
   });
 }
 
+export function accountManagerJoin(db) {
+  // During a rolling Postgres upgrade, existing accounts can still sign in before manager_id is added.
+  const managerId = db.dialect === "postgres" ? "(to_jsonb(a)->>'manager_id')" : "a.manager_id";
+  return `LEFT JOIN users manager ON manager.id=${managerId}`;
+}
+
 export function mountSessionRoutes(app, db, options) {
   app.use("/api", async (req, _res, next) => {
     const token = tokenFrom(req);
@@ -215,19 +226,21 @@ export function mountSessionRoutes(app, db, options) {
     const hash = digest(token);
     const now = new Date().toISOString();
     const account = await db.prepare(`
-      SELECT u.id, u.display_name AS displayName, u.role, u.active, a.username,
-             a.department, a.position, a.status, a.role_id AS roleId, a.decision_reason AS decisionReason,
+      SELECT u.id, u.display_name AS displayName, u.role, a.username,
+             a.department, a.position, a.status, a.role_id AS roleId,
+             manager.id AS managerId, manager.display_name AS managerName,
              r.name AS roleName, r.permissions_json
       FROM account_sessions s JOIN credential_accounts a ON a.user_id=s.user_id
       JOIN users u ON u.id=a.user_id LEFT JOIN account_roles r ON r.id=a.role_id
-      WHERE s.id_hash=? AND s.expires_at>? AND (a.status<>'approved' OR u.active=1)
+      ${accountManagerJoin(db)}
+      WHERE s.id_hash=? AND s.expires_at>? AND a.status='approved' AND u.active=1
     `).get(hash, now);
     if (account) {
-      const { id, displayName, role, roleId, roleName, status, decisionReason, username, department, position } = account;
+      const { id, displayName, role, roleId, roleName, status, username, department, position, managerId, managerName } = account;
       req.user = {
-        id, displayName, role, roleId, roleName, status, decisionReason, authKind: "password",
-        permissions: status === "approved" ? rolePermissions(role, account.permissions_json) : [],
-        profile: { username, fullName: displayName, department, position },
+        id, displayName, role, roleId, roleName, status, authKind: "password",
+        permissions: rolePermissions(role, account.permissions_json),
+        profile: { username, fullName: displayName, department, position, managerId, managerName },
       };
     } else if (options.demoMode) {
       const demo = await db.prepare(`
@@ -247,33 +260,10 @@ export function mountSessionRoutes(app, db, options) {
   });
   app.get("/api/me", async (req, res) => {
     keys(req.query, []);
-    const scopes = req.user.status === "approved" ? await db.prepare(`
+    const scopes = await db.prepare(`
       SELECT program_id AS programId,department_id AS departmentId FROM user_scopes WHERE user_id=?
       ORDER BY program_id,department_id
-    `).all(req.user.id) : [];
+    `).all(req.user.id);
     res.json({ ...req.user, scopes });
-  });
-  app.post("/api/access-application/submit", async (req, res) => {
-    if (req.user.authKind !== "password") forbidden();
-    keys(req.query, []);
-    keys(req.body ?? {}, []);
-    await db.transaction(async (tx) => {
-      const { changes } = await tx.prepare(`
-        UPDATE credential_accounts SET status='pending',submitted_at=? WHERE user_id=? AND status='draft'
-      `).run(new Date().toISOString(), req.user.id);
-      if (changes) {
-        await audit(tx, req.user.id, "submit", "access_application", req.user.id, { status: "draft" }, { status: "pending" });
-      } else {
-        const current = await tx.prepare("SELECT status FROM credential_accounts WHERE user_id=?").get(req.user.id);
-        if (current?.status !== "pending") throw new ApiError(409, "application_closed", "Заявку вже розглянуто");
-      }
-    });
-    res.json({ status: "pending" });
-  });
-  app.use("/api", (req, _res, next) => {
-    if (req.user.status !== "approved") {
-      throw new ApiError(403, "access_not_approved", "Для доступу потрібне схвалення заявки");
-    }
-    next();
   });
 }
