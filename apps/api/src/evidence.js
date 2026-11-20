@@ -346,6 +346,32 @@ export function createEvidenceStore(database, { directory, storage = undefined, 
     return rows.map((row) => metadata(row));
   }
 
+  async function pendingDeletions() {
+    return (await db.prepare("SELECT count(*) AS n FROM evidence_deletions").get()).n;
+  }
+
+  async function drainDeletions(limit = 10) {
+    const queued = await db.prepare(`
+      SELECT storage_key FROM evidence_deletions d
+      WHERE NOT EXISTS (SELECT 1 FROM evidence_versions e WHERE e.storage_key=d.storage_key)
+      ORDER BY attempts, storage_key LIMIT ?
+    `).all(Math.min(positive(limit), 10));
+    if (!queued.length) return pendingDeletions();
+
+    // Release the database before touching Storage. A failed or interrupted
+    // attempt leaves an idempotent operation for the next drain.
+    const attempts = await Promise.allSettled(queued.map(async ({ storage_key }) => objects.delete(storage_key)));
+    await db.transaction(async (tx) => {
+      const removed = tx.prepare("DELETE FROM evidence_deletions WHERE storage_key=?");
+      const failed = tx.prepare("UPDATE evidence_deletions SET attempts=attempts+1 WHERE storage_key=?");
+      for (const [index, { storage_key }] of queued.entries()) {
+        const write = attempts[index].status === "fulfilled" ? removed : failed;
+        await write.run(storage_key);
+      }
+    });
+    return pendingDeletions();
+  }
+
   async function deleteUncommitted(storageKey) {
     try {
       // A lost connection during COMMIT does not prove that it failed.
@@ -437,7 +463,10 @@ export function createEvidenceStore(database, { directory, storage = undefined, 
     }
   }
 
-  return { history, verify: async (row) => (await integrity(row)).intact, integrity, download, upload, maxBytes };
+  return {
+    history, verify: async (row) => (await integrity(row)).intact, integrity, download, upload,
+    maxBytes, pendingDeletions, drainDeletions,
+  };
 }
 
 export function mountEvidenceRoutes(app, database, evidence) {

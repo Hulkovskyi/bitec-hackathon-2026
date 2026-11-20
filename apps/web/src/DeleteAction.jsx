@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 
-export function DeleteAction({ label, prompt, onDelete }) {
+export function DeleteAction({ label, prompt, onDelete, confirmLabel = label }) {
   const [confirming, setConfirming] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
@@ -35,7 +35,7 @@ export function DeleteAction({ label, prompt, onDelete }) {
       {error && <p className="error" role="alert">{error.message}</p>}
       <div className="account-switch">
         <button className="secondary" type="button" autoFocus disabled={saving} onClick={cancel}>Скасувати</button>
-        <button type="button" disabled={saving} onClick={confirm}>{saving ? "Видаляємо…" : label}</button>
+        <button type="button" disabled={saving} onClick={confirm}>{saving ? "Видаляємо…" : confirmLabel}</button>
       </div>
     </div>
   );
