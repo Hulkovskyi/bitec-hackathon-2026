@@ -303,18 +303,21 @@ test("password change verifies the old secret, revokes only the owner's sessions
 });
 
 test("simultaneous password changes commit at most one new password", async (t) => {
-  const { db, request, login, admin } = await setup(t);
-  const first = await login(administrator);
-  const second = await login(administrator);
+  const { db, request, login, provision, enrollment } = await setup(t);
+  const adminSession = await login(administrator);
+  const created = await provision(enrollment, adminSession.cookie);
+  assert.equal(created.status, 201);
+  const first = await login(employee);
+  const second = await login(employee);
   assert.equal(first.status, 201);
   assert.equal(second.status, 201);
-  const auditCount = () => db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE entity_id=?").get(admin.id).n;
+  const auditCount = () => db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE entity_id=?").get(created.data.id).n;
   const before = auditCount();
   const passwords = ["synthetic-first-new-secret", "synthetic-second-new-secret"];
   const changes = await Promise.all([first.cookie, second.cookie].map((cookie, index) =>
     request("/auth/password", {
       method: "POST", cookie,
-      body: { currentPassword: administrator.password, newPassword: passwords[index] },
+      body: { currentPassword: employee.password, newPassword: passwords[index] },
     })));
   const winner = changes.findIndex(({ status }) => status === 204);
   assert.notEqual(winner, -1);
@@ -324,6 +327,148 @@ test("simultaneous password changes commit at most one new password", async (t) 
   assert.ok([401, 409].includes(rejected.status), JSON.stringify(rejected));
   if (rejected.status === 409) assert.equal(rejected.data.error.code, "password_changed");
   assert.equal(auditCount(), before + 1);
-  assert.equal((await login({ ...administrator, password: passwords[winner] })).status, 201);
-  assert.equal((await login({ ...administrator, password: passwords[1 - winner] })).status, 401);
+  assert.equal((await login({ ...employee, password: passwords[winner] })).status, 201);
+  assert.equal((await login({ ...employee, password: passwords[1 - winner] })).status, 401);
+});
+
+test("password administrator previews a scoped role in one read-only session", async (t) => {
+  const { db, request, login, admin, provision, enrollment } = await setup(t);
+  const adminSession = await login(administrator);
+  const parallelSession = await login(administrator);
+  const cookie = adminSession.cookie;
+  assert.equal(adminSession.status, 201);
+  assert.equal(parallelSession.status, 201);
+
+  const created = await provision({ ...enrollment, roleId: "coordinator" }, cookie);
+  assert.equal(created.status, 201);
+  const userId = created.data.id;
+  const targetSession = await login(employee);
+  assert.equal(targetSession.status, 201);
+  const me = (sessionCookie) => request("/me", { cookie: sessionCookie });
+  const adminProfile = (await me(cookie)).data;
+  const { profile, ...target } = (await me(targetSession.cookie)).data;
+  assert.equal(profile.username, employee.username);
+  assert.equal(target.role, "coordinator");
+  assert.ok(target.permissions.includes("registry.write"));
+  const { programId } = fixture.departments.find(({ id }) => id === departmentIds[0]);
+  assert.deepEqual(target.scopes, [{ programId, departmentId: departmentIds[0] }]);
+  const credential = () => db.prepare("SELECT * FROM credential_accounts WHERE user_id=?").get(userId);
+  const originalCredential = credential();
+
+  const options = await request("/role-preview/options", { cookie });
+  assert.equal(options.status, 200);
+  assert.deepEqual(options.data.items.find(({ id }) => id === userId), {
+    id: userId, displayName: target.displayName, role: target.role, roleName: target.roleName,
+  });
+  const selectableIds = fixture.users.filter(({ active, role }) => active && role !== "admin").map(({ id }) => id);
+  assert.deepEqual(options.data.items.map(({ id }) => id).sort(), [...selectableIds, userId].sort());
+  const enter = (sessionCookie, id = userId) => request("/role-preview", {
+    method: "PUT", cookie: sessionCookie, body: { userId: id },
+  });
+  const exit = (sessionCookie) => request("/role-preview", { method: "DELETE", cookie: sessionCookie });
+  for (const [sessionCookie, status] of [[undefined, 401], [targetSession.cookie, 403]]) {
+    assert.equal((await request("/role-preview/options", { cookie: sessionCookie })).status, status);
+    assert.equal((await enter(sessionCookie)).status, status);
+    assert.equal((await exit(sessionCookie)).status, status);
+  }
+
+  const entered = await enter(cookie);
+  assert.equal(entered.status, 204);
+  assert.equal(entered.setCookie, null);
+  assert.deepEqual((await me(cookie)).data, {
+    ...target, authKind: "preview", preview: { displayName: target.displayName, roleName: target.roleName },
+  });
+  assert.deepEqual((await me(parallelSession.cookie)).data, adminProfile);
+  assert.deepEqual((await me(targetSession.cookie)).data, { ...target, profile });
+  assert.equal((await request("/admin/access", { cookie: parallelSession.cookie })).status, 200);
+  assert.equal((await request("/admin/access", { cookie })).status, 403);
+
+  const inScope = fixture.measures.filter(({ departmentId }) => departmentIds.includes(departmentId));
+  const otherDepartment = fixture.departments.find(({ id, programId: candidate }) =>
+    candidate === programId && !departmentIds.includes(id));
+  const otherMeasure = fixture.measures.find(({ departmentId }) => departmentId === otherDepartment.id);
+  const otherProgram = fixture.programs.find(({ id }) => id !== programId);
+  const scopedList = await request("/measures?programId=" + programId, { cookie });
+  assert.equal(scopedList.status, 200);
+  assert.deepEqual(scopedList.data.items.map(({ id }) => id).sort(), inScope.map(({ id }) => id).sort());
+  assert.equal((await request("/measures/" + inScope[0].id, { cookie })).status, 200);
+  assert.equal((await request("/measures/" + otherMeasure.id, { cookie })).status, 404);
+  assert.equal((await request("/measures?programId=" + otherProgram.id, { cookie })).status, 404);
+
+  const { id: _id, effectiveFrom: _start, ...measure } = inScope[0];
+  const updateCode = "PREVIEW-WRITE-TEST";
+  for (const [path, method, body] of [
+    ["/measures", "POST", { ...measure, code: updateCode }],
+    ["/admin/accounts/" + userId, "PATCH", { roleId: "admin", departmentIds: [] }],
+    ["/auth/password", "POST", { currentPassword: employee.password, newPassword: "synthetic-preview-new-password" }],
+  ]) {
+    const denied = await request(path, { method, cookie, body });
+    assert.equal(denied.status, 403, path);
+    assert.equal(denied.data.error.code, "forbidden", path);
+  }
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM measures WHERE code=?").get(updateCode).n, 0);
+  assert.deepEqual(credential(), originalCredential);
+
+  assert.equal((await exit(cookie)).status, 204);
+  assert.deepEqual((await me(cookie)).data, adminProfile);
+  assert.equal((await request("/admin/access", { cookie })).status, 200);
+  assert.equal((await request("/measures/" + otherMeasure.id, { cookie })).status, 200);
+  assert.equal((await login(employee)).status, 201);
+  const events = db.prepare(`
+    SELECT action, actor_id, entity_type, entity_id, before_json, after_json FROM audit_events
+    WHERE action IN ('enter_role_preview', 'exit_role_preview') ORDER BY action
+  `).all();
+  assert.deepEqual(events.map((event) => ({ ...event })), ["enter_role_preview", "exit_role_preview"].map((action) => ({
+    action, actor_id: admin.id, entity_type: "account", entity_id: userId, before_json: null, after_json: null,
+  })));
+});
+
+test("a preview with an unavailable target denies access until the administrator exits", async (t) => {
+  const { db, request, login, admin } = await setup(t, { demoMode: true });
+  const { cookie } = await login(administrator);
+  const executor = fixture.users.find(({ role, active }) => role === "executor" && active);
+  const inactive = fixture.users.find(({ active }) => !active);
+  const demoAdministrator = fixture.users.find(({ role }) => role === "admin");
+  const enter = (userId, sessionCookie = cookie) => request("/role-preview", {
+    method: "PUT", cookie: sessionCookie, body: { userId },
+  });
+  const demo = await request("/demo/session", { method: "POST", body: { userId: demoAdministrator.id } });
+  assert.equal(demo.status, 201);
+  assert.equal((await request("/role-preview/options", { cookie: demo.cookie })).status, 403);
+  assert.equal((await enter(executor.id, demo.cookie)).status, 403);
+  assert.equal((await request("/role-preview", { method: "DELETE", cookie: demo.cookie })).status, 403);
+
+  for (const id of [admin.id, inactive.id, unknownId]) {
+    assert.equal((await enter(id)).status, 404);
+    const current = await request("/me", { cookie });
+    assert.equal(current.status, 200);
+    assert.equal(current.data.id, admin.id);
+    assert.equal(current.data.role, "admin");
+  }
+  assert.equal((await enter(executor.id)).status, 204);
+  assert.equal((await request("/role-preview/options", { cookie })).status, 403);
+  const anotherExecutor = fixture.users.find(({ id, role, active }) => id !== executor.id && role === "executor" && active);
+  assert.equal((await enter(anotherExecutor.id)).status, 403);
+  const active = await request("/me", { cookie });
+  assert.equal(active.status, 200);
+  assert.equal(active.data.id, executor.id);
+  assert.equal(active.data.authKind, "preview");
+  assert.equal((await login(administrator, cookie)).status, 403);
+
+  db.prepare("UPDATE users SET active=0 WHERE id=?").run(executor.id);
+  const unavailable = await request("/me", { cookie });
+  assert.equal(unavailable.status, 200);
+  assert.equal(unavailable.data.authKind, "preview");
+  assert.equal(unavailable.data.preview.unavailable, true);
+  assert.deepEqual(unavailable.data.permissions, []);
+  assert.deepEqual(unavailable.data.scopes, []);
+  const programs = await request("/programs", { cookie });
+  assert.equal(programs.status, 409);
+  assert.equal(programs.data.error.code, "role_preview_unavailable");
+  assert.equal((await request("/role-preview", { method: "DELETE", cookie })).status, 204);
+  const restored = await request("/me", { cookie });
+  assert.equal(restored.status, 200);
+  assert.equal(restored.data.id, admin.id);
+  assert.equal(restored.data.role, "admin");
+  assert.equal((await request("/admin/access", { cookie })).status, 200);
 });

@@ -40,6 +40,7 @@ function start() {
       if (!await db.prepare("SELECT 1 FROM account_roles WHERE id='admin'").get())
         throw new Error("Account roles have not been initialized");
       await db.prepare("SELECT manager_id FROM credential_accounts LIMIT 1").get();
+      await db.prepare("SELECT session_id_hash FROM account_session_previews LIMIT 1").get();
       await storage.checkPrivateBucket();
     },
   });

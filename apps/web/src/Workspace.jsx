@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { PasswordChange } from "./PasswordChange.jsx";
+import { RolePreviewBanner, RolePreviewPicker } from "./RolePreview.jsx";
 import { hasPermission } from "./permissions.js";
 
 const glyphs = {
@@ -66,19 +67,20 @@ export function SignIn({ title, children }) {
 }
 
 export function Workspace({
-  user, role, logout, changePassword, busy, programPicker, activeView, onNavigate,
+  user, role, logout, changePassword, rolePreview, busy, programPicker, activeView, onNavigate,
   programNavigation = true, manageAccess = false, importRegistry = false, children,
 }) {
   const account = useRef(null);
   const summary = useRef(null);
-  const [changingPassword, setChangingPassword] = useState(false);
+  const [accountPanel, setAccountPanel] = useState(null);
+  const preview = user.preview;
   const initials = user.displayName.split(/\s+/).slice(0, 2).map((part) => part[0]).join("");
-  function openPasswordChange() {
+  function openAccountPanel(panel) {
     account.current.open = false;
-    setChangingPassword(true);
+    setAccountPanel(panel);
   }
-  function closePasswordChange() {
-    setChangingPassword(false);
+  function closeAccountPanel() {
+    setAccountPanel(null);
     summary.current?.focus();
   }
   return (
@@ -114,34 +116,50 @@ export function Workspace({
         <span className="workspace-team">ITT-Zholudi</span>
       </aside>
       <div className="workspace-main">
-        <header className="workspace-topbar">
-          {programPicker}
-          <div className="workspace-tools">
-            <details className="workspace-account" ref={account}>
-              <summary ref={summary} aria-label={`Обліковий запис · ${user.displayName} · ${role}`}>
-                <span className="account-avatar" aria-hidden="true">{initials}</span>
-                <span className="account-name"><strong>{user.displayName}</strong><span>{role}</span></span>
-                <Glyph name="chevron" size={16} />
-              </summary>
-              <div className="account-menu">
-                {user.profile && (
-                  <dl className="account-profile">
-                    <dt>Логін</dt><dd>{user.profile.username}</dd>
-                    <dt>Підрозділ</dt><dd>{user.profile.department}</dd>
-                    <dt>Посада</dt><dd>{user.profile.position}</dd>
-                    <dt>Керівник</dt><dd>{user.profile.managerName ?? "—"}</dd>
-                  </dl>
-                )}
-                {changePassword && !changingPassword && (
-                  <button type="button" className="secondary" onClick={openPasswordChange} disabled={busy}>Змінити пароль</button>
-                )}
-                <button type="button" className="secondary" onClick={logout} disabled={busy}>Вийти</button>
-              </div>
-            </details>
-          </div>
-        </header>
+        <div className={preview ? "workspace-preview-header" : "workspace-header"}>
+          <header className="workspace-topbar">
+            {programPicker}
+            <div className="workspace-tools">
+              <details className="workspace-account" ref={account}>
+                <summary ref={summary} aria-label={`Обліковий запис · ${user.displayName} · ${role}`}>
+                  <span className="account-avatar" aria-hidden="true">{initials}</span>
+                  <span className="account-name"><strong>{user.displayName}</strong><span>{role}</span></span>
+                  <Glyph name="chevron" size={16} />
+                </summary>
+                <div className="account-menu">
+                  {!preview && user.profile && (
+                    <dl className="account-profile">
+                      <dt>Логін</dt><dd>{user.profile.username}</dd>
+                      <dt>Підрозділ</dt><dd>{user.profile.department}</dd>
+                      <dt>Посада</dt><dd>{user.profile.position}</dd>
+                      <dt>Керівник</dt><dd>{user.profile.managerName ?? "—"}</dd>
+                    </dl>
+                  )}
+                  {!preview && changePassword && accountPanel !== "password" && (
+                    <button type="button" className="secondary" onClick={() => openAccountPanel("password")} disabled={busy}>Змінити пароль</button>
+                  )}
+                  {!preview && rolePreview?.onStart && accountPanel !== "rolePreview" && (
+                    <button type="button" className="secondary" onClick={() => openAccountPanel("rolePreview")} disabled={busy}>
+                      Перегляд від імені користувача
+                    </button>
+                  )}
+                  {preview && (
+                    <button type="button" className="secondary" onClick={rolePreview.onExit} disabled={rolePreview.busy}>
+                      Вийти з режиму перегляду
+                    </button>
+                  )}
+                  <button type="button" className="secondary" onClick={logout} disabled={busy}>Вийти</button>
+                </div>
+              </details>
+            </div>
+          </header>
+          {preview && <RolePreviewBanner preview={preview} onExit={rolePreview.onExit}
+            busy={rolePreview.busy} error={rolePreview.error} />}
+        </div>
         <main id="workspace-content" className="workspace-content">
-          {changingPassword && <PasswordChange onSave={changePassword} onCancel={closePasswordChange} />}
+          {!preview && accountPanel === "password" && <PasswordChange onSave={changePassword} onCancel={closeAccountPanel} />}
+          {!preview && accountPanel === "rolePreview" && <RolePreviewPicker api={rolePreview.api}
+            onStart={rolePreview.onStart} onCancel={closeAccountPanel} />}
           {children}
         </main>
       </div>

@@ -50,17 +50,45 @@
   margin-top: 8px;
 }
 
-.password-change {
+.password-change,
+.role-preview-picker {
   max-width: 34rem;
   margin-top: 0;
 }
 
-.password-change .account-switch {
+.password-change .account-switch,
+.role-preview-picker .account-switch {
   margin-bottom: 0;
 }
 
+.workspace-header { display: contents; }
+.workspace-preview-header {
+  position: sticky;
+  z-index: 4;
+  top: 0;
+}
+.workspace-preview-header .workspace-topbar { position: relative; }
+.role-preview-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 10px clamp(16px, 3vw, 36px);
+  border-bottom: 1px solid var(--line-strong);
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: var(--type-label);
+  overflow-wrap: anywhere;
+}
+.role-preview-banner p { margin: 0; }
+.role-preview-banner p + p { margin-top: 2px; }
+.role-preview-banner strong { color: var(--accent-dark); }
+.role-preview-banner .error { margin-top: 8px; }
+.role-preview-banner button { white-space: normal; }
+
 @media print {
-  .password-change { display: none; }
+  .password-change, .role-preview-picker, .workspace-preview-header { display: none; }
 }
 
 .access-filter-bar {
