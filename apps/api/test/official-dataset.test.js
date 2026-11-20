@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
@@ -95,8 +96,8 @@ function inMemory(t) {
   return db;
 }
 
-async function http(t, db, date) {
-  const server = createApp(db, { demoMode: true, serveWeb: false, today: () => date }).listen(0, "127.0.0.1");
+async function http(t, db, today) {
+  const server = createApp(db, { demoMode: true, serveWeb: false, today }).listen(0, "127.0.0.1");
   await once(server, "listening");
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const origin = "http://127.0.0.1:3001";
@@ -148,7 +149,7 @@ test("H1 reproduces organizer fields and keeps historical report evidence scoped
   const db = inMemory(t);
   const input = fixture();
   const { programId } = await importOfficialDataset(db, input, { demoMode: true });
-  const request = await http(t, db, input.meta.data_zrizu);
+  const request = await http(t, db, () => input.meta.data_zrizu);
   const path = `/reports/half-year?programId=${programId}&year=2026&half=1`;
   const response = await request("coordinator", path);
   assert.equal(response.status, 200);
@@ -168,4 +169,48 @@ test("H1 reproduces organizer fields and keeps historical report evidence scoped
   assert.deepEqual((await leader.json()).sections.flatMap((section) => section.rows.map((row) => row.code)), ["Z-P", "Z-F"]);
   const executor = await request("executor", path);
   assert.equal(executor.status, 403);
+});
+
+test("organizer deadlines honor the available H1 archive and keep other periods and live approvals", async (t) => {
+  const db = inMemory(t);
+  const input = fixture();
+  const { zakhody, vykonannia_2026_h1 } = input.tablytsi;
+  zakhody.push({ ...zakhody[1], id: "Z-D", nomer_u_rozdili: 4, zmist: "Умовна прострочена дія" });
+  vykonannia_2026_h1.push({
+    ...vykonannia_2026_h1[1], zakhid_id: "Z-D", status: "v_roboti",
+    fakt_data: "", opys_rezultatu: "Робота триває.",
+  });
+  const { programId } = await importOfficialDataset(db, input, { demoMode: true });
+  let asOf = "2026-07-05";
+  const request = await http(t, db, () => asOf);
+  const query = "?programId=" + programId;
+  const riskPath = "/risk-flags" + query + "&ruleCode=overdue";
+  const dashboardPath = "/dashboard" + query + "&metric=overdue";
+  const rowKeys = ({ items }) => items.map(({ code, periodKey }) => [code, periodKey]);
+
+  const beforeArchive = await (await request("coordinator", riskPath)).json();
+  assert.deepEqual(rowKeys(beforeArchive), [["Z-D", "once"], ["Z-L", "once"], ["Z-P", "2026-H1"]]);
+
+  asOf = input.meta.data_zrizu;
+  const risks = await (await request("coordinator", riskPath)).json();
+  const dashboard = await (await request("coordinator", dashboardPath)).json();
+  assert.deepEqual(rowKeys(risks), [["Z-D", "once"]]);
+  assert.deepEqual(rowKeys(dashboard), rowKeys(risks));
+  assert.equal(dashboard.counts.overdue, risks.total);
+  assert.equal(dashboard.counts.overdueMeasures, risks.total);
+  assert.equal(dashboard.counts.completed, 0);
+  assert.equal((await (await request("coordinator", "/risk-flags" + query)).json()).total, 1);
+  assert.deepEqual(rowKeys(await (await request("leader", riskPath)).json()), []);
+
+  asOf = "2027-01-01";
+  const later = await (await request("coordinator", riskPath)).json();
+  assert.deepEqual(rowKeys(later), [["Z-D", "once"], ["Z-F", "once"], ["Z-P", "2026-H2"]]);
+
+  asOf = input.meta.data_zrizu;
+  db.prepare(`
+    INSERT INTO results (id, measure_id, period_key, revision, status, outcome, executor_id, created_at, updated_at)
+    SELECT ?, id, 'once', 1, 'approved', 'partial', executor_id, ?, ? FROM measures WHERE code='Z-L'
+  `).run(randomUUID(), asOf, asOf);
+  const afterApproval = await (await request("coordinator", riskPath)).json();
+  assert.deepEqual(rowKeys(afterApproval), [["Z-D", "once"], ["Z-L", "once"]]);
 });
