@@ -1,4 +1,5 @@
 import { adaptDatabase } from "./database.js";
+import { hasPermission } from "./permissions.js";
 import { forbidden, missing, scope, selectMeasure } from "./registry.js";
 import { ApiError, invalid, uuid } from "./validation.js";
 
@@ -91,11 +92,11 @@ export async function readResultForUser(database, user, resultId) {
 }
 
 export async function assertResultEditor(db, user, result) {
-  if (user.role !== "executor") forbidden();
+  if (!hasPermission(user, "workflow.submit")) forbidden();
   const plan = await planForScope(db, user, result.measure_id);
   if (
-    result.executor_id !== user.id ||
-    (await effectiveAssignment(db, plan, result.period_key)).executorId !== user.id
+    (user.role === "executor" && result.executor_id !== user.id) ||
+    (await effectiveAssignment(db, plan, result.period_key)).executorId !== result.executor_id
   ) missing();
   if (!["draft", "returned"].includes(result.status))
     throw new ApiError(409, "invalid_transition", "Редагування для цього стану недоступне");

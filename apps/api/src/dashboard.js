@@ -1,4 +1,5 @@
-import { measureScope, missing, programAllowed, scope, selectMeasure } from "./registry.js";
+import { forbidden, measureScope, missing, programAllowed, scope, selectMeasure } from "./registry.js";
+import { hasPermission } from "./permissions.js";
 import { canReadResult, effectiveAssignment } from "./result-access.js";
 import { currentEvidence } from "./result-workflow.js";
 import { deadlineFlag, evaluateRiskFlags, selectRevisions, startedDeadlines } from "./risk-flags.js";
@@ -199,15 +200,19 @@ async function riskFlags(db, evidence, entries, asOf, paging) {
 
 export function mountDashboardRoutes(app, db, { today, evidence }) {
   app.get("/api/dashboard", async (req, res) => {
+    const canReadAnalytics = hasPermission(req.user, "analytics.read");
+    if (!canReadAnalytics && !(req.query.metric === "pendingReview" &&
+        hasPermission(req.user, "workflow.review"))) forbidden();
     const asOf = today();
     const body = await db.transaction(async (db) => {
       const query = await readQuery(db, req.user, req.query, "metric", metrics);
       const entries = await scopedEntries(db, req.user, query, asOf);
       return dashboard(db, entries, asOf, query);
     }, { readOnly: true });
-    res.json(body);
+    res.json(canReadAnalytics ? body : { ...body, counts: { pendingReview: body.total }, completionRate: null });
   });
   app.get("/api/risk-flags", async (req, res) => {
+    if (!hasPermission(req.user, "analytics.read")) forbidden();
     const asOf = today();
     const body = await db.transaction(async (db) => {
       const query = await readQuery(db, req.user, req.query, "ruleCode", ruleCodes);

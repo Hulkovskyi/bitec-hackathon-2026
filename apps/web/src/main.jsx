@@ -1,21 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { AccountEntry, ApplicationStatus } from "./AccountEntry.jsx";
+import { AdminAccess } from "./AdminAccess.jsx";
 import { HalfYearReport } from "./HalfYearReport.jsx";
 import { ProgramDashboard } from "./ProgramDashboard.jsx";
 import { ProgramReference } from "./ProgramReference.jsx";
+import { RegistryImport } from "./RegistryImport.jsx";
 import { ResultPanel } from "./ResultPanel.jsx";
 import { measurePeriods, recurrenceLabels } from "./measure-schedule.js";
 import { halfYears, kyivToday } from "./periods.js";
-import { Glyph, SignIn, Workspace } from "./Workspace.jsx";
+import { Glyph, Workspace } from "./Workspace.jsx";
+import { hasPermission, roleNames } from "./permissions.js";
 import "./styles.css";
 
-const roleNames = {
-  executor: "Виконавець",
-  coordinator: "Координатор",
-  leader: "Керівник",
-  analyst: "Аналітик",
-  admin: "Адміністратор",
-};
 async function api(path, options = {}) {
   const response = await fetch("/api" + path, {
     ...options,
@@ -46,6 +43,7 @@ function ErrorMessage({ error }) {
   ) : null;
 }
 function App() {
+  const [demoEnabled, setDemoEnabled] = useState(false);
   const [users, setUsers] = useState([]),
     [user, setUser] = useState(null),
     [choice, setChoice] = useState("");
@@ -60,7 +58,7 @@ function App() {
   }, []);
   useEffect(() => {
     if (!window.BroadcastChannel) return;
-    const channel = new BroadcastChannel("dacm-demo-session");
+    const channel = new BroadcastChannel("dacm-session");
     sessionChannel.current = channel;
     channel.onmessage = ({ data }) => {
       if (data === "changed") refreshSession();
@@ -75,26 +73,27 @@ function App() {
     setLoading(true);
     setError(null);
     Promise.all([
-      api("/demo/users", { signal: controller.signal }),
+      api("/auth/options", { signal: controller.signal }),
       api("/me", { signal: controller.signal }).catch((e) => {
         if (e.status === 401) return null;
         throw e;
       }),
     ])
-      .then(([result, current]) => {
+      .then(async ([options, current]) => {
+        if (controller.signal.aborted) return;
+        setDemoEnabled(options.demoEnabled);
+        setUser(current);
+        const result = options.demoEnabled
+          ? await api("/demo/users", { signal: controller.signal })
+          : { items: [] };
         if (controller.signal.aborted) return;
         setUsers(result.items);
         const coordinator = result.items.find((entry) => entry.role === "coordinator");
-        setChoice(current?.id || coordinator?.id || result.items[0]?.id || "");
-        setUser(current);
+        setChoice(current?.authKind === "demo" && result.items.some((entry) => entry.id === current.id)
+          ? current.id : coordinator?.id ?? result.items[0]?.id ?? "");
       })
       .catch((e) => {
-        if (!controller.signal.aborted)
-          setError(
-            e.code === "not_found"
-              ? "Деморежим вимкнено. Запустіть сервер з DEMO_MODE=true."
-              : e,
-          );
+        if (!controller.signal.aborted) setError(e);
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
@@ -113,19 +112,44 @@ function App() {
     }
   }, [user]);
 
-  async function login(event) {
-    event.preventDefault();
+  async function authenticate(path, credentials) {
     setLoading(true);
     setError(null);
     try {
-      await api("/demo/session", {
-        method: "POST",
-        body: JSON.stringify({ userId: choice }),
-      });
+      await api(path, { method: "POST", body: JSON.stringify(credentials) });
       sessionChannel.current?.postMessage("changed");
       refreshSession();
     } catch (e) {
       setError(e);
+      setLoading(false);
+    }
+  }
+  async function register(credentials) {
+    setLoading(true);
+    setError(null);
+    try {
+      await api("/auth/register", { method: "POST", body: JSON.stringify(credentials) });
+      return true;
+    } catch (cause) {
+      setError(cause);
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }
+  async function checkApplication({ submit = false } = {}) {
+    setLoading(true);
+    setError(null);
+    try {
+      if (submit) {
+        const update = await sessionApi("/access-application/submit", { method: "POST", body: "{}" });
+        setUser((current) => current ? { ...current, status: update.status } : current);
+      } else {
+        setUser(await sessionApi("/me"));
+      }
+    } catch (cause) {
+      setError(cause);
+    } finally {
       setLoading(false);
     }
   }
@@ -143,7 +167,7 @@ function App() {
       setLoading(false);
     }
   }
-  const sessionForm = !users.length && !loading ? (
+  const sessionForm = !demoEnabled ? null : !users.length && !loading ? (
     <div>
       {!error && <p role="status">Немає активних демокористувачів.</p>}
       <button type="button" className="secondary" onClick={() => setAttempt((value) => value + 1)}>
@@ -151,7 +175,10 @@ function App() {
       </button>
     </div>
   ) : (
-    <form className="session-form" onSubmit={login}>
+    <form className="session-form" onSubmit={(event) => {
+      event.preventDefault();
+      authenticate("/demo/session", { userId: choice });
+    }}>
       <label>
         Демокористувач
         <select value={choice} onChange={(event) => setChoice(event.target.value)} disabled={loading || !users.length}>
@@ -162,15 +189,26 @@ function App() {
           ))}
         </select>
       </label>
-      <button disabled={loading || !choice}>{user ? "Змінити користувача" : "Увійти"}</button>
+      <button disabled={loading || !choice}>{user ? "Змінити користувача" : "Увійти в демосесію"}</button>
     </form>
   );
   const errorMessage = <ErrorMessage error={error} />;
-  return user ? (
-    <Registry key={user.id} api={sessionApi} user={user} sessionForm={sessionForm} logout={logout} busy={loading} sessionError={errorMessage} />
-  ) : <SignIn sessionForm={sessionForm} loading={loading} error={errorMessage} />;
+  if (!user) {
+    return <AccountEntry demoForm={sessionForm} loading={loading} error={errorMessage}
+      onLogin={(credentials) => authenticate("/auth/login", credentials)} onRegister={register}
+      onClearError={() => setError(null)} />;
+  }
+  if (user.authKind === "password" && user.status !== "approved") {
+    return <ApplicationStatus user={user} loading={loading} error={errorMessage}
+      onSubmit={() => checkApplication({ submit: true })} onRefresh={() => checkApplication()} onLogout={logout} />;
+  }
+  return <Registry key={user.id} api={sessionApi} user={user}
+    sessionForm={user.authKind === "demo" ? sessionForm : null} logout={logout} busy={loading} sessionError={errorMessage} />;
 }
 function Registry({ api, user, sessionForm, logout, busy, sessionError }) {
+  const manageAccess = user.authKind === "password" && user.role === "admin";
+  const importRegistry = hasPermission(user, "registry.import", user.role === "admin");
+  const [navigation, setNavigation] = useState(manageAccess ? "access" : null);
   const [attempt, setAttempt] = useState(0);
   const [programs, setPrograms] = useState(null),
     [programId, setProgramId] = useState(""),
@@ -183,7 +221,7 @@ function Registry({ api, user, sessionForm, logout, busy, sessionError }) {
       .then((r) => {
         if (controller.signal.aborted) return;
         setPrograms(r.items);
-        setProgramId(r.items[0]?.id || "");
+        setProgramId((current) => r.items.some(({ id }) => id === current) ? current : r.items[0]?.id ?? "");
       })
       .catch((e) => {
         if (!controller.signal.aborted) setError(e);
@@ -200,12 +238,28 @@ function Registry({ api, user, sessionForm, logout, busy, sessionError }) {
       </select>
     </label>
   );
-  const shell = { user, role: roleNames[user.role], sessionForm, logout, busy, programPicker };
+  const shell = {
+    user, role: user.roleName ?? roleNames[user.role], sessionForm, logout, busy, programPicker,
+    manageAccess, importRegistry, demo: user.authKind === "demo",
+  };
   const program = programs?.find(({ id }) => id === programId);
+  const showAccess = manageAccess && navigation === "access";
+  const showImport = importRegistry && navigation === "registryImport";
+  if (showAccess || showImport) {
+    return (
+      <Workspace {...shell} programPicker={null} programNavigation={Boolean(program)}
+        activeView={navigation} onNavigate={setNavigation}>
+        {sessionError}
+        {showAccess ? <AdminAccess api={api} currentUserId={user.id} />
+          : <RegistryImport api={api} onImported={() => setAttempt((value) => value + 1)} />}
+      </Workspace>
+    );
+  }
   return program ? (
-    <Program key={program.id} api={api} program={program} user={user} shell={shell} sessionError={sessionError} />
+    <Program key={program.id} api={api} program={program} user={user} shell={shell} sessionError={sessionError}
+      initialView={navigation} onOpenGlobal={setNavigation} />
   ) : (
-    <Workspace {...shell}>
+    <Workspace {...shell} programNavigation={false} onNavigate={manageAccess || importRegistry ? setNavigation : null}>
       {sessionError}
       <ErrorMessage error={error} />
       {!error && <p role="status">{programs ? "Немає доступних програм." : "Завантаження програм…"}</p>}
@@ -248,9 +302,12 @@ async function registryPage(api, query, searching, signal) {
   return { ...first, items };
 }
 
-function Program({ api, program, user, shell, sessionError }) {
+function Program({ api, program, user, shell, sessionError, initialView, onOpenGlobal }) {
   const [reportPeriod, setReportPeriod] = useState(null);
-  const [view, setView] = useState(user.role === "admin" ? "registry" : "dashboard");
+  const [view, setView] = useState(initialView ?? (
+    hasPermission(user, "analytics.read", true) ? "dashboard" : "registry"
+  ));
+  const canEditRegistry = hasPermission(user, "registry.write", user.role === "coordinator");
   const [options, setOptions] = useState(null),
     [result, setResult] = useState(null),
     [error, setError] = useState(null);
@@ -415,7 +472,8 @@ function Program({ api, program, user, shell, sessionError }) {
   function navigate(next) {
     if (next === view) return;
     clearDetail();
-    setView(next);
+    if (next === "access" || next === "registryImport") onOpenGlobal(next);
+    else setView(next);
   }
   function resetList() {
     clearDetail();
@@ -482,7 +540,7 @@ function Program({ api, program, user, shell, sessionError }) {
           <h1>Реєстр заходів</h1>
           {programContext}
         </div>
-        {user.role === "coordinator" && options && (program.periodEnd < kyivToday() ? (
+        {canEditRegistry && options && (program.periodEnd < kyivToday() ? (
           <p className="count">Період програми завершено.</p>
         ) : (
           <button type="button" className="with-icon" onClick={() => {
@@ -630,7 +688,7 @@ function Program({ api, program, user, shell, sessionError }) {
                     onClick={() => resultAnchor.current?.focus()}>
                     До результату <Glyph name="arrow" size={17} />
                   </button>
-                  {user.role === "coordinator" && (
+                  {canEditRegistry && (
                     selected.planFrozen ? <p className="count">План зафіксовано після подання результату.</p>
                       : <button className="link" type="button" onClick={() => setEditing(true)}>Редагувати захід</button>
                   )}

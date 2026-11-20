@@ -26,12 +26,15 @@ npx vercel deploy --prod
 | --- | --- |
 | `DACM_DATABASE_URL` | Transaction pooler URL для `dacm_runtime`. Sensitive. |
 | `DACM_PUBLIC_ORIGIN` | Публічна HTTPS-адреса демо без кінцевого слеша. |
+| `DACM_DEMO_MODE` | `true` для публічного входу в ізольоване синтетичне демо. В робочому середовищі залиште порожнім або задайте `false`. |
 | `SUPABASE_DB_CA` | PEM-сертифікат із Supabase Database Settings. |
 | `SUPABASE_URL` | HTTPS-адреса проєкту BITEC у Supabase. |
 | `SUPABASE_SECRET_KEY` | Службовий ключ проєкту BITEC. Sensitive. |
 | `SUPABASE_EVIDENCE_BUCKET` | Назва bucket. Типове значення `bitec-evidence`. |
 
 Адміністративний рядок `DACM_ADMIN_DATABASE_URL` потрібен лише для налаштування бази. Зберігайте облікові дані поза Git.
+
+Для робочого середовища запустіть `npm run create-admin` із `DACM_ADMIN_DATABASE_URL`, `SUPABASE_DB_CA` і даними першого адміністратора. Команда застосує міграції та створить обліковий запис. Пароль адміністратора передається тільки до команди налаштування. [Змінні облікового запису](../README.md#вхід-з-обліковими-записами)
 
 ## Перевірка
 

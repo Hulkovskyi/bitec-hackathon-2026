@@ -4,7 +4,8 @@ import {
   reportFilename,
 } from "../../../shared/half-year-report.mjs";
 import { forbidden, kyivDate, measureScope, programAllowed, selectMeasure } from "./registry.js";
-import { workDeadline, workInterval } from "./result-access.js";
+import { hasPermission } from "./permissions.js";
+import { effectiveAssignment, workDeadline, workInterval } from "./result-access.js";
 import { meetsIndicatorTarget } from "./risk-flags.js";
 import { choice, invalid, keys, uuid } from "./validation.js";
 
@@ -51,14 +52,14 @@ function compareText(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-async function reportEntry(plan, period, readRevisions) {
+async function reportEntry(plan, period, readRevisions, executorId) {
   const recurrent = plan.schedule_type === "continuous";
   const periodKey = recurrent ? period.key : "once";
   const interval = recurrent ? workInterval(plan, periodKey) : null;
   if (recurrent ? !interval : plan.effective_from > period.end) return null;
 
   const deadline = workDeadline(plan, periodKey, interval);
-  const revisions = await readRevisions.all(plan.id, periodKey, period.cutoff);
+  const revisions = await readRevisions.all(plan.id, periodKey, period.cutoff, ...(executorId ? [executorId] : []));
   const { approved, reviewStatus } = selectResults(revisions, period.cutoff);
   if (!recurrent && approved?.outcome === "completed" && approved.actual_date < period.start)
     return null;
@@ -109,10 +110,10 @@ async function reportEntry(plan, period, readRevisions) {
   };
 }
 
-async function officialReportEntries(db, plans, departmentIds, period, programId) {
+async function officialReportEntries(db, plans, departmentIds, period, programId, executorId) {
   const sourceRows = await db.prepare(`
     SELECT m.*, r.source_status, r.source_approved, r.source_actual_date,
-           r.source_entered_at, r.description, r.measured_value
+           r.source_entered_at, r.source_user_id, r.description, r.measured_value
     FROM official_measure_metadata m
     JOIN official_measure_results r ON r.measure_id=m.measure_id AND r.program_id=m.program_id
     WHERE m.program_id=? AND r.source_period=?
@@ -132,6 +133,7 @@ async function officialReportEntries(db, plans, departmentIds, period, programId
   for (const source of sourceRows) {
     const plan = plansById.get(source.measure_id);
     if (!plan || !departmentIds.has(source.source_department_id)) continue;
+    if (executorId && source.source_user_id !== null && source.source_user_id !== executorId) continue;
     const recurring = source.source_schedule_type !== "one_time";
     const completed = source.source_status === "vykonano";
     const dueLater = !recurring && source.source_planned_date > period.end && !completed;
@@ -216,7 +218,7 @@ async function buildReport(db, user, { programId, period, today }) {
     SELECT d.id FROM departments d WHERE d.program_id=? ${departmentFilter} ORDER BY d.code, d.id
   `).all(programId, ...(user.role === "admin" ? [] : [user.id]));
   const visible = measureScope(user);
-  const plans = await db.prepare(`
+  const scopedPlans = await db.prepare(`
     SELECT plan.*, p.period_start, p.period_end, s.code AS section_code,
            d.code AS department_code, d.title AS department_title
     FROM (${selectMeasure} WHERE s.program_id=? AND ${visible.sql}) plan
@@ -224,11 +226,18 @@ async function buildReport(db, user, { programId, period, today }) {
     JOIN sections s ON s.id=plan.section_id
     JOIN departments d ON d.id=plan.department_id
   `).all(programId, ...visible.params);
+  const executorId = user.role === "executor" ? user.id : null;
+  const plans = [];
+  for (const plan of scopedPlans) {
+    const periodKey = plan.schedule_type === "one_time" ? "once" : period.key;
+    if (!executorId || (await effectiveAssignment(db, plan, periodKey)).executorId === executorId) plans.push(plan);
+  }
   const readRevisions = db.prepare(`
     SELECT id, revision, status, outcome, result_date, actual_date, created_at, description,
            non_completion_reason, measured_value, plan_snapshot_json
     FROM results WHERE measure_id=? AND period_key=?
       AND (result_date <= ? OR result_date IS NULL)
+      ${executorId ? "AND executor_id=?" : ""}
     ORDER BY revision DESC
   `);
   const sections = sectionTitles.map((title, index) => ({ code: index + 1, title, rows: [] }));
@@ -239,11 +248,11 @@ async function buildReport(db, user, { programId, period, today }) {
   const departmentIds = departments.map(({ id }) => id);
   let entries;
   if (archive) {
-    entries = await officialReportEntries(db, plans, new Set(departmentIds), period, programId);
+    entries = await officialReportEntries(db, plans, new Set(departmentIds), period, programId, executorId);
   } else {
     entries = [];
     for (const plan of plans) {
-      const entry = await reportEntry(plan, period, readRevisions);
+      const entry = await reportEntry(plan, period, readRevisions, executorId);
       if (entry) entries.push(entry);
     }
   }
@@ -266,7 +275,7 @@ async function buildReport(db, user, { programId, period, today }) {
 
 export function mountReportRoutes(app, db, { today }) {
   app.get("/api/reports/half-year", async (req, res) => {
-    if (req.user.role === "executor") forbidden();
+    if (!hasPermission(req.user, "reports.read")) forbidden();
     const query = reportQuery(req.query, today());
     const report = await db.transaction(
       (snapshot) => buildReport(snapshot, req.user, query),

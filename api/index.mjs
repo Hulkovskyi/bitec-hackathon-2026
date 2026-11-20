@@ -7,6 +7,7 @@ function start() {
   const {
     DACM_DATABASE_URL,
     DACM_PUBLIC_ORIGIN,
+    DACM_DEMO_MODE,
     SUPABASE_DB_CA,
     SUPABASE_URL,
     SUPABASE_SECRET_KEY,
@@ -31,14 +32,17 @@ function start() {
   const db = openPostgres(databaseUrl.href, {
     ssl: { ca: SUPABASE_DB_CA, rejectUnauthorized: true },
   });
+  const demoMode = DACM_DEMO_MODE === "true";
   return createApp(db, {
-    demoMode: true,
+    demoMode,
     secureCookies: true,
     serveWeb: false,
     allowedOrigins: [publicOrigin.origin],
     evidenceStore: createEvidenceStore(db, { storage }),
     async checkReadiness() {
-      if (!await db.prepare("SELECT 1 FROM programs LIMIT 1").get())
+      if (!await db.prepare("SELECT 1 FROM account_roles WHERE id='admin'").get())
+        throw new Error("Account roles have not been initialized");
+      if (demoMode && !await db.prepare("SELECT 1 FROM programs LIMIT 1").get())
         throw new Error("Demo registry has not been seeded");
       await storage.checkPrivateBucket();
     },

@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { adaptDatabase } from "./database.js";
+import { hasPermission, loadPermissions } from "./permissions.js";
 import {
   audit,
   forbidden,
   kyivDate,
   measure,
   missing,
-  scope,
 } from "./registry.js";
 import {
   assertPeriod,
@@ -167,12 +167,12 @@ export async function listResults(database, user, measureId) {
 }
 
 export async function createResult(db, user, measureId, input) {
-  if (user.role !== "executor") forbidden();
+  if (!hasPermission(user, "workflow.submit")) forbidden();
   keys(input, ["periodKey"], ["periodKey"]);
   const periodKey = validPeriodKey(input.periodKey);
   return adaptDatabase(db).transaction(async (db) => {
     const plan = await planForScope(db, user, measureId);
-    await assignmentForUser(db, plan, user, periodKey);
+    const { executorId } = await assignmentForUser(db, plan, user, periodKey);
     if (!plan.active) inactiveMeasure();
 
     const previous = await latestResult(db, plan.id, periodKey);
@@ -187,7 +187,7 @@ export async function createResult(db, user, measureId, input) {
          (id, measure_id, period_key, revision, supersedes_id, executor_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     ).get(randomUUID(), plan.id, periodKey, (previous?.revision ?? 0) + 1,
-      previous?.id ?? null, user.id, now, now);
+      previous?.id ?? null, executorId, now, now);
     await audit(db, user.id, "create", "result", result.id, null, result);
     return result;
   });
@@ -206,7 +206,7 @@ const resultFields = {
 };
 
 export async function patchResult(db, user, resultId, input, { today = kyivDate } = {}) {
-  if (user.role !== "executor") forbidden();
+  if (!hasPermission(user, "workflow.submit")) forbidden();
   keys(input, ["version", ...Object.keys(resultFields)], ["version"]);
   const version = positive(input.version);
   const fields = Object.entries(resultFields).filter(([key]) => Object.hasOwn(input, key));
@@ -239,7 +239,7 @@ export async function readAssignment(database, user, measureId, periodKey) {
 }
 
 export async function assignExecutor(db, user, measureId, input) {
-  if (user.role !== "coordinator") forbidden();
+  if (!hasPermission(user, "workflow.assign")) forbidden();
   keys(input, ["periodKey", "executorId", "version"], ["periodKey", "executorId", "version"]);
   const executorId = uuid(input.executorId);
   const version = input.version === 0 ? 0 : positive(input.version);
@@ -305,18 +305,18 @@ export async function transitionResult(
   const approve = action === "approve";
 
   return adaptDatabase(db).transaction(async (db) => {
-    const actor = await db.prepare("SELECT id, role FROM users WHERE id=? AND active=1").get(uuid(actorId));
-    if (!actor) throw new ApiError(401, "unauthenticated", "Користувач недоступний");
-    if (actor.role !== (submit ? "executor" : "coordinator")) forbidden();
+    const user = await db.prepare("SELECT id, role FROM users WHERE id=? AND active=1").get(uuid(actorId));
+    if (!user) throw new ApiError(401, "unauthenticated", "Користувач недоступний");
+    const actor = await loadPermissions(db, user);
+    if (!hasPermission(actor, submit ? "workflow.submit" : "workflow.review")) forbidden();
 
     const readResult = db.prepare("SELECT * FROM results WHERE id=?");
     const result = await readResult.get(uuid(resultId));
     if (!result) missing();
     const plan = await getMeasurePlan(db, result.measure_id);
-    if (!plan || !(await scope(db, actor, plan.program_id, plan.department_id))) missing();
+    if (!(await canReadResult(db, actor, result, plan))) missing();
     if (submit) {
-      if (result.executor_id !== actor.id ||
-          (await effectiveAssignment(db, plan, result.period_key)).executorId !== actor.id)
+      if ((await effectiveAssignment(db, plan, result.period_key)).executorId !== result.executor_id)
         missing();
       if (!plan.active) inactiveMeasure();
     } else if (result.executor_id === actor.id) {

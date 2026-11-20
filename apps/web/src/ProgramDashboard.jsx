@@ -180,7 +180,7 @@ function Pagination({ data, label, onPageChange }) {
 
 export function ProgramDashboard({ program, userRole, programContext, departments, api, onOpenMeasure, mode = "overview" }) {
   const [departmentId, setDepartmentId] = useState("");
-  const view = roleViews[userRole];
+  const view = roleViews[userRole] ?? roleViews.analyst;
   const title = { signals: "Сигнали", approvals: "Погодження" }[mode] ?? view.title;
   const showDepartment = userRole !== "executor" && departments.length > 0;
   const breakdownDepartments = mode === "overview" && userRole === "leader" && !departmentId

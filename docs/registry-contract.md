@@ -43,15 +43,15 @@ POST /api/demo/session приймає тільки userId зі списку ак
 
 | Операція | Executor | Coordinator | Leader / Analyst | Admin |
 | --- | --- | --- | --- | --- |
-| Список/картка заходів та індикаторів | призначені йому, у scope | у scope | у scope, читання | усі, читання |
-| Створення/редагування заходу | ні | у scope, включно з новим scope при зміні | ні | ні |
+| Список/картка заходів та індикаторів | призначені йому, у scope | у scope | у scope, читання | усі |
+| Створення/редагування заходу | ні | у scope, включно з новим scope при зміні | ні | усі програми й підрозділи |
 | Читання програми/розділів/підрозділів/ризиків | у scope | у scope | у scope | усі |
 | Список можливих виконавців | ні | активні executor у вибраному scope | ні | усі |
 | Демокористувачі, scopes, довідники: зміна | ні | ні | ні | так |
 | Читання аудиту | свого доступного заходу | доступного заходу | ні у v1 | усі |
 | Імпорт синтетичного реєстру | ні | ні | ні | так |
 
-У #1 довідники, облікові записи та scopes створюються seed/імпортом; окремий CRUD та адмінпанель — #3. Дозволи на ці майбутні операції тут зафіксовано, але ендпоїнти не заявляються готовими.
+Таблиця описує типові дозволи системних ролей. Для налаштованої ролі `registry.write` дозволяє створення й редагування заходів у межах виданого доступу. Адміністратор також дотримується перевірок версії та замороження плану.
 Фільтрація доступу застосовується в SQL до pagination і count. Для невідомого або недоступного id — однаковий 404; для недозволеного типу операції — 403. Жодних назв/чисел чужих заходів у списках, помилках або аудиті.
 
 ## HTTP API для Issue #1
@@ -62,7 +62,7 @@ JSON camelCase, /api зберігається для сумісності з н�
 | --- | --- |
 | GET /api/me | {id, displayName, role, scopes:[{programId,departmentId}]} |
 | GET /api/programs | {items:[{id,code,title,periodStart,periodEnd}]} у межах доступу |
-| GET /api/programs/:id/registry-options | {sections,departments,risks,executors}; executors лише coordinator/admin, кожний {id,displayName,departmentIds:[...]}; departmentIds — перетин точних scopes виконавця й доступних caller підрозділів цієї програми, порожній перетин виключає виконавця |
+| GET /api/programs/:id/registry-options | {sections,departments,risks,executors}; executors доступні з `registry.write` або `workflow.assign`, кожний {id,displayName,departmentIds:[...]}; departmentIds — перетин точних scopes виконавця й доступних caller підрозділів цієї програми, порожній перетин виключає виконавця |
 | GET /api/measures | programId обов'язковий; sectionId,departmentId,executorId,active опціональні; page>=1, pageSize 1–100 (default 20); {items,total,page,pageSize}; порядок code,id |
 | GET /api/measures/:id | повний Measure |
 | POST /api/measures | CreateMeasure -> 201 Measure, Location |
@@ -122,7 +122,7 @@ Seed — окрема явна команда, тільки DEMO_MODE; стаб�
 ## Критерії приймання та передача
 
 1. На чистій БД міграція й seed працюють; повторний запуск не дублює даних і не стирає зміни. Попередній імпорт program із seed-code та іншим UUID -> seed_conflict, уся БД незмінна, seed_batches порожня; тестувати також збій останньої вставки, щоб довести rollback усього набору.
-2. Усі п'ять ролей перевірені через HTTP. Executor бачить власні записи; підміна id, query, body і ролі не відкриває чужі заходи/аудит. Coordinator не може призначити виконавця або підрозділ поза scope; leader/analyst не пишуть, admin не погоджує й не редагує заходи як coordinator.
+2. Усі п’ять системних ролей перевірені через HTTP. Executor бачить власні записи. Підміна id, query, body і ролі не відкриває чужі заходи чи аудит. Coordinator призначає виконавця або підрозділ у своєму scope. Leader і analyst за замовчуванням читають дані. Admin може редагувати заходи й погоджувати результати з дотриманням правил переходу між станами.
 3. Два підрозділи A/B однієї програми: executor зі scope A не призначається на B через POST/PATCH/імпорт (400 без змін), навіть якщо coordinator бачить A і B; registry-options показує тільки валідні departmentIds. Усі розділи, ризики, виконавці та індикатори узгоджені; невірний ризик/дата/ціль/зв'язок -> 400 без запису й аудиту.
 4. Створення і PATCH атомарні; повтор зі старою version -> 409. Тест штучної помилки вставки аудиту доводить rollback заходу та індикатора.
 5. Pagination/count не містять чужих даних. Неактивна/прострочена/відсутня сесія -> 401; демовхід при DEMO_MODE=false -> 404. Видати cookie admin при DEMO_MODE=true, перезапустити з тією самою БД та DEMO_MODE=false: старий cookie на GET /api/me і POST /api/imports/registry -> 401. Middleware перевірити також зі штучно збереженим demo session row.

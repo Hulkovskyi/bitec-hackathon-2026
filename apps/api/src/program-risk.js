@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { access, audit, forbidden, missing, programAllowed, scope } from "./registry.js";
+import { hasPermission } from "./permissions.js";
 import { ApiError, choice, date, flag, invalid, keys, text, uuid } from "./validation.js";
 
 const passportMetadata = [
@@ -9,7 +10,6 @@ const passportMetadata = [
 const indicatorRequired = [
   "ownerDepartmentId", "title", "unit", "direction", "baseline", "baselineDate", "target", "targetDate",
 ];
-const riskRoles = ["admin", "coordinator", "leader", "analyst"];
 const optionalText = (value, size) => value == null ? null : text(value, size, true) || null;
 
 function number(value) {
@@ -52,7 +52,7 @@ async function readPassport(db, user, programId, today) {
     restrictedInformation: Boolean(row.restricted_information),
     coordinatorDepartmentId: row.coordinator_department_id,
     coordinatorDepartmentTitle: row.coordinator_department_title,
-    canEdit: user.role === "admin",
+    canEdit: hasPermission(user, "program.write"),
     sections: sections.map(({ id, code, title, measure_count }) => ({ id, code, title, measureCount: measure_count })),
   };
 }
@@ -71,10 +71,13 @@ function passportInput(input) {
 }
 
 async function savePassport(db, user, programId, input, today) {
-  if (user.role !== "admin") forbidden();
+  if (!hasPermission(user, "program.write")) forbidden();
   const next = passportInput(input);
   const before = await readPassport(db, user, programId, today);
-  if (next.coordinatorDepartmentId) await assertDepartment(db, next.coordinatorDepartmentId, programId);
+  if (next.coordinatorDepartmentId) {
+    await assertDepartment(db, next.coordinatorDepartmentId, programId);
+    if (!(await scope(db, user, programId, next.coordinatorDepartmentId))) forbidden();
+  }
   await db.prepare(`
     INSERT INTO program_passports (
       program_id, goals, organization, approval_reference, nazk_approval_status,
@@ -128,15 +131,13 @@ function riskPayload(row, readings, user) {
     level,
     readings,
     latestReading: readings[0] ?? null,
-    canMeasure: Boolean(row.owner_department_id && (
-      user.role === "admin" || (user.role === "coordinator" && row.owns_department)
-    )),
-    canEditIndicator: user.role === "admin",
+    canMeasure: Boolean(row.owner_department_id && row.owns_department && hasPermission(user, "risks.measure")),
+    canEditIndicator: (!row.owner_department_id || Boolean(row.owns_department)) && hasPermission(user, "risks.write"),
   };
 }
 
 async function readRisks(db, user, programId, riskId = null) {
-  if (!riskRoles.includes(user.role)) forbidden();
+  if (!hasPermission(user, "risks.read")) forbidden();
   await programAllowed(db, user, programId);
   const admin = user.role === "admin";
   const ownerScope = `EXISTS (
@@ -206,10 +207,12 @@ function indicatorInput(input, today) {
 }
 
 async function saveIndicator(db, user, programId, riskId, input, today) {
-  if (user.role !== "admin") forbidden();
+  if (!hasPermission(user, "risks.write")) forbidden();
   const next = indicatorInput(input, today);
   const [before] = await readRisks(db, user, programId, riskId);
+  if (before.ownerDepartmentId && !(await scope(db, user, programId, before.ownerDepartmentId))) missing();
   await assertDepartment(db, next.ownerDepartmentId, programId);
+  if (!(await scope(db, user, programId, next.ownerDepartmentId))) forbidden();
   if (before.readings.length > 0 &&
       ["unit", "direction", "baseline", "baselineDate"].some((key) => before.indicator[key] !== next[key])) {
     throw new ApiError(409, "indicator_has_readings", "Індикатор уже має вимірювання. Одиницю, напрям і базове значення з датою змінювати не можна.");
@@ -235,7 +238,7 @@ async function saveIndicator(db, user, programId, riskId, input, today) {
 }
 
 async function addReading(db, user, programId, riskId, input, today) {
-  if (user.role !== "admin" && user.role !== "coordinator") forbidden();
+  if (!hasPermission(user, "risks.measure")) forbidden();
   keys(input, ["readingDate", "value", "source"], ["readingDate", "value", "source"]);
   await programAllowed(db, user, programId);
   const row = await db.prepare(`
@@ -243,7 +246,7 @@ async function addReading(db, user, programId, riskId, input, today) {
     FROM risks r LEFT JOIN risk_indicators ri ON ri.risk_id=r.id
     WHERE r.id=? AND r.program_id=?
   `).get(riskId, programId);
-  if (!row || (user.role === "coordinator" &&
+  if (!row || (user.role !== "admin" &&
       (!row.owner_department_id || !await scope(db, user, programId, row.owner_department_id)))) missing();
   if (!row.owner_department_id) {
     throw new ApiError(409, "risk_indicator_required", "Спочатку налаштуйте індикатор ризику");
