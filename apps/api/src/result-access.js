@@ -37,11 +37,24 @@ export function workInterval(plan, periodKey) {
   const half = halfYearKey.exec(periodKey);
   if (!half) return null;
   const [, year, number] = half;
+  if (plan.recurrence === "annual_april_may" &&
+      (number !== "1" || start > `${year}-05-31` || end < `${year}-04-01`)) {
+    return null;
+  }
   const halfStart = year + (number === "1" ? "-01-01" : "-07-01");
   const halfEnd = year + (number === "1" ? "-06-30" : "-12-31");
   const first = start > halfStart ? start : halfStart;
   const last = end < halfEnd ? end : halfEnd;
   return first <= last ? [first, last] : null;
+}
+
+export function workDeadline(plan, periodKey, interval) {
+  if (plan.schedule_type === "one_time") return plan.planned_date;
+  if (plan.recurrence === "annual_april_may") {
+    const mayEnd = `${periodKey.slice(0, 4)}-05-31`;
+    return mayEnd < interval[1] ? mayEnd : interval[1];
+  }
+  return interval[1];
 }
 
 export function assertPeriod(plan, periodKey) {

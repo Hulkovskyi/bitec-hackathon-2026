@@ -19,6 +19,7 @@ import { createEvidenceStore, mountEvidenceRoutes } from "./evidence.js";
 import { mountResultRoutes } from "./result-routes.js";
 import { mountDashboardRoutes } from "./dashboard.js";
 import { mountReportRoutes } from "./half-year-report.js";
+import { mountProgramRiskRoutes } from "./program-risk.js";
 const webBuild = fileURLToPath(new URL("../../web/dist/", import.meta.url));
 const defaultEvidenceDirectory = fileURLToPath(new URL("../../../data/evidence", import.meta.url));
 const hash = (value) => createHash("sha256").update(value).digest("hex");
@@ -379,6 +380,7 @@ export function createApp(
   mountEvidenceRoutes(app, database, evidence);
   mountDashboardRoutes(app, database, { today, evidence });
   mountReportRoutes(app, database, { today });
+  mountProgramRiskRoutes(app, database, { today });
   app.use("/api", (_req, _res) => missing());
   if (serveWeb) app.use(express.static(webBuild));
   app.use((error, _req, res, next) => {

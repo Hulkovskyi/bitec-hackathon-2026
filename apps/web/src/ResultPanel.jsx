@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { halfYears } from "./periods.js";
+import { measurePeriods } from "./measure-schedule.js";
+import { kyivToday } from "./periods.js";
 import "./results.css";
 
 const evidenceLimitMiB = import.meta.env.VITE_HOSTED_DEMO === "true" ? 4 : 5;
@@ -32,9 +33,6 @@ const auditLabels = {
   replace: "Завантажено нову версію доказу",
 };
 
-const kyivToday = () =>
-  new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Kyiv" }).format(new Date());
-
 const dateTime = (value) =>
   new Intl.DateTimeFormat("uk-UA", {
     dateStyle: "medium",
@@ -43,15 +41,6 @@ const dateTime = (value) =>
   }).format(new Date(value));
 
 const statusText = (result) => statusLabels[result.status] || result.status;
-
-function periodsFor(measure, program) {
-  const start = [measure.effectiveFrom, program.periodStart].sort().at(-1);
-  const end = program.periodEnd;
-  if (measure.scheduleType !== "continuous") {
-    return [{ key: "once", start, end, label: "Одноразовий захід" }];
-  }
-  return halfYears(start, end);
-}
 
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 
@@ -66,12 +55,12 @@ function RequestError({ error, onRetry }) {
 }
 
 export function ResultPanel({ measure, program, user, options, api, onPlanLockChange, sourceResultId }) {
-  const periods = periodsFor(measure, program);
+  const periods = measurePeriods(measure, program);
   const today = kyivToday();
   const activePeriod = periods.find((period) => period.start <= today && period.end >= today);
   const [periodKey, setPeriodKey] = useState(
     () => periods.find((period) => period.key === measure.periodKey)?.key ||
-      activePeriod?.key || periods.at(-1)?.key,
+      activePeriod?.key || (today < periods[0]?.start ? periods[0]?.key : periods.at(-1)?.key),
   );
   const period = periods.find((item) => item.key === periodKey);
   return (
@@ -732,7 +721,7 @@ function EvidenceArea({ api, canCheck, disabled, editable, onUpload, result }) {
     setChecked(null);
     try {
       const integrity = await api(`/evidence/${item.id}/integrity`);
-      setChecked({ name: item.originalName, intact: integrity.intact });
+      setChecked({ name: item.originalName, revision: item.revision, intact: integrity.intact });
     } catch (cause) {
       setCheckError(cause);
     } finally {
@@ -793,7 +782,7 @@ function EvidenceArea({ api, canCheck, disabled, editable, onUpload, result }) {
       <RequestError error={checkError} />
       {checked && (
         <p role="status" className={checked.intact ? "result-integrity" : "result-integrity result-integrity-failed"}>
-          {checked.name} · {checked.intact ? "Цілісність підтверджено" : "Цілісність не підтверджено"}
+          {checked.name} · версія {checked.revision} · {checked.intact ? "Цілісність підтверджено" : "Цілісність не підтверджено"}
         </p>
       )}
       {editable && (

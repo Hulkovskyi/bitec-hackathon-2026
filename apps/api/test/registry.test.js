@@ -132,7 +132,7 @@ test("migration and explicit seed are repeatable without overwriting data", asyn
     assert.deepEqual(
       db.prepare("SELECT version FROM schema_migrations ORDER BY version")
         .all().map(({ version }) => version),
-      [1, 2],
+      [1, 2, 3, 4, 5],
     );
     assert.equal(db.prepare("PRAGMA foreign_keys").get().foreign_keys, 1);
   } finally {

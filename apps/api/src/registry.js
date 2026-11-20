@@ -24,6 +24,7 @@ export const measureFields = [
   "plannedDate",
   "indicator",
 ];
+const recurrences = ["weekly", "monthly", "quarterly", "annual_april_may"];
 export const roles = ["executor", "coordinator", "leader", "analyst", "admin"];
 export const missing = () => {
   throw new ApiError(404, "not_found", "Запис не знайдено");
@@ -69,8 +70,11 @@ export function access(user, { periodKey, today = kyivDate() } = {}) {
   const year = period.slice(0, 4);
   const halfStart = year + (period.endsWith("H1") ? "-01-01" : "-07-01");
   const halfEnd = year + (period.endsWith("H1") ? "-06-30" : "-12-31");
+  const firstHalf = period.endsWith("H1");
+  const annualWindow = firstHalf ? `OR (m.effective_from<=? AND p.period_end>=?)` : "";
   const continuous = `(m.schedule_type='continuous' AND m.effective_from<=?
-    AND EXISTS (SELECT 1 FROM programs p WHERE p.id=s.program_id AND p.period_end>=?))`;
+    AND EXISTS (SELECT 1 FROM programs p WHERE p.id=s.program_id AND p.period_end>=?
+      AND (m.recurrence IS NULL OR m.recurrence<>'annual_april_may' ${annualWindow})))`;
 
   if (periodKey === "once") {
     conditions.push("m.schedule_type='one_time'");
@@ -79,6 +83,7 @@ export function access(user, { periodKey, today = kyivDate() } = {}) {
       ? `(m.schedule_type='one_time' OR ${continuous})`
       : continuous);
     params.push(halfEnd, halfStart);
+    if (firstHalf) params.push(`${year}-05-31`, `${year}-04-01`);
   }
   const executor = `COALESCE((
     SELECT a.executor_id FROM period_assignments a WHERE a.measure_id=m.id
@@ -107,7 +112,8 @@ export function measure(row) {
     code: row.code,
     title: row.title,
     description: row.description,
-    scheduleType: row.schedule_type,
+    scheduleType: row.recurrence ? "periodic" : row.schedule_type,
+    ...(row.recurrence ? { recurrence: row.recurrence } : {}),
     plannedDate: row.planned_date,
     active: !!row.active,
     effectiveFrom: row.effective_from,
@@ -187,6 +193,7 @@ export async function validateMeasure(
   user,
   oldProgram,
   today = kyivDate(),
+  { allowUnspecifiedIndicators = false } = {},
 ) {
   const db = adaptDatabase(database);
   const value = {
@@ -198,7 +205,7 @@ export async function validateMeasure(
     code: text(input.code, 50),
     title: text(input.title),
     description: text(input.description, 4000, true),
-    scheduleType: choice(input.scheduleType, ["one_time", "continuous"]),
+    scheduleType: choice(input.scheduleType, ["one_time", "continuous", "periodic"]),
   };
   const section = await db
     .prepare(
@@ -248,8 +255,21 @@ export async function validateMeasure(
       value.plannedDate > section.period_end
     )
       invalid("Дата поза періодом програми");
-  } else if (input.plannedDate !== null)
-    invalid("Постійний захід не має планової дати");
+  } else if (input.plannedDate !== null) {
+    invalid("Для повторюваного заходу планова дата визначається за періодом");
+  }
+  if (value.scheduleType === "periodic") {
+    value.recurrence = choice(input.recurrence, recurrences);
+    if (user && value.recurrence === "annual_april_may") {
+      const end = section.period_end;
+      const firstYear = Number(value.effectiveFrom.slice(0, 4)) + Number(value.effectiveFrom.slice(5) > "05-31");
+      const lastYear = Number(end.slice(0, 4)) - Number(end.slice(5) < "04-01");
+      if (firstYear > lastYear) invalid("У межах програми немає доступного періоду квітень–травень");
+    }
+  } else {
+    if (input.recurrence != null) invalid("Повторюваність доступна лише для періодичного заходу");
+    value.recurrence = null;
+  }
   const i = input.indicator;
   keys(
     i,
@@ -258,18 +278,23 @@ export async function validateMeasure(
   );
   if (
     ![i.baseline, i.target].every(
-      (n) => typeof n === "number" && Number.isFinite(n),
+      (n) => Number.isFinite(n) || (allowUnspecifiedIndicators && n === null),
     )
   )
     invalid("Значення індикатора мають бути скінченними числами");
-  choice(i.direction, ["increase", "decrease", "maintain"]);
-  if (
+  if (!allowUnspecifiedIndicators || i.direction !== null)
+    choice(i.direction, ["increase", "decrease", "maintain"]);
+  if (i.baseline !== null && i.target !== null && (
     (i.direction === "increase" && i.target < i.baseline) ||
     (i.direction === "decrease" && i.target > i.baseline) ||
     (i.direction === "maintain" && i.target !== i.baseline)
-  )
+  ))
     invalid("Ціль не відповідає напряму індикатора");
-  value.indicator = { ...i, title: text(i.title), unit: text(i.unit, 50) };
+  value.indicator = {
+    ...i,
+    title: text(i.title),
+    unit: allowUnspecifiedIndicators && i.unit === null ? null : text(i.unit, 50),
+  };
   return value;
 }
 export function stableIndicatorId(measureId) {
@@ -285,7 +310,10 @@ async function insertMeasure(
   indicatorId = randomUUID(),
 ) {
   const now = new Date().toISOString();
-  await db.prepare("INSERT INTO measures VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+  await db.prepare(`INSERT INTO measures (
+    id,section_id,department_id,executor_id,risk_id,code,title,description,schedule_type,
+    planned_date,active,version,effective_from,created_at,updated_at,recurrence
+  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
     id,
     value.sectionId,
     value.departmentId,
@@ -294,13 +322,14 @@ async function insertMeasure(
     value.code,
     value.title,
     value.description,
-    value.scheduleType,
+    value.scheduleType === "periodic" ? "continuous" : value.scheduleType,
     value.plannedDate,
     1,
     1,
     value.effectiveFrom,
     now,
     now,
+    value.recurrence,
   );
   const i = value.indicator;
   await db.prepare("INSERT INTO indicators VALUES (?,?,?,?,?,?,?)").run(
@@ -318,7 +347,7 @@ export async function saveMeasure(database, user, input, id, { today = kyivDate 
   if (user.role !== "coordinator") forbidden();
   keys(
     input,
-    id ? [...measureFields, "version", "active"] : measureFields,
+    [...measureFields, "recurrence", ...(id ? ["version", "active"] : [])],
     id ? ["version"] : measureFields,
   );
   if (id) positive(input.version);
@@ -340,17 +369,23 @@ export async function saveMeasure(database, user, input, id, { today = kyivDate 
       : input;
     if (before && !Object.hasOwn(input, "indicator"))
       delete combined.indicator.id;
+    const indicatorFields = ["unit", "baseline", "target", "direction"];
+    const preservesMissingValues = before != null && indicatorFields.every((field) =>
+      combined.indicator?.[field] !== null || before.indicator[field] === null
+    );
     const value = await validateMeasure(
       db,
       combined,
       user,
       before?.programId,
       dateToday,
+      { allowUnspecifiedIndicators: preservesMissingValues },
     );
     if (before && (
       value.departmentId !== before.departmentId ||
       value.executorId !== before.executorId ||
-      value.scheduleType !== before.scheduleType
+      value.scheduleType !== before.scheduleType ||
+      value.recurrence !== (before.recurrence ?? null)
     ) && await db.prepare(
       `SELECT 1 FROM results WHERE measure_id=?
        UNION ALL SELECT 1 FROM period_assignments WHERE measure_id=? LIMIT 1`,
@@ -365,7 +400,7 @@ export async function saveMeasure(database, user, input, id, { today = kyivDate 
     if (id) {
       const result = await db
         .prepare(
-          "UPDATE measures SET section_id=?,department_id=?,executor_id=?,risk_id=?,code=?,title=?,description=?,schedule_type=?,planned_date=?,active=?,version=version+1,updated_at=? WHERE id=? AND version=?",
+          "UPDATE measures SET section_id=?,department_id=?,executor_id=?,risk_id=?,code=?,title=?,description=?,schedule_type=?,planned_date=?,recurrence=?,active=?,version=version+1,updated_at=? WHERE id=? AND version=?",
         )
         .run(
           value.sectionId,
@@ -375,8 +410,9 @@ export async function saveMeasure(database, user, input, id, { today = kyivDate 
           value.code,
           value.title,
           value.description,
-          value.scheduleType,
+          value.scheduleType === "periodic" ? "continuous" : value.scheduleType,
           value.plannedDate,
+          value.recurrence,
           Number(value.active),
           new Date().toISOString(),
           id,
@@ -416,7 +452,7 @@ export async function importRegistry(
   database,
   actor,
   payload,
-  { seed = false, inTransaction = false } = {},
+  { seed = false, inTransaction = false, allowUnspecifiedIndicators = false } = {},
 ) {
   keys(
     payload,
@@ -533,11 +569,13 @@ export async function importRegistry(
     for (const r of payload.measures) {
       keys(
         r,
-        ["id", "effectiveFrom", ...measureFields],
+        ["id", "effectiveFrom", "recurrence", ...measureFields],
         ["id", "effectiveFrom", ...measureFields],
       );
       await record("measures", async () => {
-        const value = await validateMeasure(db, r, null);
+        const value = await validateMeasure(db, r, null, null, undefined, {
+          allowUnspecifiedIndicators,
+        });
         await insertMeasure(
           db,
           value,
