@@ -63,6 +63,8 @@ npm start
 
 ### Локальне демо на офіційному наборі BITEC
 
+Команда `python3 scripts/verify-official-materials.py "/шлях/до/архіву.zip"` звіряє 13 таблиць у CSV, XLSX і JSON. [Склад набору та довідкові посилання](docs/official-dataset-mapping.md)
+
 Після `npm ci` розпакуйте `dani/nabir.json` і `kliuch/ochikuvani-sygnaly.csv` з архіву організаторів. Скрипт імпортує його в окремий файл SQLite і з параметром `--verify` запускає тимчасовий локальний API для звірки. [Синтетичний ZIP BITEC](https://hack.bitec.com.ua/wp-content/uploads/2026/11/zavdannia-2-syntetychnyi-nabir-63022726.zip)
 
 **PowerShell**
@@ -81,7 +83,7 @@ export DATABASE_PATH=./data/official-bitec.sqlite
 node scripts/import-official-dataset.mjs '/шлях/до/dani/nabir.json' "$DATABASE_PATH" --verify --risk-key '/шлях/до/kliuch/ochikuvani-sygnaly.csv'
 ```
 
-Очікуваний результат звірки містить `rows: 50`, `referenceRows: 50` і `differences: []`. Для сигналів очікуються `expected: 29`, `observed: 29`, `matched: 29` та порожні списки розбіжностей. Щоб переглянути імпортовану програму в браузері, створіть першого адміністратора в тому самому `DATABASE_PATH`, запустіть застосунок і відкрийте **Звіти → 2026 · І півріччя** або **Сигнали → Зріз організаторів**.
+Для журналу очікується збіг усіх 169 подій. Результат звірки звіту містить `rows: 50`, `referenceRows: 50` і `differences: []`. Для сигналів очікуються `expected: 29`, `observed: 29`, `matched: 29` та порожні списки розбіжностей. Щоб переглянути імпортовану програму в браузері, створіть першого адміністратора в тому самому `DATABASE_PATH`, запустіть застосунок і відкрийте **Звіти → 2026 · І півріччя** або **Сигнали → Зріз організаторів**. У звіті натисніть назву заходу, щоб відкрити архівний результат і журнал джерела.
 
 ## Як влаштовано
 

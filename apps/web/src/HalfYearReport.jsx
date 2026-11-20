@@ -77,7 +77,7 @@ function ReportBrief({ summary, onOpenMeasure }) {
   );
 }
 
-function ReportSection({ section }) {
+function ReportSection({ section, onOpenMeasure }) {
   const headingId = `report-section-${section.code}`;
   return (
     <section className="report-section" aria-labelledby={headingId}>
@@ -110,7 +110,12 @@ function ReportSection({ section }) {
               {section.rows.map((row) => (
                 <tr key={row.measureId} role="row">
                   <td role="cell">
-                    <strong>{row.code} · {row.title}</strong>
+                    <strong>{row.sourceResult ? (
+                      <button type="button" className="link report-source-link"
+                        onClick={() => onOpenMeasure({ ...row, source: "official" })}>
+                        {row.code} · {row.title}
+                      </button>
+                    ) : <>{row.code} · {row.title}</>}</strong>
                     <small>{row.departmentTitle}</small>
                     {row.plannedText && <small>Плановий строк: {row.plannedText}</small>}
                   </td>
@@ -226,7 +231,7 @@ export function HalfYearReport({ program, api, selectedPeriod, onPeriodChange, o
               <span>Сформовано {generatedAt}</span>
             </p>
           </div>
-          {report.sections.map((section) => <ReportSection key={section.code} section={section} />)}
+          {report.sections.map((section) => <ReportSection key={section.code} section={section} onOpenMeasure={onOpenMeasure} />)}
           <ReportBrief summary={report.summary} onOpenMeasure={onOpenMeasure} />
         </div>
       )}

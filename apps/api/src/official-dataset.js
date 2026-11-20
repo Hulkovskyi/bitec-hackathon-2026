@@ -11,6 +11,11 @@ const sourceRoles = {
   ANAL: "analyst",
 };
 const statusValues = ["vykonano", "chastkovo", "ne_vykonano", "v_roboti", "ne_rozpochato"];
+const auditObjectTypes = new Map([
+  ["zakhid", "measure"],
+  ["vykonannia", "result"],
+  ["pidtverdzhennia", "evidence"],
+]);
 const recurrenceValues = new Map([
   ["Щотижня", "weekly"],
   ["Щомісяця", "monthly"],
@@ -85,8 +90,10 @@ function normalizeOfficialDataset(input) {
       !tables || tableNames.some((name) => !Array.isArray(tables[name]))) {
     invalid("Потрібен офіційний синтетичний JSON BITEC, завдання 2, за 2026-H1");
   }
+  const sourceAudit = tables.zhurnal_dii;
   if (tables.prohrama.length !== 1 || tables.rozdily.length !== 3 ||
-      tableNames.some((name) => tables[name].length > 1000)) {
+      tableNames.some((name) => tables[name].length > 1000) ||
+      (sourceAudit !== undefined && (!Array.isArray(sourceAudit) || sourceAudit.length > 1000))) {
     invalid("Некоректний розмір офіційного набору");
   }
   const sourceAsOf = date(input.meta.data_zrizu);
@@ -245,7 +252,8 @@ function normalizeOfficialDataset(input) {
     ];
   });
 
-  const evidence = [...index(tables.pidtverdzhennia, "id", "pidtverdzhennia").values()].map((row) => {
+  const evidenceIndex = index(tables.pidtverdzhennia, "id", "pidtverdzhennia");
+  const evidence = [...evidenceIndex.values()].map((row) => {
     if (typeof row.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(row.sha256)) {
       invalid(`Некоректна контрольна сума джерела: ${row.id}`);
     }
@@ -265,9 +273,27 @@ function normalizeOfficialDataset(input) {
     ];
   });
 
+  const auditEvents = sourceAudit === undefined ? null : [...index(sourceAudit, "id", "zhurnal_dii")]
+    .map(([sourceId, row]) => {
+      const occurredAt = sourceTimestamp(row.chas);
+      if (occurredAt.slice(0, 10) > sourceAsOf) invalid(`Подія після дати зрізу: ${sourceId}`);
+      const actor = referenced(inputUsers, text(row.korystuvach_id, 64), "korystuvachi");
+      const objectType = auditObjectTypes.get(row.obiekt);
+      if (!objectType) invalid(`Невідомий вид об’єкта журналу: ${sourceId}`);
+      const objectCode = text(row.obiekt_id, 64);
+      const measureCode = objectType === "evidence"
+        ? referenced(evidenceIndex, objectCode, "pidtverdzhennia").zakhid_id
+        : objectCode;
+      return [
+        program.id, measureId(measureCode), sourceId, occurredAt, text(`${actor.posada} · ${actor.id}`),
+        text(row.diia, 200), objectType, objectCode, optionalText(row.pole, 100),
+        optionalText(row.stare_znachennia), optionalText(row.nove_znachennia),
+      ];
+    });
+
   return {
     sourceAsOf, reportPeriod, programId: program.id, passport, riskIndicators, readings, riskMetadata,
-    metadata, results, evidence, deadlineChanges,
+    metadata, results, evidence, deadlineChanges, auditEvents,
     registry: {
       schemaVersion: 1, synthetic: true, programs: [program],
       sections, departments, users, scopes, risks, measures,
@@ -278,6 +304,23 @@ function normalizeOfficialDataset(input) {
 async function insertRows(db, sql, rows) {
   const statement = db.prepare(sql);
   for (const row of rows) await statement.run(...row);
+}
+
+async function saveOfficialAudit(db, { programId, auditEvents }, retainExistingMeasures = false) {
+  if (auditEvents === null) return 0;
+  let events = auditEvents;
+  if (retainExistingMeasures) {
+    // An upgrade of a local archive must respect measures already removed from it.
+    const rows = await db.prepare("SELECT measure_id FROM official_measure_metadata WHERE program_id=?").all(programId);
+    const measureIds = new Set(rows.map(({ measure_id }) => measure_id));
+    events = auditEvents.filter(([, measureId]) => measureIds.has(measureId));
+  }
+  await insertRows(db, `
+    INSERT INTO official_audit_events
+      (program_id,measure_id,source_id,occurred_at,actor_label,action,object_type,object_code,field,before_value,after_value)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`, events);
+  await db.prepare("UPDATE official_dataset_batches SET source_audit=1 WHERE program_id=?").run(programId);
+  return events.length;
 }
 
 export async function importOfficialDataset(database, input, { demoMode = false } = {}) {
@@ -292,13 +335,16 @@ export async function importOfficialDataset(database, input, { demoMode = false 
   };
   return adaptDatabase(database).transaction(async (db) => {
     const already = await db.prepare(
-      "SELECT source_hash FROM official_dataset_batches WHERE program_id=?",
+      "SELECT source_hash,source_audit FROM official_dataset_batches WHERE program_id=?",
     ).get(programId);
     if (already) {
       if (already.source_hash !== sourceHash) {
         throw new ApiError(409, "official_dataset_conflict", "Інший пакет джерела вже імпортовано");
       }
-      return { ...info, alreadyImported: true };
+      const auditEvents = already.source_audit
+        ? (await db.prepare("SELECT count(*) AS n FROM official_audit_events WHERE program_id=?").get(programId)).n
+        : await saveOfficialAudit(db, data, true);
+      return { ...info, auditEvents, alreadyImported: true };
     }
     await importRegistry(db, null, data.registry, {
       seed: true, inTransaction: true, allowUnspecifiedIndicators: true,
@@ -346,7 +392,8 @@ export async function importOfficialDataset(database, input, { demoMode = false 
       INSERT INTO official_deadline_changes
         (id, measure_id, program_id, decision_date, old_deadline, new_deadline, reason, source_user_id)
       VALUES (?,?,?,?,?,?,?,?)`, data.deadlineChanges);
-    return { ...info, alreadyImported: false };
+    const auditEvents = await saveOfficialAudit(db, data);
+    return { ...info, auditEvents, alreadyImported: false };
   });
 }
 

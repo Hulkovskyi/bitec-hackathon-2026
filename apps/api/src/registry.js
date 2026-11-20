@@ -150,8 +150,7 @@ export function measure(row) {
     },
   };
 }
-async function getOfficialResult(db, user, row, today) {
-  if (!hasPermission(user, "analytics.read") && !hasPermission(user, "reports.read")) forbidden();
+async function getOfficialMeasureArchive(db, user, row, today) {
   const archive = await db.prepare(`
     SELECT r.source_period, b.source_as_of, r.source_status, r.source_approved,
            r.source_actual_date, r.source_user_id, r.description, r.measured_value,
@@ -168,6 +167,12 @@ async function getOfficialResult(db, user, row, today) {
       .get(row.id, archive.source_period);
     if ((assignment?.executor_id ?? row.executor_id) !== user.id) missing();
   }
+  return archive;
+}
+
+async function getOfficialResult(db, user, row, today) {
+  if (!hasPermission(user, "analytics.read") && !hasPermission(user, "reports.read")) forbidden();
+  const archive = await getOfficialMeasureArchive(db, user, row, today);
   const evidence = await db.prepare(`
     SELECT title FROM official_evidence_claims WHERE program_id=? AND measure_id=? ORDER BY source_id
   `).all(row.program_id, row.id);
@@ -180,15 +185,20 @@ async function getOfficialResult(db, user, row, today) {
   };
 }
 
-export async function getMeasure(database, user, id, options) {
-  const db = adaptDatabase(database);
-  const rule = access(user, options);
+async function scopedMeasureRow(db, id, rule) {
   const row = await db.prepare(`
     SELECT ${measureColumns}, ${rule.executor} AS effective_executor_id, source.expected_evidence
     ${measureTables} LEFT JOIN official_measure_metadata source ON source.measure_id=m.id AND source.program_id=s.program_id
     WHERE m.id=? AND ${rule.sql}
   `).get(rule.period, id, ...rule.params);
   if (!row) missing();
+  return row;
+}
+
+export async function getMeasure(database, user, id, options) {
+  const db = adaptDatabase(database);
+  const rule = access(user, options);
+  const row = await scopedMeasureRow(db, id, rule);
   const expectedEvidence = row.expected_evidence?.trim();
   const value = {
     ...periodMeasure(row, user, rule.period),
@@ -198,6 +208,27 @@ export async function getMeasure(database, user, id, options) {
   return hasPermission(user, "registry.write")
     ? { ...value, planFrozen: await planIsFrozen(db, id) }
     : value;
+}
+
+export async function readOfficialAudit(db, user, id, { today, page, pageSize }) {
+  if (!hasPermission(user, "audit.read")) forbidden();
+  const row = await scopedMeasureRow(db, id, access(user, { today }));
+  await getOfficialMeasureArchive(db, user, row, today);
+  const { source_audit: available } = await db.prepare(
+    "SELECT source_audit FROM official_dataset_batches WHERE program_id=?",
+  ).get(row.program_id);
+  if (!available) return { items: [], total: 0, page, pageSize, available: false };
+  const { n: total } = await db.prepare(
+    "SELECT count(*) AS n FROM official_audit_events WHERE program_id=? AND measure_id=?",
+  ).get(row.program_id, id);
+  const items = await db.prepare(`
+    SELECT source_id AS "sourceId", occurred_at AS "occurredAt", actor_label AS "actorLabel", action,
+           object_type AS "objectType", object_code AS "objectCode", field,
+           before_value AS "before", after_value AS "after"
+    FROM official_audit_events WHERE program_id=? AND measure_id=?
+    ORDER BY occurred_at DESC,source_id DESC LIMIT ? OFFSET ?
+  `).all(row.program_id, id, pageSize, (page - 1) * pageSize);
+  return { items, total, page, pageSize, available: true };
 }
 
 export function periodMeasure(row, user, period) {

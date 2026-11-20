@@ -139,6 +139,7 @@ test("organizer import is atomic, repeatable and does not create workflow approv
   assert.equal(first.measures, 3);
   assert.equal(first.results, 3);
   assert.equal(first.evidenceClaims, 1);
+  assert.equal(first.auditEvents, 0);
   assert.equal(first.alreadyImported, false);
   assert.deepEqual(await importOfficialDataset(db, input, { demoMode: true }), { ...first, alreadyImported: true });
   const changed = structuredClone(input);
@@ -151,6 +152,131 @@ test("organizer import is atomic, repeatable and does not create workflow approv
     assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n, 0);
   }
   assert.equal(db.prepare("SELECT source_checksum FROM official_evidence_claims").get().source_checksum, "a".repeat(64));
+});
+
+function auditFixture() {
+  const input = fixture();
+  input.tablytsi.korystuvachi.push({ id: "UA", rol: "ADMIN", pidrozdil_id: "", posada: "Адміністратор" });
+  const creation = {
+    chas: "2025-12-23T10:00", korystuvach_id: "UC", diia: "Створено (синтетичний імпорт)",
+    obiekt: "zakhid", pole: "", stare_znachennia: "", nove_znachennia: "",
+  };
+  input.tablytsi.zhurnal_dii = [
+    { ...creation, id: "L-001", obiekt_id: "Z-P" },
+    {
+      ...creation, id: "L-002", chas: "2026-06-30T12:00", korystuvach_id: "U1",
+      diia: "Внесено результат", obiekt: "vykonannia", obiekt_id: "Z-P",
+      pole: "status", stare_znachennia: "не розпочато", nove_znachennia: "частково виконано",
+    },
+    {
+      ...creation, id: "L-003", chas: "2026-07-01T13:00", korystuvach_id: "U1",
+      diia: "Додано умовне підтвердження", obiekt: "pidtverdzhennia", obiekt_id: "E1",
+      pole: "sha256", nove_znachennia: "a".repeat(64),
+    },
+    { ...creation, id: "L-004", obiekt_id: "Z-L" },
+  ];
+  return input;
+}
+
+test("organizer audit is separate, paginated and limited to permitted archived measures", async (t) => {
+  const db = inMemory(t);
+  const input = auditFixture();
+  const imported = await importOfficialDataset(db, input, { demoMode: true });
+  assert.equal(imported.auditEvents, 4);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM audit_events").get().n, 0);
+  const find = db.prepare("SELECT id,department_id FROM measures WHERE code=?");
+  const id = find.get("Z-P").id;
+  const prefix = (id) => `/measures/${id}/official-audit`;
+  let now = input.meta.data_zrizu;
+  const request = await http(t, db, () => now);
+
+  db.prepare("UPDATE users SET display_name='Поточне ім’я' WHERE display_name='Виконавець А · U1'").run();
+  const first = await request("coordinator", prefix(id) + "?pageSize=1");
+  assert.equal(first.status, 200);
+  assert.deepEqual(await first.json(), {
+    available: true, total: 3, page: 1, pageSize: 1, items: [{
+      sourceId: "L-003", occurredAt: "2026-07-01T13:00", actorLabel: "Виконавець А · U1",
+      action: "Додано умовне підтвердження", objectType: "evidence", objectCode: "E1",
+      field: "sha256", before: null, after: "a".repeat(64),
+    }],
+  });
+  const rest = await request("coordinator", prefix(id) + "?page=2&pageSize=2");
+  assert.deepEqual((await rest.json()).items.map((event) => ({
+    id: event.sourceId, kind: event.objectType, old: event.before, value: event.after,
+  })), [{ id: "L-001", kind: "measure", old: null, value: null }]);
+  const second = await request("coordinator", prefix(id) + "?page=2&pageSize=1");
+  const [result] = (await second.json()).items;
+  assert.equal(result.objectType, "result");
+  assert.equal(result.before, "не розпочато");
+  assert.equal(result.after, "частково виконано");
+
+  const empty = await request("coordinator", prefix(find.get("Z-F").id));
+  assert.deepEqual(await empty.json(), { available: true, page: 1, pageSize: 20, items: [], total: 0 });
+  assert.equal((await request("leader", prefix(id))).status, 403);
+  assert.equal((await request("coordinator", prefix(id) + "?pageSize=0")).status, 400);
+
+  // Access to the current plan does not by itself grant access to the old unit.
+  const foreign = find.get("Z-L");
+  db.prepare("DELETE FROM user_scopes WHERE department_id=? AND user_id=(SELECT id FROM users WHERE role='coordinator')")
+    .run(foreign.department_id);
+  db.prepare("UPDATE measures SET department_id=? WHERE id=?").run(find.get("Z-P").department_id, foreign.id);
+  assert.equal((await request("coordinator", prefix(foreign.id))).status, 404);
+  now = "2026-07-05";
+  assert.equal((await request("coordinator", prefix(id))).status, 404);
+});
+
+test("the same archive backfills only retained measures and cascades source events on deletion", async (t) => {
+  const db = inMemory(t);
+  const input = auditFixture();
+  const { programId } = await importOfficialDataset(db, input, { demoMode: true });
+  const sourceAudit = db.prepare("SELECT source_audit FROM official_dataset_batches WHERE program_id=?");
+  const count = db.prepare("SELECT count(*) AS n FROM official_audit_events");
+  assert.equal(sourceAudit.get(programId).source_audit, 1);
+
+  // Reproduce the pre-migration state with the original package hash.
+  db.exec("DELETE FROM official_audit_events; UPDATE official_dataset_batches SET source_audit=0;");
+  const find = db.prepare("SELECT id FROM measures WHERE code=?");
+  const request = await http(t, db, () => input.meta.data_zrizu);
+  const retainedId = find.get("Z-P").id;
+  const read = await request("coordinator", `/measures/${retainedId}/official-audit`);
+  assert.deepEqual(await read.json(), { available: false, page: 1, pageSize: 20, items: [], total: 0 });
+
+  const deleted = await request("admin", `/measures/${find.get("Z-L").id}`, { method: "DELETE", body: { version: 1 } });
+  assert.equal(deleted.status, 204);
+  const backfilled = await importOfficialDataset(db, input, { demoMode: true });
+  assert.equal(backfilled.alreadyImported, true);
+  assert.equal(backfilled.auditEvents, 3);
+  assert.equal(count.get().n, 3);
+  assert.equal(sourceAudit.get(programId).source_audit, 1);
+  assert.deepEqual(await importOfficialDataset(db, input, { demoMode: true }), backfilled);
+  assert.equal(find.get("Z-L"), undefined);
+
+  const removed = await request("admin", `/measures/${retainedId}`, { method: "DELETE", body: { version: 1 } });
+  assert.equal(removed.status, 204);
+  assert.equal(count.get().n, 0);
+  assert.equal((await importOfficialDataset(db, input, { demoMode: true })).auditEvents, 0);
+});
+
+test("an invalid or failed organizer audit import does not publish a partial archive", async (t) => {
+  const db = inMemory(t);
+  const input = auditFixture();
+  for (const change of [
+    { obiekt_id: "unknown" },
+    { korystuvach_id: "unknown" },
+    { chas: "2026-07-07T00:00" },
+    { id: "L-001" },
+  ]) {
+    const invalid = structuredClone(input);
+    Object.assign(invalid.tablytsi.zhurnal_dii[1], change);
+    await assert.rejects(importOfficialDataset(db, invalid, { demoMode: true }), { status: 400 });
+  }
+  db.exec(`
+    CREATE TEMP TRIGGER reject_source_audit BEFORE INSERT ON official_audit_events
+    BEGIN SELECT RAISE(ABORT, 'synthetic archive audit failure'); END;
+  `);
+  await assert.rejects(importOfficialDataset(db, input, { demoMode: true }), /synthetic archive audit failure/);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM programs").get().n, 0);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM official_dataset_batches").get().n, 0);
 });
 
 test("H1 reproduces organizer fields and keeps historical report evidence scoped and unverified", async (t) => {

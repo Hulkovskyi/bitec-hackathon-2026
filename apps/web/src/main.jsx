@@ -737,7 +737,7 @@ function Program({ api, program, user, shell, sessionError, initialView, onNavig
           </div>
           {selected && !editing && (
             <div ref={resultAnchor} tabIndex={-1} className="registry-result">
-              {selected.officialResult && <OfficialMeasureResult result={selected.officialResult} />}
+              {selected.officialResult && <OfficialMeasureResult result={selected.officialResult} measureId={selected.id} user={user} api={api} />}
               {resultPanel}
             </div>
           )}
