@@ -29,7 +29,10 @@
 .reference-error > :last-child { margin-bottom: 0; }
 
 .reference-error { margin-bottom: 16px; }
-.reference-facts { margin: 0; }
+.reference-facts {
+  display: block;
+  margin: 0;
+}
 .reference-facts > div {
   display: grid;
   grid-template-columns: minmax(120px, .8fr) minmax(0, 1.2fr);
