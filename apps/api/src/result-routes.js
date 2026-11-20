@@ -1,5 +1,6 @@
 import { forbidden } from "./registry.js";
-import { readResultForUser } from "./result-access.js";
+import { hasPermission } from "./permissions.js";
+import { isIndependentReviewer, readResultForUser } from "./result-access.js";
 import {
   assignExecutor,
   createResult,
@@ -39,7 +40,7 @@ async function resultDetail(db, result, user, evidenceStore) {
   const latest = new Map();
   for (const file of evidenceHistory) {
     if (
-      file.uploadedBy === result.executor_id &&
+      (file.executorId ?? file.uploadedBy) === result.executor_id &&
       file.revision > (latest.get(file.logicalFileId)?.revision ?? 0)
     ) latest.set(file.logicalFileId, file);
   }
@@ -51,6 +52,8 @@ async function resultDetail(db, result, user, evidenceStore) {
   ).all(result.id);
   return {
     ...resultJson(result),
+    canReview: result.status === "submitted" && hasPermission(user, "workflow.review") &&
+      await isIndependentReviewer(db, result, user.id),
     evidence: [...latest.values()],
     evidenceHistory,
     reviews,
@@ -146,7 +149,7 @@ export function mountResultRoutes(app, db, { today, evidence }) {
     res.json(resultJson(result));
   });
   app.get("/api/results/:id/audit", async (req, res) => {
-    if (["leader", "analyst"].includes(req.user.role)) forbidden();
+    if (!hasPermission(req.user, "audit.read")) forbidden();
     keys(req.query, ["page", "pageSize"]);
     const value = await db.transaction(async (db) => {
       const result = await readResultForUser(db, req.user, req.params.id);

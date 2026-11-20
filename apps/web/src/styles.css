@@ -185,7 +185,7 @@ button.icon-button { width: 36px; min-height: 36px; padding: 0; display: inline-
 }
 .program-select { flex-direction: row; align-items: center; gap: 10px; min-width: 0; margin: 0; }
 .program-select select { width: min(300px, 30vw); min-width: 0; background: var(--panel-muted); }
-.workspace-tools { display: flex; align-items: center; gap: 14px; }
+.workspace-tools { display: flex; align-items: center; gap: 14px; margin-left: auto; }
 .demo, .active-pill {
   display: inline-flex;
   align-items: center;

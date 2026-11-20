@@ -132,7 +132,7 @@ test("migration and explicit seed are repeatable without overwriting data", asyn
     assert.deepEqual(
       db.prepare("SELECT version FROM schema_migrations ORDER BY version")
         .all().map(({ version }) => version),
-      [1, 2, 3, 4, 5],
+      [1, 2, 3, 4, 5, 6],
     );
     assert.equal(db.prepare("PRAGMA foreign_keys").get().foreign_keys, 1);
   } finally {
@@ -180,7 +180,7 @@ test("all five roles: scoped lists, pagination/count, options and foreign IDs", 
       options.data.executors.length,
       [205, 208].includes(user) ? (user === 208 ? 3 : 2) : 0,
     );
-    if (user !== 205) {
+    if (![205, 208].includes(user)) {
       const write = await request("/api/measures", {
         cookie,
         method: "POST",

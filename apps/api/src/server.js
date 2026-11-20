@@ -18,6 +18,7 @@ migrate(database);
 
 createApp(database, {
   demoMode: process.env.DEMO_MODE === "true",
+  registrationEnabled: process.env.REGISTRATION_ENABLED !== "false",
   evidenceDirectory: databasePath + ".evidence",
 }).listen(
   port,

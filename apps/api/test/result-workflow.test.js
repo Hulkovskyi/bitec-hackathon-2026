@@ -140,7 +140,7 @@ test("transition access, return comments and optimistic versions are enforced wi
 
   await transition(db, resultId, executor, "submit", 1);
   const beforeReview = snapshot(db, resultId);
-  await assert.rejects(() => transition(db, resultId, id(208), "approve", 2), {
+  await assert.rejects(() => transition(db, resultId, id(206), "approve", 2), {
     status: 403,
     code: "forbidden",
   });

@@ -1,4 +1,5 @@
 import { adaptDatabase } from "./database.js";
+import { hasPermission } from "./permissions.js";
 import { forbidden, missing, scope, selectMeasure } from "./registry.js";
 import { ApiError, invalid, uuid } from "./validation.js";
 
@@ -90,12 +91,23 @@ export async function readResultForUser(database, user, resultId) {
   return result;
 }
 
+export async function isIndependentReviewer(db, result, actorId) {
+  if (result.executor_id === actorId) return false;
+  const submissions = await db.prepare(`
+    SELECT actor_id, after_json FROM audit_events
+    WHERE entity_type='result' AND entity_id=? AND action='submit'
+  `).all(result.id);
+  // The version distinguishes submissions even if their audit timestamps are equal.
+  const submission = submissions.find(({ after_json }) => JSON.parse(after_json)?.version === result.version);
+  return submission?.actor_id !== actorId;
+}
+
 export async function assertResultEditor(db, user, result) {
-  if (user.role !== "executor") forbidden();
+  if (!hasPermission(user, "workflow.submit")) forbidden();
   const plan = await planForScope(db, user, result.measure_id);
   if (
-    result.executor_id !== user.id ||
-    (await effectiveAssignment(db, plan, result.period_key)).executorId !== user.id
+    (user.role === "executor" && result.executor_id !== user.id) ||
+    (await effectiveAssignment(db, plan, result.period_key)).executorId !== result.executor_id
   ) missing();
   if (!["draft", "returned"].includes(result.status))
     throw new ApiError(409, "invalid_transition", "Редагування для цього стану недоступне");

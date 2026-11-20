@@ -1,5 +1,6 @@
 import { randomUUID, createHash } from "node:crypto";
 import { adaptDatabase } from "./database.js";
+import { hasPermission } from "./permissions.js";
 import {
   ApiError,
   invalid,
@@ -138,7 +139,7 @@ export async function getMeasure(database, user, id, options) {
     .get(rule.period, id, ...rule.params);
   if (!row) missing();
   const value = periodMeasure(row, user, rule.period);
-  return user.role === "coordinator"
+  return hasPermission(user, "registry.write")
     ? { ...value, planFrozen: await planIsFrozen(db, id) }
     : value;
 }
@@ -148,7 +149,8 @@ export function periodMeasure(row, user, period) {
     ...measure(row),
     executorId: row.effective_executor_id,
     periodKey: row.schedule_type === "one_time" ? "once" : period,
-    ...(user.role === "coordinator" ? { baseExecutorId: row.executor_id } : {}),
+    ...(hasPermission(user, "registry.write") || hasPermission(user, "workflow.assign")
+      ? { baseExecutorId: row.executor_id } : {}),
   };
 }
 
@@ -344,7 +346,7 @@ async function insertMeasure(
   return id;
 }
 export async function saveMeasure(database, user, input, id, { today = kyivDate } = {}) {
-  if (user.role !== "coordinator") forbidden();
+  if (!hasPermission(user, "registry.write")) forbidden();
   keys(
     input,
     [...measureFields, "recurrence", ...(id ? ["version", "active"] : [])],
