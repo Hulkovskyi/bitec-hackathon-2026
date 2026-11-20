@@ -32,6 +32,21 @@
   overflow-wrap: anywhere;
 }
 
+.result-plan-note {
+  margin: 6px 0 0;
+  max-width: 64ch;
+  overflow-wrap: anywhere;
+}
+
+.result-plan-note strong {
+  color: var(--text);
+  margin-inline-end: 4px;
+}
+
+.result-plan-note time {
+  font-variant-numeric: tabular-nums;
+}
+
 .result-panel-heading .result-period {
   width: min(100%, 15rem);
   margin: 0;

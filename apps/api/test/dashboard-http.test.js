@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
+import { createFirstAdministrator } from "../src/accounts.js";
 import { createApp } from "../src/app.js";
 import { migrate } from "../src/database.js";
 import { kyivDate } from "../src/registry.js";
@@ -59,7 +60,7 @@ async function setup(t, measures, today = () => date, evidenceStore) {
     });
     return {
       status: response.status,
-      data: await response.json(),
+      data: response.status === 204 ? null : await response.json(),
       headers: response.headers,
     };
   }
@@ -375,4 +376,117 @@ test("Kyiv half-year rollover keeps overdue pairs and reassignment hides foreign
   assert.deepEqual(unique.items.map(label), ["E:2026-H1"]);
   assert.deepEqual(checked(await a(url("/dashboard", { metric: "overdue" }))).items.map(label), ["E:2026-H1"]);
   assert.deepEqual(checked(await b(url("/dashboard", { metric: "overdue" }))).items.map(label), ["E:2026-H2"]);
+});
+
+const decisionPath = "/risk-flag-decisions";
+function overdueDecision(subjectId) {
+  const key = { programId: program, source: "live", ruleCode: "overdue", subjectType: "measure", subjectId, periodKey: "once" };
+  return {
+    key,
+    options: `${decisionPath}/assignees?${new URLSearchParams(key)}`,
+    save: (session, patch) => session(decisionPath, {
+      method: "PUT",
+      body: { ...key, action: "Уточнити причину та подати результат", assigneeId: id(201), dueDate: date, version: 0, ...patch },
+    }),
+  };
+}
+
+test("risk flag decisions persist after the signal clears and track scoped, versioned changes", async (t) => {
+  const local = measure(501, "A");
+  const foreign = measure(502, "X", { departmentId: id(102), executorId: id(203) });
+  const { db, login } = await setup(t, [local, foreign]);
+  const coordinator = await login(205);
+  const executor = await login(201);
+  const analyst = await login(207);
+  const leader = await login(206);
+  const admin = await login(208);
+  const localDecision = overdueDecision(local.id);
+  const foreignDecision = overdueDecision(foreign.id);
+
+  checked(await coordinator(foreignDecision.options), 404);
+  checked(await analyst(localDecision.options), 403);
+  checked(await executor(url(decisionPath)), 403);
+  const { items, decision, signalVersion } = checked(await coordinator(localDecision.options));
+  assert.equal(decision, null);
+  assert.deepEqual(items.map(({ id }) => id).sort(), [201, 202, 205, 206, 207, 208].map(id));
+  checked(await coordinator(localDecision.options.replace("overdue", "forged_rule")), 404);
+  checked(await localDecision.save(coordinator, { signalVersion, assigneeId: id(203) }), 400);
+  checked(await localDecision.save(coordinator, { signalVersion, assigneeId: id(209) }), 400);
+  checked(await localDecision.save(coordinator, { signalVersion, dueDate: "2026-11-16" }), 400);
+  checked(await localDecision.save(analyst, { signalVersion }), 403);
+
+  const first = checked(await localDecision.save(coordinator, { signalVersion }));
+  assert.equal(first.version, 1);
+  assert.equal(first.decidedBy, id(205));
+  assert.equal(first.assigneeName, "Виконавець А");
+  assert.equal(first.signal.code, local.code);
+  assert.equal(first.signal.title, local.title);
+  assert.equal(first.signal.sourceValues.deadline, local.plannedDate);
+  const duplicate = checked(await localDecision.save(coordinator, { signalVersion }), 409);
+  assert.equal(duplicate.error.code, "version_conflict");
+
+  db.prepare("UPDATE measures SET planned_date=? WHERE id=?").run("2026-11-11", local.id);
+  const changed = checked(await localDecision.save(coordinator, { signalVersion, version: first.version }), 409);
+  assert.equal(changed.error.code, "signal_changed");
+  const refreshed = checked(await coordinator(localDecision.options));
+  assert.deepEqual(refreshed.decision, first);
+  const second = checked(await localDecision.save(coordinator, {
+    signalVersion: refreshed.signalVersion, version: first.version, assigneeId: id(202),
+  }));
+  assert.equal(second.id, first.id);
+  assert.equal(second.version, 2);
+  assert.equal(second.signal.sourceValues.deadline, "2026-11-11");
+  const events = db.prepare(`
+    SELECT action, before_json, after_json FROM audit_events
+    WHERE entity_type='risk_flag_decision' AND entity_id=? ORDER BY occurred_at
+  `).all(first.id);
+  assert.deepEqual(events.map(({ action }) => action), ["create_risk_flag_decision", "update_risk_flag_decision"]);
+  assert.equal(events[0].before_json, null);
+  assert.deepEqual(JSON.parse(events[1].before_json), first);
+  assert.deepEqual(JSON.parse(events[1].after_json), second);
+
+  const otherOptions = checked(await admin(foreignDecision.options));
+  checked(await foreignDecision.save(admin, { signalVersion: otherOptions.signalVersion, assigneeId: id(203) }));
+  const scoped = checked(await analyst(url(decisionPath)));
+  assert.deepEqual(scoped, { items: [second], total: 1, page: 1, pageSize: 20, canDecide: false });
+  assert.equal(checked(await leader(url(decisionPath, { pageSize: "1", page: "2" }))).total, 2);
+  checked(await coordinator(url(decisionPath, { departmentId: id(102) })), 404);
+
+  db.prepare("DELETE FROM user_scopes WHERE user_id=? AND department_id=?").run(id(205), department);
+  checked(await localDecision.save(coordinator, { signalVersion: refreshed.signalVersion, version: second.version }), 404);
+  db.prepare("UPDATE measures SET planned_date=? WHERE id=?").run("2026-12-01", local.id);
+  checked(await admin(localDecision.options), 404);
+  checked(await localDecision.save(admin, { signalVersion: refreshed.signalVersion, version: second.version }), 404);
+  assert.deepEqual(checked(await analyst(url(decisionPath))).items, [second]);
+
+  checked(await admin(`/measures/${local.id}`, { method: "DELETE", body: { version: 1 } }), 204);
+  assert.deepEqual(checked(await analyst(url(decisionPath))).items, []);
+  assert.equal(db.prepare("SELECT count(*) AS count FROM audit_events WHERE entity_id=?").get(first.id).count, 0);
+});
+
+test("role preview can inspect decisions while password sessions exclude seed-only assignees", async (t) => {
+  const local = measure(501, "A");
+  const { db, request } = await setup(t, [local]);
+  const credentials = { username: "decision.admin", password: "synthetic-password" };
+  const administrator = await createFirstAdministrator(db, {
+    ...credentials, fullName: "Синтетичний адміністратор", department: "Підрозділ", position: "Адміністратор",
+  });
+  const login = await request("/auth/login", { method: "POST", body: credentials });
+  assert.equal(checked(login, 201).userId, administrator.id);
+  const cookie = login.headers.get("set-cookie").split(";")[0];
+  const authenticated = (path, options = {}) => request(path, { ...options, cookie });
+  const localDecision = overdueDecision(local.id);
+  const options = checked(await authenticated(localDecision.options));
+  assert.deepEqual(options.items.map(({ id }) => id), [administrator.id]);
+  const saved = checked(await localDecision.save(authenticated, { signalVersion: options.signalVersion, assigneeId: administrator.id }));
+
+  checked(await authenticated("/role-preview", { method: "PUT", body: { userId: id(205) } }), 204);
+  const preview = checked(await authenticated(url(decisionPath)));
+  assert.equal(preview.canDecide, false);
+  assert.deepEqual(preview.items, [saved]);
+  checked(await authenticated(localDecision.options), 403);
+  checked(await localDecision.save(authenticated, {
+    signalVersion: options.signalVersion, assigneeId: administrator.id, version: saved.version,
+  }), 403);
+  assert.equal(db.prepare("SELECT version FROM risk_flag_decisions WHERE id=?").get(saved.id).version, 1);
 });

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Glyph } from "./Workspace.jsx";
 import { DeleteAction } from "./DeleteAction.jsx";
 import "./program-reference.css";
@@ -284,7 +284,11 @@ function RiskEditor({ api, path, risk, onCancel, onSave }) {
   );
 }
 
-function RiskRecord({ risk, api, path, departments, refresh, readOnly, catalogPath, onCatalogChange }) {
+function RiskRecord({ risk, api, path, departments, refresh, readOnly, catalogPath, onCatalogChange, focused }) {
+  const heading = useRef(null);
+  useEffect(() => {
+    if (focused) heading.current?.focus();
+  }, [focused]);
   const [form, setForm] = useState("");
   const [notice, setNotice] = useState("");
   const { indicator, readings } = risk;
@@ -302,7 +306,7 @@ function RiskRecord({ risk, api, path, departments, refresh, readOnly, catalogPa
     <article className="reference-risk">
       <div className="reference-section-heading">
         <div>
-          <h2>{risk.code} · {risk.title}</h2>
+          <h2 ref={heading} tabIndex={-1}>{risk.code} · {risk.title}</h2>
           <p className="count">{risk.ownerDepartmentTitle || "Підрозділ не визначено"}</p>
         </div>
         {risk.level && <span className="reference-level" data-level={risk.level}>
@@ -357,7 +361,7 @@ function RiskRecord({ risk, api, path, departments, refresh, readOnly, catalogPa
   );
 }
 
-function CorruptionRisks({ api, path, departments, readOnly, catalogPath, onCatalogChange }) {
+function CorruptionRisks({ api, path, departments, readOnly, catalogPath, onCatalogChange, focusedRiskId }) {
   const request = useProgramReference(api, path);
   const [creating, setCreating] = useState(false);
   const [notice, setNotice] = useState("");
@@ -380,7 +384,7 @@ function CorruptionRisks({ api, path, departments, readOnly, catalogPath, onCata
           {request.data.items.map((risk) => (
             <RiskRecord key={risk.id} risk={risk} api={api} path={`${path}/${risk.id}`}
               departments={departments} refresh={request.refresh} readOnly={readOnly}
-              catalogPath={catalogPath && `${catalogPath}/${risk.id}`} onCatalogChange={onCatalogChange} />
+              catalogPath={catalogPath && `${catalogPath}/${risk.id}`} onCatalogChange={onCatalogChange} focused={focusedRiskId === risk.id} />
           ))}
         </div>
       )}
@@ -389,7 +393,7 @@ function CorruptionRisks({ api, path, departments, readOnly, catalogPath, onCata
   );
 }
 
-export function ProgramReference({ view, program, programContext, departments, api, readOnly, catalogAdmin, onCatalogChange }) {
+export function ProgramReference({ view, program, programContext, departments, api, readOnly, catalogAdmin, onCatalogChange, focusedRiskId }) {
   const passport = view === "passport";
   const path = `/programs/${program.id}/${passport ? "passport" : "corruption-risks"}`;
   const catalogPath = catalogAdmin ? `/admin/programs/${program.id}/${passport ? "passport" : "risks"}` : null;
@@ -404,7 +408,7 @@ export function ProgramReference({ view, program, programContext, departments, a
       {passport
         ? <Passport key={path} api={api} path={path} departments={departments} readOnly={readOnly} catalogPath={catalogPath} />
         : <CorruptionRisks key={path} api={api} path={path} departments={departments} readOnly={readOnly}
-          catalogPath={catalogPath} onCatalogChange={onCatalogChange} />}
+          catalogPath={catalogPath} onCatalogChange={onCatalogChange} focusedRiskId={focusedRiskId} />}
     </section>
   );
 }

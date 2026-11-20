@@ -39,7 +39,10 @@ export async function purgeMeasureRows(db, measureIds) {
          OR (entity_type='evidence' AND entity_id IN (
            SELECT id FROM evidence_versions WHERE result_id IN (${results})
          ))
-    `).run(...batch, ...batch, ...batch, ...batch, ...batch);
+         OR (entity_type='risk_flag_decision' AND entity_id IN (
+           SELECT id FROM risk_flag_decisions WHERE measure_id IN (${params})
+         ))
+    `).run(...batch, ...batch, ...batch, ...batch, ...batch, ...batch);
 
     await db.prepare(`DELETE FROM evidence_versions WHERE result_id IN (${results})`).run(...batch);
     await db.prepare(`DELETE FROM result_reviews WHERE result_id IN (${results})`).run(...batch);

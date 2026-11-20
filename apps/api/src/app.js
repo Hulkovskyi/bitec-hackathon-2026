@@ -1,7 +1,7 @@
 import express from "express";
 import { fileURLToPath } from "node:url";
 import { adaptDatabase, databaseConstraintKind } from "./database.js";
-import { ApiError, keys, uuid, pagination, invalid } from "./validation.js";
+import { ApiError, choice, keys, uuid, pagination, invalid } from "./validation.js";
 import { mountLoginRoutes, mountSessionRoutes } from "./accounts.js";
 import { mountAccountAdminRoutes } from "./account-admin.js";
 import { mountDepartmentAdminRoutes } from "./department-admin.js";
@@ -221,11 +221,14 @@ export function createApp(
     res.json(body);
   });
   app.get("/api/measures/:id", async (req, res) => {
-    keys(req.query, ["periodKey"]);
-    res.json(await getMeasure(database, req.user, uuid(req.params.id), {
-      periodKey: req.query.periodKey,
-      today: today(),
-    }));
+    keys(req.query, ["periodKey", "source"]);
+    const archive = choice(req.query.source ?? "live", ["live", "official"]) === "official";
+    const id = uuid(req.params.id);
+    const options = { periodKey: req.query.periodKey, today: today(), archive };
+    const result = archive
+      ? await database.transaction((tx) => getMeasure(tx, req.user, id, options), { readOnly: true })
+      : await getMeasure(database, req.user, id, options);
+    res.json(result);
   });
   app.post("/api/measures", async (req, res) => {
     keys(req.query, []);

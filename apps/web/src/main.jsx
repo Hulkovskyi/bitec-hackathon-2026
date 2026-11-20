@@ -10,9 +10,9 @@ import { ProgramDashboard } from "./ProgramDashboard.jsx";
 import { ProgramAdmin } from "./ProgramAdmin.jsx";
 import { ProgramReference } from "./ProgramReference.jsx";
 import { RegistryImport } from "./RegistryImport.jsx";
-import { ResultPanel } from "./ResultPanel.jsx";
+import { OfficialMeasureResult, ResultPanel } from "./ResultPanel.jsx";
 import { measurePeriods, recurrenceLabels } from "./measure-schedule.js";
-import { halfYears, kyivToday } from "./periods.js";
+import { formatRegistryDate, halfYears, kyivToday } from "./periods.js";
 import { Glyph, SignIn, Workspace } from "./Workspace.jsx";
 import { hasPermission, roleNames } from "./permissions.js";
 import "./styles.css";
@@ -262,11 +262,6 @@ function Registry({ api, user, logout, changePassword, rolePreview, busy, sessio
 const registryPageSize = 20;
 const lastRegistryPage = (total) => Math.max(1, Math.ceil(total / registryPageSize));
 
-function formatRegistryDate(value) {
-  if (!value) return "—";
-  return value.split("-").reverse().join(".");
-}
-
 function scheduleLabel(measure) {
   if (measure.scheduleType === "continuous") return "Постійно";
   if (measure.scheduleType === "periodic") return recurrenceLabels[measure.recurrence] ?? "Періодично";
@@ -291,6 +286,7 @@ async function registryPage(api, query, searching, signal) {
 
 function Program({ api, program, user, shell, sessionError, initialView, onOpenGlobal }) {
   const [reportPeriod, setReportPeriod] = useState(null);
+  const [signalSubject, setSignalSubject] = useState(null);
   const [registryNotice, setRegistryNotice] = useState("");
   const [view, setView] = useState(initialView ?? (
     hasPermission(user, "analytics.read", true) ? "dashboard" : "registry"
@@ -389,24 +385,27 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
     requestedPeriod = periodKey,
     focusHeading = false,
     sourceResultId = null,
+    source,
   } = {}) {
     clearDetail();
     const controller = new AbortController();
     detailRequest.current = controller;
     setDetailLoading(true);
     try {
-      const query = requestedPeriod
-        ? `?${new URLSearchParams({ periodKey: requestedPeriod })}` : "";
-      const measure = await api("/measures/" + id + query, {
+      const query = new URLSearchParams();
+      if (source === "official") query.set("source", source);
+      else if (requestedPeriod) query.set("periodKey", requestedPeriod);
+      const measure = await api("/measures/" + id + (query.size ? "?" + query : ""), {
         signal: controller.signal,
       });
       if (!controller.signal.aborted) {
         focusOnDetail.current = focusHeading;
-        setSelected({ ...measure, sourceResultId });
+        setSelected({ ...measure, sourceResultId,
+          ...(measure.officialResult && requestedPeriod ? { periodKey: requestedPeriod } : {}) });
       }
     } catch (e) {
       if (!controller.signal.aborted) {
-        setDetailError({ cause: e, retry: () => open(id, { requestedPeriod, focusHeading, sourceResultId }) });
+        setDetailError({ cause: e, retry: () => open(id, { requestedPeriod, focusHeading, sourceResultId, source }) });
       }
     } finally {
       if (!controller.signal.aborted) {
@@ -415,10 +414,10 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
       }
     }
   }
-  function openDashboardMeasure({ measureId, periodKey: requestedPeriod, resultId }) {
+  function openDashboardMeasure({ measureId, periodKey: requestedPeriod, resultId, source }) {
     if (view === "approvals") {
       setView("review");
-      open(measureId, { requestedPeriod, focusHeading: true, sourceResultId: resultId });
+      open(measureId, { requestedPeriod, focusHeading: true, sourceResultId: resultId, source });
       return;
     }
     setView("registry");
@@ -430,7 +429,12 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
       setPage(1);
       setPeriodKey(requestedPeriod);
     }
-    open(measureId, { requestedPeriod, focusHeading: true, sourceResultId: resultId });
+    open(measureId, { requestedPeriod, focusHeading: true, sourceResultId: resultId, source });
+  }
+  function openSignalSubject(subject) {
+    clearDetail();
+    setSignalSubject(subject);
+    setView(subject.type === "risk" ? "corruptionRisks" : "dashboard");
   }
   function beginSave() {
     const originView = detailView.current;
@@ -460,6 +464,7 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
   function navigate(next) {
     if (next === view) return;
     clearDetail();
+    setSignalSubject(null);
     if (next === "access" || next === "registryImport" || next === "programManagement") onOpenGlobal(next);
     else setView(next);
   }
@@ -553,14 +558,17 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
       ) : view === "passport" || view === "corruptionRisks" ? (
         <ProgramReference view={view} program={program} programContext={programContext}
           departments={options?.departments ?? []} api={api} readOnly={Boolean(user.preview)}
-          catalogAdmin={shell.manageAccess} onCatalogChange={() => setRefresh((value) => value + 1)} />
+          catalogAdmin={shell.manageAccess} onCatalogChange={() => setRefresh((value) => value + 1)}
+          focusedRiskId={signalSubject?.type === "risk" ? signalSubject.id : undefined} />
       ) : view === "report" ? (
         <HalfYearReport program={program} api={api} selectedPeriod={reportPeriod}
           onPeriodChange={setReportPeriod} onOpenMeasure={openDashboardMeasure} />
       ) : view !== "registry" ? (
         <ProgramDashboard key={viewMode} mode={viewMode} program={program} userRole={user.role}
           programContext={programContext} departments={options?.departments ?? []}
-          api={api} onOpenMeasure={openDashboardMeasure} />
+          api={api} onOpenMeasure={openDashboardMeasure} onOpenSubject={openSignalSubject}
+          canOpenRisk={hasPermission(user, "risks.read", user.role !== "executor")}
+          initialDepartmentId={signalSubject?.type === "department" ? signalSubject.id : ""} />
       ) : (
         <>
           {registryNotice && <p className="access-notice" role="status">{registryNotice}</p>}
@@ -710,6 +718,7 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
           </div>
           {selected && !editing && (
             <div ref={resultAnchor} tabIndex={-1} className="registry-result">
+              {selected.officialResult && <OfficialMeasureResult result={selected.officialResult} />}
               {resultPanel}
             </div>
           )}

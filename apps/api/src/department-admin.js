@@ -81,7 +81,12 @@ export function mountDepartmentAdminRoutes(app, db, { finishDeletion = (res) => 
           OR (entity_type='risk_measurement' AND entity_id IN (
             SELECT id FROM risk_measurements WHERE risk_id IN (${ownedRisks})
           ))
-      `).run(id, programId, id, programId, id, programId, id);
+          OR (entity_type='risk_flag_decision' AND entity_id IN (
+            SELECT id FROM risk_flag_decisions WHERE program_id=? AND (
+              department_id=? OR risk_owner_department_id=?
+            )
+          ))
+      `).run(id, programId, id, programId, id, programId, id, programId, id, id);
       const readings = await tx.prepare(`DELETE FROM risk_measurements WHERE risk_id IN (${ownedRisks})`).run(programId, id);
       const indicators = await tx.prepare("DELETE FROM risk_indicators WHERE program_id=? AND owner_department_id=?").run(programId, id);
       await tx.prepare("DELETE FROM departments WHERE program_id=? AND id=?").run(programId, id);

@@ -132,14 +132,51 @@ export function measure(row) {
     },
   };
 }
+async function getOfficialResult(db, user, row, today) {
+  if (!hasPermission(user, "analytics.read")) forbidden();
+  const archive = await db.prepare(`
+    SELECT r.source_period, b.source_as_of, r.source_status, r.source_approved,
+           r.source_actual_date, r.source_user_id, r.description, r.measured_value,
+           m.source_department_id, m.indicator_target, m.indicator_unit
+    FROM official_measure_results r
+    JOIN official_measure_metadata m ON m.measure_id=r.measure_id AND m.program_id=r.program_id
+    JOIN official_dataset_batches b ON b.program_id=r.program_id AND b.source_period=r.source_period
+    WHERE r.measure_id=? AND r.program_id=? AND b.source_as_of<=?
+  `).get(row.id, row.program_id, today);
+  if (!archive || !await scope(db, user, row.program_id, archive.source_department_id) ||
+    (user.role === "executor" && archive.source_user_id !== null && archive.source_user_id !== user.id)) missing();
+  if (user.role === "executor" && row.schedule_type !== "one_time") {
+    const assignment = await db.prepare("SELECT executor_id FROM period_assignments WHERE measure_id=? AND period_key=?")
+      .get(row.id, archive.source_period);
+    if ((assignment?.executor_id ?? row.executor_id) !== user.id) missing();
+  }
+  const evidence = await db.prepare(`
+    SELECT title FROM official_evidence_claims WHERE program_id=? AND measure_id=? ORDER BY source_id
+  `).all(row.program_id, row.id);
+  return {
+    periodKey: archive.source_period, asOf: archive.source_as_of, status: archive.source_status,
+    markedApproved: Boolean(archive.source_approved), actualDate: archive.source_actual_date,
+    description: archive.description, actual: archive.measured_value,
+    target: archive.indicator_target, unit: archive.indicator_unit,
+    evidence: evidence.map(({ title }) => title),
+  };
+}
+
 export async function getMeasure(database, user, id, options) {
   const db = adaptDatabase(database);
   const rule = access(user, options);
-  const row = await db
-    .prepare(`${selectPeriodMeasure(rule)} WHERE m.id=? AND ${rule.sql}`)
-    .get(rule.period, id, ...rule.params);
+  const row = await db.prepare(`
+    SELECT ${measureColumns}, ${rule.executor} AS effective_executor_id, source.expected_evidence
+    ${measureTables} LEFT JOIN official_measure_metadata source ON source.measure_id=m.id AND source.program_id=s.program_id
+    WHERE m.id=? AND ${rule.sql}
+  `).get(rule.period, id, ...rule.params);
   if (!row) missing();
-  const value = periodMeasure(row, user, rule.period);
+  const expectedEvidence = row.expected_evidence?.trim();
+  const value = {
+    ...periodMeasure(row, user, rule.period),
+    ...(expectedEvidence ? { expectedEvidence } : {}),
+    ...(options?.archive ? { officialResult: await getOfficialResult(db, user, row, options.today) } : {}),
+  };
   return hasPermission(user, "registry.write")
     ? { ...value, planFrozen: await planIsFrozen(db, id) }
     : value;
