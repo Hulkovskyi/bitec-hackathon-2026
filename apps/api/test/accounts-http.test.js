@@ -475,3 +475,73 @@ test("a preview with an unavailable target denies access until the administrator
   assert.equal(restored.data.role, "admin");
   assert.equal((await request("/admin/access", { cookie })).status, 200);
 });
+
+test("an administrator edits profiles, revokes access and deletes unused custom roles without losing history", async (t) => {
+  const { db, request, login, admin, provision, enrollment } = await setup(t);
+  const { cookie: adminCookie } = await login(administrator);
+  const role = (await request("/admin/roles", { method: "POST", cookie: adminCookie,
+    body: { name: "Тестова роль", baseRole: "executor", permissions: ["workflow.submit"] } })).data;
+  const parent = (await provision({ ...enrollment, roleId: role.id }, adminCookie)).data;
+  const child = (await provision({ ...enrollment, username: "child.test", managerId: parent.id }, adminCookie)).data;
+  const { cookie: workerCookie } = await login(employee);
+  const profile = {
+    username: "updated.employee", fullName: "Олена Оновлена", department: "Другий відділ",
+    position: "Старший фахівець", managerId: admin.id,
+  };
+  const update = (id, value, cookie = adminCookie) =>
+    request(`/admin/accounts/${id}/profile`, { method: "PATCH", cookie, body: value });
+  const removeAccount = (id, cookie = adminCookie) =>
+    request(`/admin/accounts/${id}`, { method: "DELETE", cookie });
+  const removeRole = (id) => request(`/admin/roles/${id}`, { method: "DELETE", cookie: adminCookie });
+
+  assert.equal((await update(parent.id, profile, workerCookie)).status, 403);
+  assert.equal((await update(parent.id, { ...profile, username: administrator.username })).data.error.code, "username_taken");
+  assert.equal((await update(parent.id, { ...profile, managerId: child.id })).status, 400);
+  assert.equal((await update(parent.id, { ...profile, password: "injected-password" })).status, 400);
+  const edited = await update(parent.id, profile);
+  assert.equal(edited.status, 200);
+  assert.equal(edited.data.roleId, role.id);
+  assert.deepEqual(edited.data.departmentIds, departmentIds);
+  assert.deepEqual((await request("/me", { cookie: workerCookie })).data.profile,
+    { ...profile, managerName: administrator.fullName });
+  assert.equal((await login(employee)).status, 401);
+  assert.equal((await login({ ...employee, username: profile.username })).status, 201);
+  assert.equal((await removeRole("executor")).status, 403);
+  assert.equal((await removeRole(role.id)).data.error.code, "role_in_use");
+  assert.equal((await removeAccount(parent.id, workerCookie)).status, 403);
+  assert.equal((await removeAccount(admin.id)).status, 403);
+  assert.equal((await removeAccount(parent.id)).data.error.code, "manager_in_use");
+
+  const childProfile = {
+    username: child.username, fullName: child.fullName, department: child.department,
+    position: child.position, managerId: admin.id,
+  };
+  assert.equal((await update(child.id, childProfile)).status, 200);
+  assert.equal((await removeAccount(parent.id)).status, 204);
+  assert.equal((await request("/me", { cookie: workerCookie })).status, 401);
+  assert.equal((await login({ ...employee, username: profile.username })).status, 401);
+  assert.equal(db.prepare("SELECT active FROM users WHERE id=?").get(parent.id).active, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM user_scopes WHERE user_id=?").get(parent.id).n, 0);
+  assert.equal((await request("/admin/access", { cookie: adminCookie })).data.accounts.find(({ id }) => id === parent.id).status,
+    "revoked");
+  assert.equal((await removeRole(role.id)).status, 204);
+  const restoreAccess = () => request(`/admin/accounts/${parent.id}/restore`, { method: "POST", cookie: adminCookie,
+    body: { roleId: "executor", departmentIds } });
+  const restore = await restoreAccess();
+  assert.equal(restore.status, 200);
+  assert.equal(restore.data.status, "approved");
+  assert.deepEqual(restore.data.departmentIds, departmentIds);
+  assert.equal((await login({ ...employee, username: profile.username })).status, 201);
+  assert.equal((await update(parent.id, { ...profile, managerId: child.id })).status, 200);
+  assert.equal((await removeAccount(parent.id)).status, 204);
+  assert.equal((await removeAccount(child.id)).status, 204);
+  assert.equal((await restoreAccess()).status, 400);
+  assert.equal((await update(parent.id, profile)).status, 200);
+  assert.equal((await restoreAccess()).status, 200);
+  const events = db.prepare("SELECT action,before_json,after_json FROM audit_events WHERE entity_id=? OR entity_id=?")
+    .all(parent.id, role.id);
+  for (const action of ["create", "update_profile", "revoke_access", "restore_access", "delete_role"]) {
+    assert.ok(events.some((event) => event.action === action), action);
+  }
+  assert.ok(!JSON.stringify(events).includes(employee.password));
+});

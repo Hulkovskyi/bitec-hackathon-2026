@@ -441,6 +441,35 @@ export async function saveMeasure(database, user, input, id, { today = kyivDate 
   });
 }
 
+
+export async function deleteMeasure(database, user, id, version) {
+  if (user.role !== "admin") forbidden();
+  positive(version);
+  await adaptDatabase(database).transaction(async (db) => {
+    const before = await getBaseMeasure(db, user, id);
+    if (before.version !== version) {
+      throw new ApiError(409, "version_conflict", "Запис змінено. Оновіть картку та повторіть видалення");
+    }
+    const linked = await db.prepare(`
+      SELECT 1 FROM results WHERE measure_id=?
+      UNION ALL SELECT 1 FROM period_assignments WHERE measure_id=?
+      UNION ALL SELECT 1 FROM official_measure_metadata WHERE measure_id=?
+      LIMIT 1
+    `).get(id, id, id);
+    if (linked) {
+      throw new ApiError(
+        409,
+        "measure_in_use",
+        "Захід має результати, призначення за періодом або запис в офіційному архіві. Видалення недоступне.",
+      );
+    }
+    await db.prepare("DELETE FROM indicators WHERE measure_id=?").run(id);
+    const { changes } = await db.prepare("DELETE FROM measures WHERE id=? AND version=?").run(id, version);
+    if (!changes) throw new ApiError(409, "version_conflict", "Запис змінено");
+    await audit(db, user.id, "delete", "measure", id, before, null);
+  });
+}
+
 const importGroups = [
   "programs",
   "sections",

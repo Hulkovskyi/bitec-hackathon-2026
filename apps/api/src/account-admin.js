@@ -1,13 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { accountManagerJoin, insertApprovedAccount, prepareAccountCredentials } from "./accounts.js";
+import { accountManagerJoin, insertApprovedAccount, prepareAccountCredentials, validateAccountProfile } from "./accounts.js";
+import { databaseConstraintKind } from "./database.js";
 import { permissions, roleBases, rolePermissions } from "./permissions.js";
 import { audit, forbidden, missing } from "./registry.js";
 import { ApiError, choice, invalid, keys, text, uuid } from "./validation.js";
 
 const permissionKeys = new Set(permissions.map(({ key }) => key));
+const visibleAccount = `(a.status<>'draft' OR EXISTS (
+  SELECT 1 FROM audit_events e WHERE e.entity_type='account' AND e.entity_id=a.user_id AND e.action='revoke_access'
+))`;
+
 function accountSelect(db) {
   return `SELECT
-  a.user_id AS id,a.username,u.display_name AS fullName,a.department,a.position,a.status,
+  a.user_id AS id,a.username,u.display_name AS fullName,a.department,a.position,
+  CASE a.status WHEN 'draft' THEN 'revoked' ELSE a.status END AS status,
   a.role_id AS roleId,a.submitted_at AS submittedAt,a.reviewed_at AS reviewedAt,a.decision_reason AS decisionReason,
   manager.id AS managerId,manager.display_name AS managerName
   FROM credential_accounts a JOIN users u ON u.id=a.user_id
@@ -25,7 +31,7 @@ function roleView(row) {
   };
 }
 
-async function verifyAdministrator(db, actorId) {
+export async function verifyAdministrator(db, actorId) {
   if (!(await db.prepare(`
     SELECT 1 FROM credential_accounts a JOIN users u ON u.id=a.user_id
     WHERE a.user_id=? AND a.status='approved' AND u.role='admin' AND u.active=1
@@ -35,11 +41,32 @@ async function verifyAdministrator(db, actorId) {
 async function accountForAdmin(db, accountId) {
   const account = await db.prepare(`
     ${accountSelect(db)}
-    WHERE a.user_id=? AND a.status<>'draft'
+    WHERE a.user_id=? AND ${visibleAccount}
   `).get(accountId);
   if (!account) missing();
   const scope = await db.prepare("SELECT department_id FROM user_scopes WHERE user_id=? ORDER BY department_id").all(accountId);
   return { ...account, departmentIds: scope.map(({ department_id }) => department_id) };
+}
+
+async function verifyManager(db, managerId, accountId, unavailableMessage = "Оберіть чинного керівника зі списку облікових записів") {
+  const manager = await db.prepare(`
+    SELECT 1 FROM credential_accounts a JOIN users u ON u.id=a.user_id
+    WHERE a.user_id=? AND a.status='approved' AND u.active=1
+  `).get(managerId);
+  if (!manager) invalid(unavailableMessage);
+  if (accountId && await db.prepare(`
+    WITH RECURSIVE managers(id) AS (
+      SELECT CAST(? AS TEXT)
+      UNION
+      SELECT a.manager_id FROM credential_accounts a JOIN managers m ON a.user_id=m.id
+      WHERE a.manager_id IS NOT NULL
+    )
+    SELECT 1 FROM managers WHERE id=?
+  `).get(managerId, accountId)) invalid("Керівник і підлеглі не можуть утворювати цикл");
+}
+
+function isPrimaryAdministrator(account) {
+  return account.roleId === "admin" && account.username === "admin";
 }
 
 async function assignedAccess(db, body) {
@@ -84,7 +111,7 @@ export function mountAccountAdminRoutes(app, db) {
       await verifyAdministrator(tx, req.user.id);
       const accounts = await tx.prepare(`
         ${accountSelect(tx)}
-        WHERE a.status<>'draft' ORDER BY a.username
+        WHERE ${visibleAccount} ORDER BY a.username
       `).all();
       const scopes = await tx.prepare(`
         SELECT s.user_id,s.department_id FROM user_scopes s JOIN credential_accounts a ON a.user_id=s.user_id
@@ -115,11 +142,7 @@ export function mountAccountAdminRoutes(app, db) {
     const credentials = await prepareAccountCredentials(req.body);
     const created = await db.transaction(async (tx) => {
       await verifyAdministrator(tx, req.user.id);
-      const manager = await tx.prepare(`
-        SELECT 1 FROM credential_accounts a JOIN users u ON u.id=a.user_id
-        WHERE a.user_id=? AND a.status='approved' AND u.active=1
-      `).get(managerId);
-      if (!manager) invalid("Оберіть чинного керівника зі списку облікових записів");
+      await verifyManager(tx, managerId);
       const { role, departments } = await assignedAccess(tx, req.body);
       const id = await insertApprovedAccount(tx, credentials, {
         roleId: role.id, baseRole: role.base_role, managerId, reviewedBy: req.user.id,
@@ -173,6 +196,7 @@ export function mountAccountAdminRoutes(app, db) {
     const result = await db.transaction(async (tx) => {
       await verifyAdministrator(tx, req.user.id);
       const account = await accountForAdmin(tx, id);
+      if (isPrimaryAdministrator(account)) forbidden();
       if (account.status !== "approved") throw new ApiError(409, "access_not_approved", "Спочатку схваліть заявку");
       const access = await assignedAccess(tx, req.body);
       await grantAccess(tx, id, access);
@@ -182,6 +206,81 @@ export function mountAccountAdminRoutes(app, db) {
         { roleId: account.roleId, departmentIds: account.departmentIds },
         { roleId: updated.roleId, departmentIds: updated.departmentIds });
       return updated;
+    });
+    res.json(result);
+  });
+
+  app.patch("/api/admin/accounts/:id/profile", async (req, res) => {
+    keys(req.query, []);
+    const fields = ["fullName", "username", "department", "position", "managerId"];
+    keys(req.body, fields, fields);
+    const id = uuid(req.params.id);
+    const profile = validateAccountProfile(req.body);
+    const managerId = req.body.managerId === null ? null : uuid(req.body.managerId);
+    const result = await db.transaction(async (tx) => {
+      await verifyAdministrator(tx, req.user.id);
+      const before = await accountForAdmin(tx, id);
+      if (isPrimaryAdministrator(before) && profile.username !== before.username) forbidden();
+      if (managerId !== null && managerId !== before.managerId) await verifyManager(tx, managerId, id);
+      try {
+        await tx.prepare("UPDATE credential_accounts SET username=?,department=?,position=?,manager_id=? WHERE user_id=?")
+          .run(profile.username, profile.department, profile.position, managerId, id);
+      } catch (error) {
+        if (databaseConstraintKind(error) === "unique") {
+          throw new ApiError(409, "username_taken", "Такий логін уже зареєстровано");
+        }
+        throw error;
+      }
+      await tx.prepare("UPDATE users SET display_name=? WHERE id=?").run(profile.fullName, id);
+      const after = await accountForAdmin(tx, id);
+      await audit(tx, req.user.id, "update_profile", "account", id, before, after);
+      return after;
+    });
+    res.json(result);
+  });
+
+  app.delete("/api/admin/accounts/:id", async (req, res) => {
+    keys(req.query, []);
+    const id = uuid(req.params.id);
+    if (id === req.user.id) forbidden();
+    await db.transaction(async (tx) => {
+      await verifyAdministrator(tx, req.user.id);
+      const before = await accountForAdmin(tx, id);
+      if (isPrimaryAdministrator(before)) forbidden();
+      if (before.status !== "approved") throw new ApiError(409, "access_not_approved", "Відкликати можна лише схвалений доступ");
+      if (await tx.prepare(`
+        SELECT 1 FROM credential_accounts WHERE manager_id=? AND status IN ('approved','pending')
+      `).get(id)) {
+        throw new ApiError(409, "manager_in_use", "Спочатку призначте підлеглим іншого керівника");
+      }
+      await tx.prepare("UPDATE credential_accounts SET status='draft',role_id=NULL WHERE user_id=?").run(id);
+      await tx.prepare("UPDATE users SET active=0 WHERE id=?").run(id);
+      await tx.prepare("DELETE FROM user_scopes WHERE user_id=?").run(id);
+      await tx.prepare("DELETE FROM account_sessions WHERE user_id=?").run(id);
+      await tx.prepare("DELETE FROM sessions WHERE user_id=?").run(id);
+      await audit(tx, req.user.id, "revoke_access", "account", id, before,
+        { status: "revoked", roleId: null, departmentIds: [] });
+    });
+    res.status(204).end();
+  });
+
+  app.post("/api/admin/accounts/:id/restore", async (req, res) => {
+    keys(req.query, []);
+    keys(req.body, ["roleId", "departmentIds"], ["roleId", "departmentIds"]);
+    const id = uuid(req.params.id);
+    const result = await db.transaction(async (tx) => {
+      await verifyAdministrator(tx, req.user.id);
+      const before = await accountForAdmin(tx, id);
+      if (before.status !== "revoked") throw new ApiError(409, "access_not_revoked", "Доступ цього облікового запису не відкликано");
+      if (before.managerId !== null) {
+        await verifyManager(tx, before.managerId, id, "Спочатку призначте чинного керівника в профілі або залиште поле порожнім");
+      }
+      const access = await assignedAccess(tx, req.body);
+      await grantAccess(tx, id, access);
+      await tx.prepare("UPDATE credential_accounts SET status='approved',role_id=? WHERE user_id=?").run(access.role.id, id);
+      const after = await accountForAdmin(tx, id);
+      await audit(tx, req.user.id, "restore_access", "account", id, before, after);
+      return after;
     });
     res.json(result);
   });
@@ -222,5 +321,22 @@ export function mountAccountAdminRoutes(app, db) {
       return updated;
     });
     res.json(role);
+  });
+
+  app.delete("/api/admin/roles/:id", async (req, res) => {
+    keys(req.query, []);
+    const id = text(req.params.id, 64);
+    await db.transaction(async (tx) => {
+      await verifyAdministrator(tx, req.user.id);
+      const existing = await tx.prepare("SELECT * FROM account_roles WHERE id=?").get(id);
+      if (!existing) missing();
+      if (existing.system) forbidden();
+      if (await tx.prepare("SELECT 1 FROM credential_accounts WHERE role_id=?").get(id)) {
+        throw new ApiError(409, "role_in_use", "Спочатку змініть роль в усіх облікових записах, які її використовують");
+      }
+      await tx.prepare("DELETE FROM account_roles WHERE id=?").run(id);
+      await audit(tx, req.user.id, "delete_role", "account_role", id, roleView(existing), null);
+    });
+    res.status(204).end();
   });
 }

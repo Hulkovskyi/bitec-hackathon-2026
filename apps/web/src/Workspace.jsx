@@ -42,7 +42,6 @@ function Brand() {
 const navigation = [
   { key: "dashboard", label: "Огляд", visible: (user) => hasPermission(user, "analytics.read", true) },
   { key: "registry", label: "Реєстр", visible: () => true },
-  { key: "passport", label: "Паспорт програми", visible: () => true },
   { key: "corruptionRisks", label: "Корупційні ризики", visible: (user) => hasPermission(user, "risks.read", user.role !== "executor") },
   { key: "signals", label: "Сигнали", visible: (user) => user.role !== "executor" && hasPermission(user, "analytics.read", true) },
   { key: "approvals", label: "Погодження", visible: (user) => hasPermission(user, "workflow.review", user.role === "coordinator") },
@@ -97,6 +96,13 @@ export function Workspace({
                 <span>{label}</span>
               </button>
             ))}
+            {manageAccess && programNavigation && (
+              <button type="button" aria-current={activeView === "departments" ? "page" : undefined}
+                onClick={() => onNavigate("departments")}>
+                <Glyph name="access" />
+                <span>Підрозділи</span>
+              </button>
+            )}
             {manageAccess && (
               <button type="button" aria-current={activeView === "access" ? "page" : undefined}
                 onClick={() => onNavigate("access")}>
@@ -104,11 +110,25 @@ export function Workspace({
                 <span>Користувачі й ролі</span>
               </button>
             )}
+            {manageAccess && (
+              <button type="button" aria-current={activeView === "programManagement" ? "page" : undefined}
+                onClick={() => onNavigate("programManagement")}>
+                <Glyph name="report" />
+                <span>Програми</span>
+              </button>
+            )}
             {importRegistry && (
               <button type="button" aria-current={activeView === "registryImport" ? "page" : undefined}
                 onClick={() => onNavigate("registryImport")}>
                 <Glyph name="registry" />
                 <span>Імпорт реєстру</span>
+              </button>
+            )}
+            {programNavigation && (
+              <button type="button" aria-current={activeView === "passport" ? "page" : undefined}
+                onClick={() => onNavigate("passport")}>
+                <Glyph name="passport" />
+                <span>Паспорт програми</span>
               </button>
             )}
           </nav>

@@ -3,7 +3,7 @@ import { minimumAccountPasswordLength } from "../../../shared/account-password.m
 import { roleNames } from "./permissions.js";
 import "./account.css";
 
-const tabs = { accounts: "Облікові записи", roles: "Ролі", applications: "Заявки" };
+const tabs = { accounts: "Облікові записи", roles: "Ролі", applications: "Заявки", revoked: "Відкликані доступи" };
 const statuses = { pending: "На розгляді", approved: "Схвалено", rejected: "Відхилено" };
 const dateTime = new Intl.DateTimeFormat("uk-UA", {
   dateStyle: "medium", timeStyle: "short", timeZone: "Europe/Kyiv",
@@ -68,29 +68,68 @@ function AccessAssignment({ account, roles, departments, label, busy, error, onS
   );
 }
 
+function AccountProfileFields({ account, managers, busy }) {
+  const primaryAdministrator = account?.roleId === "admin" && account.username === "admin";
+  const availableManagers = managers.filter(({ id }) => id !== account?.id);
+  const currentManagerMissing = account?.managerId && !availableManagers.some(({ id }) => id === account.managerId);
+  return (
+    <>
+      <label>ПІБ<input name="fullName" defaultValue={account?.fullName} maxLength={160} required disabled={busy} /></label>
+      <label>Підрозділ<input name="department" defaultValue={account?.department} maxLength={160} required disabled={busy} /></label>
+      <label>Посада<input name="position" defaultValue={account?.position} maxLength={160} required disabled={busy} /></label>
+      <label>
+        Керівник
+        <select name="managerId" defaultValue={account?.managerId ?? ""} required={!account} disabled={busy}>
+          <option value="">{account ? "Без керівника" : "Оберіть керівника"}</option>
+          {currentManagerMissing && <option value={account.managerId}>{account.managerName}</option>}
+          {availableManagers.map(({ id, fullName, username }) => (
+            <option key={id} value={id}>{fullName} · {username}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Логін
+        <input name="username" defaultValue={account?.username} autoCapitalize="none" spellCheck={false}
+          readOnly={primaryAdministrator} minLength={3} maxLength={64} required disabled={busy} />
+      </label>
+    </>
+  );
+}
+
+function AccountProfileEditor({ account, managers, busy, error, onSave, onCancel }) {
+  return (
+    <form className="access-editor" aria-label="Редагування профілю" onSubmit={(event) => {
+      event.preventDefault();
+      const fields = Object.fromEntries(new FormData(event.currentTarget));
+      onSave({ ...fields, managerId: fields.managerId || null });
+    }}>
+      <AccountProfileFields account={account} managers={managers} busy={busy} />
+      <ErrorMessage error={error} />
+      <EditorActions busy={busy} onCancel={onCancel} label="Зберегти профіль" />
+    </form>
+  );
+}
+
+function RemovalConfirmation({ busy, error, onCancel, onConfirm, label, children }) {
+  return (
+    <form className="access-editor" onSubmit={(event) => {
+      event.preventDefault();
+      onConfirm();
+    }}>
+      <p className="count">{children}</p>
+      <ErrorMessage error={error} />
+      <EditorActions busy={busy} onCancel={onCancel} label={label} />
+    </form>
+  );
+}
+
 function AccountCreation({ managers, roles, departments, onSave, onCancel, busy, error }) {
   return (
     <div className="access-entry">
       <h3>Новий обліковий запис</h3>
       <AccessAssignment roles={roles} departments={departments} label="Створити обліковий запис"
         onSave={onSave} onCancel={onCancel} busy={busy} error={error}>
-        <label>ПІБ<input name="fullName" maxLength={160} required disabled={busy} /></label>
-        <label>Підрозділ<input name="department" maxLength={160} required disabled={busy} /></label>
-        <label>Посада<input name="position" maxLength={160} required disabled={busy} /></label>
-        <label>
-          Керівник
-          <select name="managerId" defaultValue="" required disabled={busy}>
-            <option value="">Оберіть керівника</option>
-            {managers.map(({ id, fullName, username }) => (
-              <option key={id} value={id}>{fullName} · {username}</option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Логін
-          <input name="username" autoCapitalize="none" spellCheck={false}
-            minLength={3} maxLength={64} required disabled={busy} />
-        </label>
+        <AccountProfileFields managers={managers} busy={busy} />
         <label>
           Пароль
           <input name="password" type="password" autoComplete="new-password" aria-describedby="new-account-password-help"
@@ -159,11 +198,12 @@ function RoleEditor({ role, permissionOptions, onSave, onCancel, busy, error }) 
   );
 }
 
-function AccountList({ accounts, roles, departments, applications, currentUserId, editor, onEdit, onSave, busy, error }) {
+function AccountList({ accounts, managers, roles, departments, applications, revoked, currentUserId, editor, onEdit, onSave, busy, error }) {
   const rolesById = new Map(roles.map((role) => [role.id, role]));
   const departmentsById = new Map(departments.map((department) => [department.id, department]));
   if (accounts.length === 0) {
-    return <p className="empty">{applications ? "За цим фільтром заявок немає." : "Немає схвалених облікових записів."}</p>;
+    return <p className="empty">{applications ? "За цим фільтром заявок немає."
+      : revoked ? "Немає відкликаних доступів." : "Немає схвалених облікових записів."}</p>;
   }
   return (
     <ul className="access-items" role="list">
@@ -171,6 +211,9 @@ function AccountList({ accounts, roles, departments, applications, currentUserId
         const role = rolesById.get(account.roleId);
         const editType = editor?.id === account.id ? editor.type : null;
         const applicationPath = `/admin/applications/${account.id}/decision`;
+        const accountPath = `/admin/accounts/${account.id}`;
+        const allowedToRemove = account.id !== currentUserId
+          && !(account.roleId === "admin" && account.username === "admin");
         const scopeLabels = account.departmentIds.map((id) => departmentsById.get(id))
           .filter(Boolean).map(({ programCode, title }) => `${programCode} · ${title}`);
         return (
@@ -191,24 +234,54 @@ function AccountList({ accounts, roles, departments, applications, currentUserId
                 <dt>Доступ</dt><dd>{role.baseRole === "admin" ? "Усі програми й підрозділи" : scopeLabels.join(", ") || "—"}</dd>
               </dl>
             )}
-            {editType === "reject" ? (
+            {editType === "profile" ? (
+              <AccountProfileEditor account={account} managers={managers} onCancel={() => onEdit(null)} busy={busy} error={error}
+                onSave={(profile) => onSave(accountPath + "/profile", "PATCH", profile, "Дані профілю оновлено.")} />
+            ) : editType === "revoke" ? (
+              <RemovalConfirmation onCancel={() => onEdit(null)} busy={busy} error={error} label="Підтвердити відкликання"
+                onConfirm={() => onSave(accountPath, "DELETE", undefined, "Доступ відкликано.")}>
+                Вхід і чинні сеанси буде вимкнено. Історія дій збережеться.
+              </RemovalConfirmation>
+            ) : editType === "reject" ? (
               <RejectionEditor onCancel={() => onEdit(null)} busy={busy} error={error}
                 onSave={(reason) => onSave(applicationPath, "POST", { decision: "reject", reason }, "Заявку відхилено.")} />
             ) : editType ? (
               <AccessAssignment key={editType} account={editType === "assign" ? account : null}
-                roles={roles} departments={departments} label={editType === "approve" ? "Схвалити заявку" : "Зберегти доступ"}
+                roles={roles} departments={departments} label={editType === "approve" ? "Схвалити заявку"
+                  : editType === "restore" ? "Відновити доступ" : "Зберегти доступ"}
                 onCancel={() => onEdit(null)} busy={busy} error={error}
-                onSave={(assignment) => editType === "approve"
-                  ? onSave(applicationPath, "POST", { decision: "approve", ...assignment }, "Заявку схвалено.")
-                  : onSave(`/admin/accounts/${account.id}`, "PATCH", assignment, "Доступ оновлено.")} />
-            ) : applications && account.status === "pending" ? (
+                onSave={(assignment) => {
+                  if (editType === "approve") {
+                    onSave(applicationPath, "POST", { decision: "approve", ...assignment }, "Заявку схвалено.");
+                  } else if (editType === "restore") {
+                    onSave(accountPath + "/restore", "POST", assignment, "Доступ відновлено.");
+                  } else {
+                    onSave(accountPath, "PATCH", assignment, "Доступ оновлено.");
+                  }
+                }} />
+            ) : (
               <div className="account-switch">
-                <button type="button" onClick={() => onEdit({ id: account.id, type: "approve" })} disabled={busy}>Схвалити</button>
-                <button type="button" className="secondary" onClick={() => onEdit({ id: account.id, type: "reject" })} disabled={busy}>Відхилити</button>
+                {applications && account.status === "pending" && (
+                  <>
+                    <button type="button" onClick={() => onEdit({ id: account.id, type: "approve" })} disabled={busy}>Схвалити</button>
+                    <button type="button" className="secondary" onClick={() => onEdit({ id: account.id, type: "reject" })} disabled={busy}>Відхилити</button>
+                  </>
+                )}
+                <button type="button" className="secondary" onClick={() => onEdit({ id: account.id, type: "profile" })}
+                  disabled={busy}>Редагувати профіль</button>
+                {!applications && !revoked && allowedToRemove && (
+                  <>
+                    <button type="button" className="secondary" onClick={() => onEdit({ id: account.id, type: "assign" })}
+                      disabled={busy}>Змінити роль і доступ</button>
+                    <button type="button" className="secondary" onClick={() => onEdit({ id: account.id, type: "revoke" })}
+                      disabled={busy}>Відкликати доступ</button>
+                  </>
+                )}
+                {revoked && (
+                  <button type="button" className="secondary" onClick={() => onEdit({ id: account.id, type: "restore" })}
+                    disabled={busy}>Відновити доступ</button>
+                )}
               </div>
-            ) : !applications && account.id !== currentUserId && (
-              <button type="button" className="secondary" onClick={() => onEdit({ id: account.id, type: "assign" })}
-                disabled={busy}>Змінити роль і доступ</button>
             )}
           </li>
         );
@@ -238,11 +311,22 @@ function RoleList({ roles, permissions, editor, onEdit, onSave, busy, error }) {
                 <p className="count">{role.system ? "Системна роль" : `Базова роль · ${roleNames[role.baseRole]}`}</p>
               </div>
               {role.editable && editor?.id !== role.id && (
-                <button type="button" className="secondary" onClick={() => onEdit({ id: role.id, type: "edit" })}
-                  aria-label={`Редагувати роль ${role.name}`} disabled={busy}>Редагувати</button>
+                <div className="account-switch">
+                  <button type="button" className="secondary" onClick={() => onEdit({ id: role.id, type: "edit" })}
+                    aria-label={`Редагувати роль ${role.name}`} disabled={busy}>Редагувати</button>
+                  {!role.system && (
+                    <button type="button" className="secondary" onClick={() => onEdit({ id: role.id, type: "delete" })}
+                      aria-label={`Видалити роль ${role.name}`} disabled={busy}>Видалити</button>
+                  )}
+                </div>
               )}
             </header>
-            {editor?.id === role.id ? (
+            {editor?.id === role.id && editor.type === "delete" ? (
+              <RemovalConfirmation onCancel={() => onEdit(null)} busy={busy} error={error} label="Підтвердити видалення"
+                onConfirm={() => onSave(`/admin/roles/${role.id}`, "DELETE", undefined, "Роль видалено.")}>
+                Видалити роль «{role.name}»?
+              </RemovalConfirmation>
+            ) : editor?.id === role.id ? (
               <RoleEditor role={role} permissionOptions={permissions} onCancel={() => onEdit(null)} busy={busy} error={error}
                 onSave={(value) => onSave(`/admin/roles/${role.id}`, "PATCH", value, "Роль оновлено.")} />
             ) : (
@@ -307,8 +391,10 @@ export function AdminAccess({ api, currentUserId }) {
   }
 
   const applications = tab === "applications";
-  const accountStatus = applications ? filter : "approved";
+  const revoked = tab === "revoked";
+  const accountStatus = applications ? filter : revoked ? "revoked" : "approved";
   const accounts = data?.accounts.filter(({ status }) => status === accountStatus);
+  const managers = data?.accounts.filter(({ status }) => status === "approved");
   const editProps = { editor, onEdit: edit, onSave: save, busy, error: saveError };
   return (
     <section className="access-management" aria-labelledby="access-title">
@@ -343,8 +429,8 @@ export function AdminAccess({ api, currentUserId }) {
                 disabled={busy || Boolean(editor)}>Оновити заявки</button>
             </div>
           )}
-          {!applications && (editor?.type === "createAccount" ? (
-            <AccountCreation managers={accounts} roles={data.roles} departments={data.departments}
+          {tab === "accounts" && (editor?.type === "createAccount" ? (
+            <AccountCreation managers={managers} roles={data.roles} departments={data.departments}
               onSave={(value) => save("/admin/accounts", "POST", value, "Обліковий запис створено.")}
               onCancel={() => edit(null)} busy={busy} error={saveError} />
           ) : (
@@ -352,8 +438,8 @@ export function AdminAccess({ api, currentUserId }) {
               Додати обліковий запис
             </button>
           ))}
-          <AccountList accounts={accounts}
-            roles={data.roles} departments={data.departments} applications={applications}
+          <AccountList accounts={accounts} managers={managers}
+            roles={data.roles} departments={data.departments} applications={applications} revoked={revoked}
             currentUserId={currentUserId} {...editProps} />
         </>
       ))}
