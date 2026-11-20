@@ -41,7 +41,7 @@ npx vercel deploy --prod
 
 ## Скидання облікових записів через GitHub
 
-1. У **Settings → Secrets and variables → Actions** додайте секрети репозиторію або середовища `production`. `DACM_ADMIN_DATABASE_URL` містить рядок підключення власника цільової бази без `sslmode`, `SUPABASE_DB_CA` містить PEM-сертифікат, а `DACM_ADMIN_PASSWORD` містить пароль адміністратора від 12 символів.
+1. У **Settings → Secrets and variables → Actions** додайте секрети репозиторію або середовища `production`. `DACM_ADMIN_DATABASE_URL` містить рядок підключення власника цільової бази без `sslmode`, `SUPABASE_DB_CA` містить PEM-сертифікат, а `DACM_ADMIN_PASSWORD` містить пароль адміністратора від 6 символів.
 2. У **Actions → Reset application accounts → Run workflow** оберіть гілку `main`, установіть прапорець, що підтверджує видалення всіх облікових записів застосунку, і запустіть процес. Він застосує решту міграцій, анулює сеанси та скине облікові записи до одного адміністратора. [Файл процесу](../.github/workflows/reset-accounts.yml)
 3. Після успішного завершення увійдіть як `admin` із паролем із `DACM_ADMIN_PASSWORD`. Створіть потрібні облікові записи в **Користувачі й ролі**.
 
