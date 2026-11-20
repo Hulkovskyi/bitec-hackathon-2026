@@ -124,6 +124,36 @@ test("verified object download returns exactly the bytes that passed the digest 
   await assert.rejects(store.download(row), { status: 404, code: "not_found" });
 });
 
+test("evidence deletion queue retries storage failures and handles already removed objects", async (t) => {
+  const alreadyRemoved = "00000000-0000-4000-8000-000000000002";
+  const later = "00000000-0000-4000-8000-000000000003";
+  const files = new Set([key, later]);
+  let unavailable = true;
+  const adapter = storage(async (url, options) => {
+    if (url.endsWith("/bucket/" + bucket)) return privateBucket();
+    assert.equal(options.method, "DELETE");
+    const { prefixes: [name] } = JSON.parse(options.body);
+    if (name === key && unavailable) return Response.json({}, { status: 503 });
+    return Response.json(files.delete(name) ? [{ name }] : []);
+  });
+  const db = new DatabaseSync(":memory:");
+  t.after(() => db.close());
+  migrate(db);
+  const enqueue = db.prepare("INSERT INTO evidence_deletions (storage_key) VALUES (?)");
+  for (const name of [key, alreadyRemoved, later]) enqueue.run(name);
+  const store = createEvidenceStore(db, { storage: adapter });
+
+  assert.equal(await store.pendingDeletions(), 3);
+  assert.equal(await store.drainDeletions(1), 3, "A storage failure leaves the entry pending");
+  assert.equal(db.prepare("SELECT attempts FROM evidence_deletions WHERE storage_key=?").get(key).attempts, 1);
+  assert.equal(await store.drainDeletions(2), 1, "A failed entry does not prevent untried deletions");
+  assert.deepEqual([...files], [key]);
+  unavailable = false;
+  assert.equal(await store.drainDeletions(), 0);
+  assert.equal(files.size, 0);
+  assert.equal(await store.drainDeletions(), 0);
+});
+
 test("hosted evidence HTTP route keeps access, limit and rollback rules with object storage", async (t) => {
   const files = new Map();
   const adapter = storage(async (url, { method, body }) => {

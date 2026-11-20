@@ -1,0 +1,33 @@
+name: Reset application accounts
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_reset:
+        description: "Видалити всі облікові записи застосунку, завершити сесії та залишити одного admin"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  reset:
+    if: github.ref == 'refs/heads/main' && inputs.confirm_reset
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version-file: .node-version
+      - run: npm ci --ignore-scripts
+      - run: npm run reset-accounts
+        env:
+          DACM_ADMIN_DATABASE_URL: ${{ secrets.DACM_ADMIN_DATABASE_URL }}
+          SUPABASE_DB_CA: ${{ secrets.SUPABASE_DB_CA }}
+          DACM_ADMIN_PASSWORD: ${{ secrets.DACM_ADMIN_PASSWORD }}

@@ -340,6 +340,41 @@ test("undated drafts use their Kyiv creation day at a half-year boundary", async
   assert.equal(rowFor(checked(await coordinator(reportUrl(2))), july.id).reviewStatus, "draft");
 });
 
+test("future one-time and recurring plans follow the report period and annual window", async (t) => {
+  const future = measure(501, "FUTURE", { plannedDate: "2026-12-15" });
+  const quarterly = measure(502, "QUARTERLY", {
+    scheduleType: "periodic", plannedDate: null, recurrence: "quarterly",
+  });
+  const annual = measure(503, "ANNUAL", {
+    scheduleType: "periodic", plannedDate: null, recurrence: "annual_april_may",
+  });
+  const missedWindow = measure(504, "ANNUAL-LATE", {
+    scheduleType: "periodic", plannedDate: null, recurrence: "annual_april_may",
+    effectiveFrom: "2026-06-01",
+  });
+  const { login } = await setup(t, [future, quarterly, annual, missedWindow], () => "2026-06-05");
+  const coordinator = await login(205);
+  const h1 = checked(await coordinator(reportUrl()));
+  const h2 = checked(await coordinator(reportUrl(2)));
+
+  assert.equal(rowFor(h1, future.id).executionState, "not_due");
+  assert.equal(rowFor(h1, future.id).resultDescription, "");
+  assert.equal(rowFor(h1, quarterly.id).actualDate, "2026-06-30");
+  assert.equal(rowFor(h1, quarterly.id).executionState, "not_due");
+  assert.equal(rowFor(h2, quarterly.id).actualDate, "2026-12-31");
+  assert.equal(rowFor(h1, annual.id).plannedDate, "2026-05-31");
+  assert.equal(rowFor(h1, annual.id).executionState, "not_approved");
+  assert.equal(rowFor(h2, annual.id), undefined);
+  assert.equal(rowFor(h1, missedWindow.id), undefined);
+  assert.equal(rowFor(h2, missedWindow.id), undefined);
+
+  const executor = await login(201);
+  const h1Measure = checked(await executor(`/measures/${annual.id}?periodKey=2026-H1`));
+  assert.equal(h1Measure.scheduleType, "periodic");
+  assert.equal(h1Measure.recurrence, "annual_april_may");
+  checked(await executor(`/measures/${annual.id}?periodKey=2026-H2`), 404);
+});
+
 test("report scopes isolate departments and programs and reject invalid or unauthorized requests", async (t) => {
   const local = measure(501, "SAME");
   const hidden = measure(502, "SAME", { departmentId: id(102), executorId: id(203) });

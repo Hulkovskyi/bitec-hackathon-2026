@@ -8,6 +8,7 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { adaptDatabase } from "./database.js";
 import { assertStorageKey, OversizedEvidenceObject, validStorageKey } from "./evidence-storage.js";
+import { hasPermission, loadPermissions } from "./permissions.js";
 import { audit, forbidden, missing } from "./registry.js";
 import { assertResultEditor, readResultForUser } from "./result-access.js";
 import { ApiError, invalid, keys, positive, uuid } from "./validation.js";
@@ -27,7 +28,7 @@ const mediaTypes = new Map([
   [".txt", "text/plain"],
 ]);
 
-function metadata(row) {
+function metadata(row, actorId = row.upload_actor_id ?? row.uploaded_by) {
   return {
     id: row.id,
     resultId: row.result_id,
@@ -37,7 +38,8 @@ function metadata(row) {
     mediaType: row.media_type,
     byteSize: row.byte_size,
     sha256: row.sha256,
-    uploadedBy: row.uploaded_by,
+    uploadedBy: actorId,
+    ...(actorId === row.uploaded_by ? {} : { executorId: row.uploaded_by }),
     createdAt: row.created_at,
   };
 }
@@ -333,20 +335,58 @@ export function createEvidenceStore(database, { directory, storage = undefined, 
   async function history(resultId, user) {
     const owned = user.role === "executor";
     const rows = await db.prepare(
-      `SELECT * FROM evidence_versions WHERE result_id=? ${owned ? "AND uploaded_by=?" : ""}
+      `SELECT e.*, (
+         SELECT actor_id FROM audit_events
+         WHERE entity_type='evidence' AND entity_id=e.id AND action IN ('upload','replace')
+         ORDER BY occurred_at, id LIMIT 1
+       ) AS upload_actor_id
+       FROM evidence_versions e WHERE result_id=? ${owned ? "AND uploaded_by=?" : ""}
        ORDER BY created_at, logical_file_id, revision`,
     ).all(...(owned ? [resultId, user.id] : [resultId]));
-    return rows.map(metadata);
+    return rows.map((row) => metadata(row));
+  }
+
+  async function pendingDeletions() {
+    return (await db.prepare("SELECT count(*) AS n FROM evidence_deletions").get()).n;
+  }
+
+  async function drainDeletions(limit = 10) {
+    const queued = await db.prepare(`
+      SELECT storage_key FROM evidence_deletions d
+      WHERE NOT EXISTS (SELECT 1 FROM evidence_versions e WHERE e.storage_key=d.storage_key)
+      ORDER BY attempts, storage_key LIMIT ?
+    `).all(Math.min(positive(limit), 10));
+    if (!queued.length) return pendingDeletions();
+
+    // Release the database before touching Storage. A failed or interrupted
+    // attempt leaves an idempotent operation for the next drain.
+    const attempts = await Promise.allSettled(queued.map(async ({ storage_key }) => objects.delete(storage_key)));
+    await db.transaction(async (tx) => {
+      const removed = tx.prepare("DELETE FROM evidence_deletions WHERE storage_key=?");
+      const failed = tx.prepare("UPDATE evidence_deletions SET attempts=attempts+1 WHERE storage_key=?");
+      for (const [index, { storage_key }] of queued.entries()) {
+        const write = attempts[index].status === "fulfilled" ? removed : failed;
+        await write.run(storage_key);
+      }
+    });
+    return pendingDeletions();
   }
 
   async function deleteUncommitted(storageKey) {
     try {
       // A lost connection during COMMIT does not prove that it failed.
-      if (!await db.prepare("SELECT 1 FROM evidence_versions WHERE storage_key=?").get(storageKey)) {
-        await objects.delete(storageKey);
-      }
+      if (await db.prepare("SELECT 1 FROM evidence_versions WHERE storage_key=?").get(storageKey)) return;
+      await objects.delete(storageKey);
     } catch {
-      console.error("Could not confirm or remove an uncommitted evidence object");
+      try {
+        await db.prepare(`
+          INSERT INTO evidence_deletions (storage_key)
+          SELECT ? WHERE NOT EXISTS (SELECT 1 FROM evidence_versions WHERE storage_key=?)
+          ON CONFLICT (storage_key) DO NOTHING
+        `).run(storageKey, storageKey);
+      } catch {
+        console.error("Could not queue an uncommitted evidence object for removal");
+      }
     }
   }
 
@@ -361,14 +401,16 @@ export function createEvidenceStore(database, { directory, storage = undefined, 
       // Store immutable bytes before the transaction publishes their metadata.
       await objects.put(storageKey, file.bytes, file.mediaType);
     } catch (error) {
+      await deleteUncommitted(storageKey);
       if (error instanceof OversizedEvidenceObject) throw tooLarge(maxBytes);
       throw error;
     }
 
     try {
       return await db.transaction(async (tx) => {
-        const user = await tx.prepare("SELECT id, role FROM users WHERE id=? AND active=1").get(actorId);
-        if (!user) throw new ApiError(401, "unauthenticated", "Користувач недоступний");
+        const actor = await tx.prepare("SELECT id, role FROM users WHERE id=? AND active=1").get(actorId);
+        if (!actor) throw new ApiError(401, "unauthenticated", "Користувач недоступний");
+        const user = await loadPermissions(tx, actor);
         const result = await readResultForUser(tx, user, resultId);
         await assertResultEditor(tx, user, result);
         if (result.version !== file.version) throw conflict();
@@ -385,7 +427,7 @@ export function createEvidenceStore(database, { directory, storage = undefined, 
             `SELECT revision FROM evidence_versions
              WHERE result_id=? AND uploaded_by=? AND logical_file_id=?
              ORDER BY revision DESC LIMIT 1`,
-          ).get(resultId, user.id, file.logicalFileId);
+          ).get(resultId, result.executor_id, file.logicalFileId);
           if (!prior) missing();
           revision = prior.revision + 1;
           if (revision > maxRevisions)
@@ -393,7 +435,7 @@ export function createEvidenceStore(database, { directory, storage = undefined, 
         } else {
           const count = await tx.prepare(
             "SELECT count(DISTINCT logical_file_id) AS n FROM evidence_versions WHERE result_id=? AND uploaded_by=?",
-          ).get(resultId, user.id);
+          ).get(resultId, result.executor_id);
           if (count.n >= maxFiles)
             invalid("Для одного результату доступно не більше 10 файлів на виконавця");
         }
@@ -408,7 +450,7 @@ export function createEvidenceStore(database, { directory, storage = undefined, 
           media_type: file.mediaType,
           byte_size: file.byteSize,
           sha256: file.sha256,
-          uploaded_by: user.id,
+          uploaded_by: result.executor_id,
           created_at: changedAt,
         };
         await tx.prepare(
@@ -419,7 +461,7 @@ export function createEvidenceStore(database, { directory, storage = undefined, 
           row.id, row.result_id, row.logical_file_id, row.revision, row.original_name,
           row.storage_key, row.media_type, row.byte_size, row.sha256, row.uploaded_by, row.created_at,
         );
-        const evidence = metadata(row);
+        const evidence = metadata(row, user.id);
         await audit(tx, user.id, revision === 1 ? "upload" : "replace", "evidence", row.id, null, evidence);
         return { evidence, resultVersion: file.version + 1 };
       });
@@ -429,7 +471,10 @@ export function createEvidenceStore(database, { directory, storage = undefined, 
     }
   }
 
-  return { history, verify: async (row) => (await integrity(row)).intact, integrity, download, upload, maxBytes };
+  return {
+    history, verify: async (row) => (await integrity(row)).intact, integrity, download, upload,
+    maxBytes, pendingDeletions, drainDeletions,
+  };
 }
 
 export function mountEvidenceRoutes(app, database, evidence) {
@@ -462,7 +507,7 @@ export function mountEvidenceRoutes(app, database, evidence) {
 
   app.get("/api/evidence/:id/integrity", async (req, res) => {
     keys(req.query, []);
-    if (!["coordinator", "admin"].includes(req.user.role)) forbidden();
+    if (!hasPermission(req.user, "workflow.review")) forbidden();
     const { id, expectedSha256, actualSha256, intact } = await evidence.integrity(await findReadable(req));
     res.json({ id, expectedSha256, actualSha256, intact });
   });

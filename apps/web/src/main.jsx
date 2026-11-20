@@ -1,19 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { AccountEntry } from "./AccountEntry.jsx";
+import { AdminAccess } from "./AdminAccess.jsx";
+import { DeleteAction } from "./DeleteAction.jsx";
+import { EvidenceCleanup } from "./EvidenceCleanup.jsx";
+import { DepartmentAdmin } from "./DepartmentAdmin.jsx";
 import { HalfYearReport } from "./HalfYearReport.jsx";
 import { ProgramDashboard } from "./ProgramDashboard.jsx";
-import { ResultPanel } from "./ResultPanel.jsx";
-import { halfYears, kyivToday } from "./periods.js";
+import { ProgramAdmin } from "./ProgramAdmin.jsx";
+import { ProgramReference } from "./ProgramReference.jsx";
+import { RegistryImport } from "./RegistryImport.jsx";
+import { OfficialMeasureResult, ResultPanel } from "./ResultPanel.jsx";
+import { measurePeriods, recurrenceLabels } from "./measure-schedule.js";
+import { formatRegistryDate, halfYears, kyivToday } from "./periods.js";
 import { Glyph, SignIn, Workspace } from "./Workspace.jsx";
+import { hasPermission, roleNames } from "./permissions.js";
 import "./styles.css";
 
-const roleNames = {
-  executor: "Виконавець",
-  coordinator: "Координатор",
-  leader: "Керівник",
-  analyst: "Аналітик",
-  admin: "Адміністратор",
-};
 async function api(path, options = {}) {
   const response = await fetch("/api" + path, {
     ...options,
@@ -44,21 +47,23 @@ function ErrorMessage({ error }) {
   ) : null;
 }
 function App() {
-  const [users, setUsers] = useState([]),
-    [user, setUser] = useState(null),
-    [choice, setChoice] = useState("");
+  const [user, setUser] = useState(null);
+  const [notice, setNotice] = useState("");
+  const [sessionChecking, setSessionChecking] = useState(true);
+  const [previewExit, setPreviewExit] = useState({ busy: false, error: null });
   const [loading, setLoading] = useState(true),
     [error, setError] = useState(null);
   const [attempt, setAttempt] = useState(0);
   const sessionChannel = useRef(null);
   const refreshSession = useCallback(() => {
+    setSessionChecking(true);
     setLoading(true);
     setUser(null);
     setAttempt((value) => value + 1);
   }, []);
   useEffect(() => {
     if (!window.BroadcastChannel) return;
-    const channel = new BroadcastChannel("dacm-demo-session");
+    const channel = new BroadcastChannel("dacm-session");
     sessionChannel.current = channel;
     channel.onmessage = ({ data }) => {
       if (data === "changed") refreshSession();
@@ -72,33 +77,53 @@ function App() {
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    Promise.all([
-      api("/demo/users", { signal: controller.signal }),
-      api("/me", { signal: controller.signal }).catch((e) => {
-        if (e.status === 401) return null;
-        throw e;
-      }),
-    ])
-      .then(([result, current]) => {
+    api("/me", { signal: controller.signal })
+      .then((current) => {
         if (controller.signal.aborted) return;
-        setUsers(result.items);
-        const coordinator = result.items.find((entry) => entry.role === "coordinator");
-        setChoice(current?.id || coordinator?.id || result.items[0]?.id || "");
-        setUser(current);
+        if ((current.authKind === "password" || current.authKind === "preview") && current.status === "approved") {
+          setUser(current);
+        } else if (current.authKind === "password") {
+          setError("Адміністратор ще не відкрив доступ до цього облікового запису.");
+        }
       })
       .catch((e) => {
-        if (!controller.signal.aborted)
-          setError(
-            e.code === "not_found"
-              ? "Деморежим вимкнено. Запустіть сервер з DEMO_MODE=true."
-              : e,
-          );
+        if (!controller.signal.aborted && e.status !== 401) setError(e);
       })
       .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        if (!controller.signal.aborted) {
+          setSessionChecking(false);
+          setLoading(false);
+        }
       });
     return () => controller.abort();
   }, [attempt]);
+
+  useEffect(() => {
+    if (!user) return;
+    let controller;
+    function checkSession() {
+      if (document.visibilityState !== "visible") return;
+      controller?.abort();
+      const check = new AbortController();
+      controller = check;
+      api("/me", { signal: check.signal })
+        .then((current) => {
+          if (!check.signal.aborted && JSON.stringify(current) !== JSON.stringify(user)) {
+            setUser((value) => value === user ? current : value);
+          }
+        })
+        .catch((cause) => {
+          if (!check.signal.aborted && cause.status === 401) {
+            setUser((value) => value === user ? null : value);
+          }
+        });
+    }
+    document.addEventListener("visibilitychange", checkSession);
+    return () => {
+      controller?.abort();
+      document.removeEventListener("visibilitychange", checkSession);
+    };
+  }, [user]);
 
   const sessionApi = useCallback(async (path, options) => {
     try {
@@ -107,19 +132,19 @@ function App() {
       if (cause.status === 401 && !options?.signal?.aborted) {
         setUser((current) => current === user ? null : current);
       }
+      if (cause.code === "role_preview_unavailable" && user?.preview && !options?.signal?.aborted) {
+        refreshSession();
+      }
       throw cause;
     }
-  }, [user]);
+  }, [user, refreshSession]);
 
-  async function login(event) {
-    event.preventDefault();
+  async function authenticate(credentials) {
     setLoading(true);
     setError(null);
     try {
-      await api("/demo/session", {
-        method: "POST",
-        body: JSON.stringify({ userId: choice }),
-      });
+      await api("/auth/login", { method: "POST", body: JSON.stringify(credentials) });
+      setNotice("");
       sessionChannel.current?.postMessage("changed");
       refreshSession();
     } catch (e) {
@@ -127,6 +152,36 @@ function App() {
       setLoading(false);
     }
   }
+  async function changePassword(credentials) {
+    try {
+      await api("/auth/password", { method: "POST", body: JSON.stringify(credentials) });
+    } catch (cause) {
+      if (cause.status === 401 && cause.code !== "invalid_credentials") refreshSession();
+      throw cause;
+    }
+    setNotice("Пароль змінено. Увійдіть із новим паролем.");
+    sessionChannel.current?.postMessage("changed");
+    refreshSession();
+  }
+
+  async function startRolePreview(userId) {
+    await sessionApi("/role-preview", { method: "PUT", body: JSON.stringify({ userId }) });
+    sessionChannel.current?.postMessage("changed");
+    refreshSession();
+  }
+
+  async function exitRolePreview() {
+    setPreviewExit({ busy: true, error: null });
+    try {
+      await sessionApi("/role-preview", { method: "DELETE" });
+      sessionChannel.current?.postMessage("changed");
+      refreshSession();
+      setPreviewExit({ busy: false, error: null });
+    } catch (cause) {
+      setPreviewExit({ busy: false, error: cause });
+    }
+  }
+
   async function logout() {
     setLoading(true);
     setError(null);
@@ -141,39 +196,32 @@ function App() {
       setLoading(false);
     }
   }
-  const sessionForm = !users.length && !loading ? (
-    <div>
-      {!error && <p role="status">Немає активних демокористувачів.</p>}
-      <button type="button" className="secondary" onClick={() => setAttempt((value) => value + 1)}>
-        Оновити список користувачів
-      </button>
-    </div>
-  ) : (
-    <form className="session-form" onSubmit={login}>
-      <label>
-        Демокористувач
-        <select value={choice} onChange={(event) => setChoice(event.target.value)} disabled={loading || !users.length}>
-          {users.map((entry) => (
-            <option key={entry.id} value={entry.id}>
-              {entry.displayName} · {roleNames[entry.role]}
-            </option>
-          ))}
-        </select>
-      </label>
-      <button disabled={loading || !choice}>{user ? "Змінити користувача" : "Увійти"}</button>
-    </form>
-  );
   const errorMessage = <ErrorMessage error={error} />;
-  return user ? (
-    <Registry key={user.id} api={sessionApi} user={user} sessionForm={sessionForm} logout={logout} busy={loading} sessionError={errorMessage} />
-  ) : <SignIn sessionForm={sessionForm} loading={loading} error={errorMessage} />;
+  if (sessionChecking) {
+    return <SignIn title="Перевіряємо сеанс"><p role="status">Завантажуємо доступ…</p></SignIn>;
+  }
+  if (!user) {
+    return <AccountEntry loading={loading} error={errorMessage} notice={notice} onLogin={authenticate} />;
+  }
+  const rolePreview = user.preview
+    ? { onExit: exitRolePreview, ...previewExit }
+    : user.role === "admin" ? { api: sessionApi, onStart: startRolePreview } : null;
+  const accessKey = JSON.stringify([user.authKind, user.id, user.roleId, user.permissions, user.scopes]);
+  return <Registry key={accessKey} api={sessionApi} user={user}
+    logout={logout} changePassword={user.preview ? null : changePassword} rolePreview={rolePreview}
+    busy={loading} sessionError={errorMessage} />;
 }
-function Registry({ api, user, sessionForm, logout, busy, sessionError }) {
+function Registry({ api, user, logout, changePassword, rolePreview, busy, sessionError }) {
+  const manageAccess = !user.preview && user.authKind === "password" && user.role === "admin";
+  const importRegistry = !user.preview && hasPermission(user, "registry.import", user.role === "admin");
+  const unavailable = Boolean(user.preview?.unavailable);
+  const [navigation, setNavigation] = useState(manageAccess ? "access" : null);
   const [attempt, setAttempt] = useState(0);
   const [programs, setPrograms] = useState(null),
     [programId, setProgramId] = useState(""),
     [error, setError] = useState(null);
   useEffect(() => {
+    if (unavailable) return;
     const controller = new AbortController();
     setError(null);
     setPrograms(null);
@@ -181,13 +229,13 @@ function Registry({ api, user, sessionForm, logout, busy, sessionError }) {
       .then((r) => {
         if (controller.signal.aborted) return;
         setPrograms(r.items);
-        setProgramId(r.items[0]?.id || "");
+        setProgramId((current) => r.items.some(({ id }) => id === current) ? current : r.items[0]?.id ?? "");
       })
       .catch((e) => {
         if (!controller.signal.aborted) setError(e);
       });
     return () => controller.abort();
-  }, [api, attempt]);
+  }, [api, attempt, unavailable]);
   const programPicker = (
     <label className="program-select">
       <span>Програма</span>
@@ -198,12 +246,35 @@ function Registry({ api, user, sessionForm, logout, busy, sessionError }) {
       </select>
     </label>
   );
-  const shell = { user, role: roleNames[user.role], sessionForm, logout, busy, programPicker };
+  const shell = {
+    user, role: user.roleName ?? roleNames[user.role], logout, changePassword, rolePreview, busy, programPicker,
+    manageAccess, importRegistry,
+  };
   const program = programs?.find(({ id }) => id === programId);
+  const showAccess = manageAccess && navigation === "access";
+  const showImport = importRegistry && navigation === "registryImport";
+  const showPrograms = manageAccess && navigation === "programManagement";
+  if (unavailable) return <Workspace {...shell} programPicker={null} programNavigation={false}>{sessionError}</Workspace>;
+  if (showAccess || showImport || showPrograms) {
+    return (
+      <Workspace {...shell} programPicker={null} programNavigation={Boolean(program)}
+        activeView={navigation} onNavigate={setNavigation}>
+        {sessionError}
+        {showAccess && <AdminAccess api={api} currentUserId={user.id} />}
+        {showImport && <RegistryImport api={api} onImported={() => setAttempt((value) => value + 1)} />}
+        {showPrograms && <ProgramAdmin api={api} programs={programs} error={error}
+          onRetry={() => setAttempt((value) => value + 1)} onChange={(id) => {
+            if (id) setProgramId(id);
+            setAttempt((value) => value + 1);
+          }} />}
+      </Workspace>
+    );
+  }
   return program ? (
-    <Program key={program.id} api={api} program={program} user={user} shell={shell} sessionError={sessionError} />
+    <Program key={program.id} api={api} program={program} user={user} shell={shell} sessionError={sessionError}
+      initialView={navigation} onNavigate={setNavigation} />
   ) : (
-    <Workspace {...shell}>
+    <Workspace {...shell} programNavigation={false} onNavigate={manageAccess || importRegistry ? setNavigation : null}>
       {sessionError}
       <ErrorMessage error={error} />
       {!error && <p role="status">{programs ? "Немає доступних програм." : "Завантаження програм…"}</p>}
@@ -219,30 +290,20 @@ function Registry({ api, user, sessionForm, logout, busy, sessionError }) {
 const registryPageSize = 20;
 const lastRegistryPage = (total) => Math.max(1, Math.ceil(total / registryPageSize));
 
-function formatRegistryDate(value) {
-  if (!value) return "—";
-  return value.split("-").reverse().join(".");
+function scheduleLabel(measure) {
+  if (measure.scheduleType === "continuous") return "Постійно";
+  if (measure.scheduleType === "periodic") return recurrenceLabels[measure.recurrence] ?? "Періодично";
+  return formatRegistryDate(measure.plannedDate);
 }
 
-// Search uses the same server-filtered list and loads its pages only when needed.
-async function registryPage(api, query, searching, signal) {
-  const parameters = new URLSearchParams(query);
-  if (!searching) return api("/measures?" + parameters, { signal });
-  parameters.set("page", "1");
-  parameters.set("pageSize", "100");
-  const first = await api("/measures?" + parameters, { signal });
-  const items = [...first.items];
-  for (let page = 2; page <= Math.ceil(first.total / first.pageSize); page += 1) {
-    parameters.set("page", String(page));
-    const response = await api("/measures?" + parameters, { signal });
-    items.push(...response.items);
-  }
-  return { ...first, items };
-}
-
-function Program({ api, program, user, shell, sessionError }) {
+function Program({ api, program, user, shell, sessionError, initialView, onNavigate }) {
   const [reportPeriod, setReportPeriod] = useState(null);
-  const [view, setView] = useState(user.role === "admin" ? "registry" : "dashboard");
+  const [signalSubject, setSignalSubject] = useState(null);
+  const [registryNotice, setRegistryNotice] = useState("");
+  const [view, setView] = useState(initialView ?? (
+    hasPermission(user, "analytics.read", true) ? "dashboard" : "registry"
+  ));
+  const canEditRegistry = !user.preview && hasPermission(user, "registry.write", user.role === "coordinator");
   const [options, setOptions] = useState(null),
     [result, setResult] = useState(null),
     [error, setError] = useState(null);
@@ -261,9 +322,7 @@ function Program({ api, program, user, shell, sessionError }) {
   const detailView = useRef(0);
   const detailHeading = useRef(null);
   const focusOnDetail = useRef(false);
-  const searchTerm = search.trim().toLocaleLowerCase("uk");
-  const searching = Boolean(searchTerm);
-  const serverPage = searching ? 1 : page;
+  const searchTerm = search.trim().normalize("NFC").toLocaleLowerCase("uk");
   useEffect(() => () => {
     detailView.current += 1;
     detailRequest.current?.abort();
@@ -279,44 +338,53 @@ function Program({ api, program, user, shell, sessionError }) {
       : current);
   }, []);
 
+  const [optionsError, setOptionsError] = useState(null);
   useEffect(() => {
+    const controller = new AbortController();
+    setOptionsError(null);
+    api(`/programs/${program.id}/registry-options`, { signal: controller.signal })
+      .then((value) => { if (!controller.signal.aborted) setOptions(value); })
+      .catch((cause) => { if (!controller.signal.aborted) setOptionsError(cause); });
+    return () => controller.abort();
+  }, [api, program.id, refresh]);
+  useEffect(() => {
+    if (view !== "registry") return;
     const controller = new AbortController();
     setLoading(true);
     setError(null);
     const query = new URLSearchParams({
       programId: program.id,
-      page: String(serverPage),
+      page: String(page),
       pageSize: String(registryPageSize),
       ...(section ? { sectionId: section } : {}),
       ...(active ? { active } : {}),
       ...(periodKey ? { periodKey } : {}),
+      ...(searchTerm ? { q: searchTerm } : {}),
     });
-    Promise.all([
-      api(`/programs/${program.id}/registry-options`, {
-        signal: controller.signal,
-      }),
-      registryPage(api, query, searching, controller.signal),
-    ])
-      .then(([o, r]) => {
+    const load = async () => {
+      try {
+        const value = await api("/measures?" + query, { signal: controller.signal });
         if (controller.signal.aborted) return;
-        setOptions(o);
-        const lastPage = lastRegistryPage(r.total);
-        if (!searching && serverPage > lastPage) {
-          // A save can remove the only row on the current server page.
+        const lastPage = lastRegistryPage(value.total);
+        if (page > lastPage) {
           setResult(null);
           setPage(lastPage);
-          return;
+        } else {
+          setResult(value);
         }
-        setResult(r);
-      })
-      .catch((e) => {
-        if (!controller.signal.aborted) setError(e);
-      })
-      .finally(() => {
+      } catch (cause) {
+        if (!controller.signal.aborted) setError(cause);
+      } finally {
         if (!controller.signal.aborted) setLoading(false);
-      });
-    return () => controller.abort();
-  }, [api, program.id, serverPage, section, active, periodKey, refresh, searching]);
+      }
+    };
+    const timeout = searchTerm ? setTimeout(load, 180) : null;
+    if (timeout === null) load();
+    return () => {
+      clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [api, program.id, page, section, active, periodKey, refresh, searchTerm, view]);
   function clearDetail() {
     detailView.current += 1;
     detailRequest.current?.abort();
@@ -329,31 +397,34 @@ function Program({ api, program, user, shell, sessionError }) {
   }
   function changePage(offset) {
     clearDetail();
-    if (!searching) setResult(null);
+    setResult(null);
     setPage((p) => p + offset);
   }
   async function open(id, {
     requestedPeriod = periodKey,
     focusHeading = false,
     sourceResultId = null,
+    source,
   } = {}) {
     clearDetail();
     const controller = new AbortController();
     detailRequest.current = controller;
     setDetailLoading(true);
     try {
-      const query = requestedPeriod
-        ? `?${new URLSearchParams({ periodKey: requestedPeriod })}` : "";
-      const measure = await api("/measures/" + id + query, {
+      const query = new URLSearchParams();
+      if (source === "official") query.set("source", source);
+      else if (requestedPeriod) query.set("periodKey", requestedPeriod);
+      const measure = await api("/measures/" + id + (query.size ? "?" + query : ""), {
         signal: controller.signal,
       });
       if (!controller.signal.aborted) {
         focusOnDetail.current = focusHeading;
-        setSelected({ ...measure, sourceResultId });
+        setSelected({ ...measure, sourceResultId,
+          ...(measure.officialResult && requestedPeriod ? { periodKey: requestedPeriod } : {}) });
       }
     } catch (e) {
       if (!controller.signal.aborted) {
-        setDetailError({ cause: e, retry: () => open(id, { requestedPeriod, focusHeading, sourceResultId }) });
+        setDetailError({ cause: e, retry: () => open(id, { requestedPeriod, focusHeading, sourceResultId, source }) });
       }
     } finally {
       if (!controller.signal.aborted) {
@@ -362,14 +433,15 @@ function Program({ api, program, user, shell, sessionError }) {
       }
     }
   }
-  function openDashboardMeasure({ measureId, periodKey: requestedPeriod, resultId }) {
+  function openDashboardMeasure({ measureId, periodKey: requestedPeriod, resultId, source }) {
     if (view === "approvals") {
       setView("review");
-      open(measureId, { requestedPeriod, focusHeading: true, sourceResultId: resultId });
+      open(measureId, { requestedPeriod, focusHeading: true, sourceResultId: resultId, source });
       return;
     }
     setView("registry");
-    if (section || active || searching || page !== 1 || periodKey !== requestedPeriod) {
+    onNavigate("registry");
+    if (section || active || searchTerm || page !== 1 || periodKey !== requestedPeriod) {
       setResult(null);
       setSection("");
       setActive("");
@@ -377,7 +449,14 @@ function Program({ api, program, user, shell, sessionError }) {
       setPage(1);
       setPeriodKey(requestedPeriod);
     }
-    open(measureId, { requestedPeriod, focusHeading: true, sourceResultId: resultId });
+    open(measureId, { requestedPeriod, focusHeading: true, sourceResultId: resultId, source });
+  }
+  function openSignalSubject(subject) {
+    clearDetail();
+    setSignalSubject(subject);
+    const next = subject.type === "risk" ? "corruptionRisks" : "dashboard";
+    setView(next);
+    onNavigate(next);
   }
   function beginSave() {
     const originView = detailView.current;
@@ -386,9 +465,7 @@ function Program({ api, program, user, shell, sessionError }) {
       setRefresh((n) => n + 1);
       if (detailView.current !== originView) return;
 
-      const compatiblePeriod = value.scheduleType === "one_time"
-        ? periodKey === "once"
-        : halfYears(value.effectiveFrom, program.periodEnd).some(({ key }) => key === periodKey);
+      const compatiblePeriod = measurePeriods(value, program).some(({ key }) => key === periodKey);
       if (periodKey && compatiblePeriod) {
         open(value.id);
       } else {
@@ -409,7 +486,9 @@ function Program({ api, program, user, shell, sessionError }) {
   function navigate(next) {
     if (next === view) return;
     clearDetail();
-    setView(next);
+    setSignalSubject(null);
+    onNavigate(next);
+    if (!["access", "registryImport", "programManagement"].includes(next)) setView(next);
   }
   function resetList() {
     clearDetail();
@@ -417,19 +496,14 @@ function Program({ api, program, user, shell, sessionError }) {
     setPage(1);
   }
   const resultAnchor = useRef(null);
-  const matches = searching && result
-    ? result.items.filter((item) => `${item.code} ${item.title}`.toLocaleLowerCase("uk").includes(searchTerm))
-    : null;
-  const total = matches?.length ?? result?.total ?? 0;
+  const missingRegistrySetup = options && (!options.departments.length
+    ? "Спочатку додайте підрозділ."
+    : !options.executors.length ? "Спочатку призначте виконавця з активним обліковим записом." : "");
+  const total = result?.total ?? 0;
   const lastPage = lastRegistryPage(total);
-  const visiblePage = matches ? Math.min(page, lastPage) : page;
-  useEffect(() => {
-    if (page !== visiblePage) setPage(visiblePage);
-  }, [page, visiblePage]);
-  const rows = matches
-    ? matches.slice((visiblePage - 1) * registryPageSize, visiblePage * registryPageSize)
-    : result?.items ?? [];
+  const rows = result?.items ?? [];
   const viewMode = view === "dashboard" ? "overview" : view;
+  const deletionView = detailView.current;
   const programContext = (
     <p>{program.title} <span aria-hidden="true">·</span> {formatRegistryDate(program.periodStart)} — {formatRegistryDate(program.periodEnd)}</p>
   );
@@ -471,13 +545,18 @@ function Program({ api, program, user, shell, sessionError }) {
   return (
     <Workspace {...shell} activeView={view} onNavigate={navigate}>
       {sessionError}
+      {shell.manageAccess && (view === "registry" || view === "departments") && (
+        <EvidenceCleanup api={api} revision={refresh} />
+      )}
       {view === "registry" && <header className="section-heading">
         <div>
-          <h1>Реєстр заходів</h1>
+          <h1 id="registry-title" tabIndex={-1}>Реєстр заходів</h1>
           {programContext}
         </div>
-        {user.role === "coordinator" && options && (program.periodEnd < kyivToday() ? (
+        {canEditRegistry && options && (program.periodEnd < kyivToday() ? (
           <p className="count">Період програми завершено.</p>
+        ) : missingRegistrySetup ? (
+          <p className="count">{missingRegistrySetup}</p>
         ) : (
           <button type="button" className="with-icon" onClick={() => {
             clearDetail();
@@ -487,15 +566,31 @@ function Program({ api, program, user, shell, sessionError }) {
           </button>
         ))}
       </header>}
-      {view === "report" ? (
+      {view === "departments" ? (
+        <>
+          <ErrorMessage error={optionsError} />
+          {optionsError && <button className="secondary" type="button" onClick={() => setRefresh((n) => n + 1)}>Повторити завантаження</button>}
+          {options ? <DepartmentAdmin key={program.id} api={api} program={program}
+            departments={options.departments} onChange={() => setRefresh((value) => value + 1)} />
+            : !optionsError && <p className="count" role="status">Завантаження підрозділів…</p>}
+        </>
+      ) : view === "passport" || view === "corruptionRisks" ? (
+        <ProgramReference view={view} program={program} programContext={programContext}
+          departments={options?.departments ?? []} api={api} readOnly={Boolean(user.preview)}
+          catalogAdmin={shell.manageAccess} onCatalogChange={() => setRefresh((value) => value + 1)}
+          focusedRiskId={signalSubject?.type === "risk" ? signalSubject.id : undefined} />
+      ) : view === "report" ? (
         <HalfYearReport program={program} api={api} selectedPeriod={reportPeriod}
           onPeriodChange={setReportPeriod} onOpenMeasure={openDashboardMeasure} />
       ) : view !== "registry" ? (
         <ProgramDashboard key={viewMode} mode={viewMode} program={program} userRole={user.role}
           programContext={programContext} departments={options?.departments ?? []}
-          api={api} onOpenMeasure={openDashboardMeasure} />
+          api={api} onOpenMeasure={openDashboardMeasure} onOpenSubject={openSignalSubject}
+          canOpenRisk={hasPermission(user, "risks.read", user.role !== "executor")}
+          initialDepartmentId={signalSubject?.type === "department" ? signalSubject.id : ""} />
       ) : (
         <>
+          {registryNotice && <p className="access-notice" role="status">{registryNotice}</p>}
           <div className={selected && !editing ? "register-grid register-grid-split" : "register-grid"}>
             <section className="register-list" aria-label="Перелік заходів">
               <div className="registry-filters">
@@ -503,13 +598,11 @@ function Program({ api, program, user, shell, sessionError }) {
                   <span>Пошук заходів</span>
                   <span className="search-field">
                     <Glyph name="search" size={17} />
-                    <input type="search" placeholder="Код або назва" value={search}
+                    <input type="search" maxLength={200} placeholder="Код або назва" value={search}
                       onChange={(event) => {
                         const next = event.target.value;
-                        if (Boolean(next.trim()) !== searching) setResult(null);
-                        clearDetail();
+                        if (next.trim().normalize("NFC").toLocaleLowerCase("uk") !== searchTerm) resetList();
                         setSearch(next);
-                        setPage(1);
                       }} />
                   </span>
                 </label>
@@ -551,8 +644,8 @@ function Program({ api, program, user, shell, sessionError }) {
                 </label>
               </div>
               <div className="register-content">
-                <ErrorMessage error={error} />
-                {error && (
+                <ErrorMessage error={error ?? optionsError} />
+                {(error || optionsError) && (
                   <button className="secondary" type="button" onClick={() => setRefresh((value) => value + 1)}>
                     Повторити завантаження
                   </button>
@@ -565,16 +658,16 @@ function Program({ api, program, user, shell, sessionError }) {
                       <RegistryTable items={rows} selectedId={selected?.id} departments={options?.departments}
                         disabled={detailLoading} onOpen={(id) => open(id, { focusHeading: true })} />
                     ) : (
-                      <p className="empty">{searching
+                      <p className="empty">{searchTerm
                         ? "За цим запитом заходів немає."
                         : "За вибраними фільтрами немає доступних заходів."}</p>
                     )}
                     {lastPage > 1 && (
                       <nav className="register-pagination" aria-label="Сторінки реєстру">
-                        <button className="secondary" type="button" disabled={visiblePage === 1 || loading}
+                        <button className="secondary" type="button" disabled={page === 1 || loading}
                           onClick={() => changePage(-1)}>Попередня</button>
-                        <span>Сторінка {visiblePage}</span>
-                        <button className="secondary" type="button" disabled={visiblePage >= lastPage || loading}
+                        <span>Сторінка {page}</span>
+                        <button className="secondary" type="button" disabled={page >= lastPage || loading}
                           onClick={() => changePage(1)}>Наступна</button>
                       </nav>
                     )}
@@ -608,11 +701,13 @@ function Program({ api, program, user, shell, sessionError }) {
                   <dt>Початок дії</dt>
                   <dd>{formatRegistryDate(selected.effectiveFrom)}</dd>
                   <dt>Строк</dt>
-                  <dd>{selected.scheduleType === "continuous" ? "Постійно" : formatRegistryDate(selected.plannedDate)}</dd>
+                  <dd>{scheduleLabel(selected)}</dd>
                   <dt>Індикатор</dt>
-                  <dd>{selected.indicator.title}: {selected.indicator.baseline} → {selected.indicator.target} {selected.indicator.unit}</dd>
+                  <dd>{selected.indicator.title}: {selected.indicator.baseline ?? "—"} → {selected.indicator.target ?? "—"} {selected.indicator.unit ?? ""}</dd>
                   <dt>Ризик</dt>
-                  <dd>{options?.risks.find((entry) => entry.id === selected.riskId)?.title || "Не застосовується"}</dd>
+                  <dd>{selected.riskId
+                    ? options?.risks.find((entry) => entry.id === selected.riskId)?.title ?? "Назва недоступна"
+                    : "Не застосовується"}</dd>
                   <dt>Версія запису</dt>
                   <dd>{selected.version}</dd>
                 </dl>
@@ -621,16 +716,28 @@ function Program({ api, program, user, shell, sessionError }) {
                     onClick={() => resultAnchor.current?.focus()}>
                     До результату <Glyph name="arrow" size={17} />
                   </button>
-                  {user.role === "coordinator" && (
+                  {canEditRegistry && (
                     selected.planFrozen ? <p className="count">План зафіксовано після подання результату.</p>
                       : <button className="link" type="button" onClick={() => setEditing(true)}>Редагувати захід</button>
                   )}
                 </div>
+                {shell.manageAccess && <DeleteAction key={selected.id} label="Видалити захід" confirmLabel="Видалити назавжди"
+                  prompt={`Остаточно видалити захід «${selected.code}» та всі його результати, призначення й докази?`} onDelete={async () => {
+                    const outcome = await api(`/measures/${selected.id}`, { method: "DELETE", body: JSON.stringify({ version: selected.version }) });
+                    setRefresh((value) => value + 1);
+                    if (detailView.current !== deletionView) return;
+                    clearDetail();
+                    setRegistryNotice(outcome
+                      ? `Захід «${selected.code}» видалено. Файли доказів очікують очищення.`
+                      : `Захід «${selected.code}» видалено.`);
+                    requestAnimationFrame(() => document.getElementById("registry-title")?.focus());
+                  }} />}
               </article>
             )}
           </div>
           {selected && !editing && (
             <div ref={resultAnchor} tabIndex={-1} className="registry-result">
+              {selected.officialResult && <OfficialMeasureResult result={selected.officialResult} />}
               {resultPanel}
             </div>
           )}
@@ -674,7 +781,7 @@ function RegistryTable({ items, selectedId, departments = [], disabled, onOpen }
               </td>
               <td role="cell">
                 <span className="registry-cell-label" aria-hidden="true">Строк</span>
-                {item.scheduleType === "continuous" ? "Постійно" : formatRegistryDate(item.plannedDate)}
+                {scheduleLabel(item)}
               </td>
               <td role="cell">
                 <span className="registry-cell-label" aria-hidden="true">Стан</span>
@@ -697,7 +804,8 @@ function MeasureForm({
   onCancel,
   onReload,
 }) {
-  const firstDepartment = options.departments[0]?.id || "";
+  const firstDepartment = options.departments.find(({ id }) =>
+    options.executors.some(({ departmentIds }) => departmentIds.includes(id)))?.id ?? options.departments[0]?.id ?? "";
   const [value, setValue] = useState(() =>
     original
       ? {
@@ -717,6 +825,7 @@ function MeasureForm({
           title: "",
           description: "",
           scheduleType: "one_time",
+          recurrence: null,
           plannedDate: program.periodEnd,
           active: true,
           indicator: {
@@ -733,10 +842,16 @@ function MeasureForm({
   const change = (key, v) => setValue((old) => ({ ...old, [key]: v }));
   const indicator = (key, v) =>
     setValue((old) => ({ ...old, indicator: { ...old.indicator, [key]: v } }));
+  const availableExecutors = options.executors.filter((item) => item.departmentIds.includes(value.departmentId));
   const today = kyivToday();
   const effectiveFrom = original?.effectiveFrom ?? (today > program.periodStart ? today : program.periodStart);
   const riskRequired =
     options.sections.find((s) => s.id === value.sectionId)?.code === 2;
+  const permitsAnnual = original?.recurrence === "annual_april_may" || measurePeriods({
+    scheduleType: "periodic",
+    recurrence: "annual_april_may",
+    effectiveFrom: original?.effectiveFrom ?? today,
+  }, program).length > 0;
   async function submit(event) {
     event.preventDefault();
     const finishSave = onSaveStart();
@@ -752,14 +867,17 @@ function MeasureForm({
         "title",
         "description",
         "scheduleType",
+        "recurrence",
         "plannedDate",
       ].map((key) => [key, value[key]]),
     );
-    body.indicator = Object.fromEntries(
-      ["title", "unit", "direction"].map((key) => [key, value.indicator[key]]),
-    );
-    body.indicator.baseline = Number(value.indicator.baseline);
-    body.indicator.target = Number(value.indicator.target);
+    body.indicator = {
+      title: value.indicator.title,
+      unit: value.indicator.unit?.trim() || null,
+      baseline: value.indicator.baseline == null || value.indicator.baseline === "" ? null : Number(value.indicator.baseline),
+      target: value.indicator.target == null || value.indicator.target === "" ? null : Number(value.indicator.target),
+      direction: value.indicator.direction || null,
+    };
     if (original) {
       body.version = original.version;
       body.active = value.active;
@@ -839,14 +957,15 @@ function MeasureForm({
               onChange={(e) => change("executorId", e.target.value)}
             >
               <option value="">Оберіть виконавця</option>
-              {options.executors
-                .filter((e) => e.departmentIds.includes(value.departmentId))
-                .map((e) => (
-                  <option key={e.id} value={e.id}>
-                    {e.displayName}
-                  </option>
-                ))}
+              {value.executorId && !availableExecutors.some(({ id }) => id === value.executorId) &&
+                <option value={value.executorId}>Поточний виконавець недоступний</option>}
+              {availableExecutors.map((e) => (
+                <option key={e.id} value={e.id}>{e.displayName}</option>
+              ))}
             </select>
+            {!availableExecutors.length && !value.executorId && (
+              <span className="count">У цього підрозділу ще немає виконавця з активним доступом.</span>
+            )}
           </label>
           {riskRequired && (
             <label>
@@ -887,19 +1006,35 @@ function MeasureForm({
             Тип строку
             <select
               value={value.scheduleType}
-              onChange={(e) =>
+              onChange={(e) => {
+                const scheduleType = e.target.value;
                 setValue((v) => ({
                   ...v,
-                  scheduleType: e.target.value,
-                  plannedDate:
-                    e.target.value === "continuous" ? null : program.periodEnd,
-                }))
-              }
+                  scheduleType,
+                  recurrence: scheduleType === "periodic" ? v.recurrence ?? "monthly" : null,
+                  plannedDate: scheduleType === "one_time" ? program.periodEnd : null,
+                }));
+              }}
             >
               <option value="one_time">Одноразовий</option>
               <option value="continuous">Постійний</option>
+              <option value="periodic">Періодичний</option>
             </select>
           </label>
+          {value.scheduleType === "periodic" && (
+            <label>
+              Повторюваність
+              <select required value={value.recurrence ?? ""} onChange={(e) => change("recurrence", e.target.value)}>
+                <option value="" disabled>Оберіть повторюваність</option>
+                {Object.entries(recurrenceLabels).map(([key, title]) => {
+                  const unavailable = key === "annual_april_may" && !permitsAnnual;
+                  return <option key={key} value={key} disabled={unavailable}>
+                    {unavailable ? `${title} (поза строком програми)` : title}
+                  </option>;
+                })}
+              </select>
+            </label>
+          )}
           {value.scheduleType === "one_time" && (
             <label>
               Планова дата
@@ -936,38 +1071,40 @@ function MeasureForm({
           <label>
             Одиниця виміру
             <input
-              required
+              required={!original || original.indicator.unit != null}
               maxLength={50}
-              value={value.indicator.unit}
+              value={value.indicator.unit ?? ""}
               onChange={(e) => indicator("unit", e.target.value)}
             />
           </label>
           <label>
             Базове значення
             <input
-              required
+              required={!original || original.indicator.baseline != null}
               type="number"
               step="any"
-              value={value.indicator.baseline}
+              value={value.indicator.baseline ?? ""}
               onChange={(e) => indicator("baseline", e.target.value)}
             />
           </label>
           <label>
             Цільове значення
             <input
-              required
+              required={!original || original.indicator.target != null}
               type="number"
               step="any"
-              value={value.indicator.target}
+              value={value.indicator.target ?? ""}
               onChange={(e) => indicator("target", e.target.value)}
             />
           </label>
           <label>
             Напрям
             <select
-              value={value.indicator.direction}
+              required={!original || original.indicator.direction != null}
+              value={value.indicator.direction ?? ""}
               onChange={(e) => indicator("direction", e.target.value)}
             >
+              {original && original.indicator.direction == null && <option value="">Не зазначено</option>}
               <option value="increase">Збільшення</option>
               <option value="decrease">Зменшення</option>
               <option value="maintain">Збереження</option>

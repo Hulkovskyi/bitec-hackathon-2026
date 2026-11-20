@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { createApp } from "../src/app.js";
+import { createEvidenceStore } from "../src/evidence.js";
 import { migrate } from "../src/database.js";
 import { seed } from "../src/seed.js";
 
@@ -14,13 +15,14 @@ const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
 const origin = "http://127.0.0.1:3001";
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 
-async function setup(t) {
+async function setup(t, { creatorId = 201, storage } = {}) {
   const evidenceDirectory = await mkdtemp(join(tmpdir(), "dacm-test-evidence-"));
   const db = new DatabaseSync(":memory:");
   migrate(db);
   await seed(db, { demoMode: true });
+  const evidenceStore = createEvidenceStore(db, { directory: evidenceDirectory, storage });
   const server = createApp(db, {
-    evidenceDirectory,
+    evidenceStore,
     demoMode: true,
     today: () => "2026-11-17",
   }).listen(0, "127.0.0.1");
@@ -49,8 +51,9 @@ async function setup(t) {
     return response.headers.getSetCookie()[0].split(";")[0];
   }
   const executor = await login(201);
+  const creator = creatorId === 201 ? executor : await login(creatorId);
   const creation = await request(`/api/measures/${id(501)}/results`, {
-    method: "POST", cookie: executor, body: { periodKey: "once" },
+    method: "POST", cookie: creator, body: { periodKey: "once" },
   });
   assert.equal(creation.status, 201);
   const result = await creation.json();
@@ -70,7 +73,7 @@ async function setup(t) {
       method: "POST", cookie, body,
     });
   }
-  return { db, evidenceDirectory, request, login, result, executor, upload };
+  return { db, evidenceDirectory, evidenceStore, request, login, result, executor, creator, upload };
 }
 
 test("evidence keeps immutable bytes and version history with scoped download and integrity", async (t) => {
@@ -153,4 +156,112 @@ test("rejected uploads leave no rows, version changes or temporary files", async
   assert.equal((await upload("Синтетичний доказ")).status, 500);
   assertUnchanged();
   assert.deepEqual(await readdir(evidenceDirectory), []);
+});
+
+test("admin can manage a measure and its result while uploads retain executor ownership and real authorship", async (t) => {
+  const { db, request, login, result, executor, creator: admin, upload } = await setup(t, { creatorId: 208 });
+  assert.equal(result.executorId, id(201));
+  const measurePath = `/api/measures/${id(501)}`;
+  const resultPath = `/api/results/${result.id}`;
+  const edit = await request(measurePath, {
+    method: "PATCH", cookie: admin, body: { version: 1, title: "Захід після перевірки" },
+  });
+  assert.equal(edit.status, 200);
+
+  const assign = await request(measurePath + "/assignment", {
+    method: "PUT", cookie: admin, body: { version: 0, periodKey: "once", executorId: id(202) },
+  });
+  assert.equal(assign.status, 200);
+
+  const replaceOwner = await (await request(resultPath, { cookie: admin })).json();
+  assert.equal(replaceOwner.executorId, id(202));
+  const patch = await request(resultPath, {
+    method: "PATCH", cookie: admin, body: {
+      version: replaceOwner.version, outcome: "completed", description: "Результат підтверджено",
+      resultDate: "2026-11-17", actualDate: "2026-11-17", measuredValue: 100,
+    },
+  });
+  assert.equal(patch.status, 200);
+  const { version } = await patch.json();
+
+  const first = await upload("Перший доказ", { cookie: admin, version });
+  assert.equal(first.status, 201);
+  const original = await first.json();
+  assert.equal(original.evidence.uploadedBy, id(208));
+  assert.equal(original.evidence.executorId, id(202));
+  const replacement = await upload("Оновлений доказ", {
+    cookie: admin, version: original.resultVersion, logicalFileId: original.evidence.logicalFileId,
+  });
+  assert.equal(replacement.status, 201);
+  const uploaded = await replacement.json();
+  assert.equal(uploaded.evidence.revision, 2);
+
+  const newExecutor = await login(202);
+  const current = await (await request(resultPath, { cookie: newExecutor })).json();
+  assert.deepEqual(current.evidence, [uploaded.evidence]);
+  assert.equal((await request(resultPath, { cookie: executor })).status, 404);
+  const previousDownload = await request(`/api/evidence/${original.evidence.id}/download`, { cookie: newExecutor });
+  assert.equal(previousDownload.status, 200);
+  assert.equal(await previousDownload.text(), "Перший доказ");
+
+  const submitted = await request(resultPath + "/submit", {
+    method: "POST", cookie: admin, body: { version: uploaded.resultVersion },
+  });
+  assert.equal(submitted.status, 200);
+  const submission = await submitted.json();
+  assert.equal((await (await request(resultPath, { cookie: admin })).json()).canReview, false);
+  for (const decision of ["approve", "return"]) {
+    const selfReview = await request(resultPath + "/review", {
+      method: "POST", cookie: admin, body: { version: submission.version, decision, comment: "Перевірено" },
+    });
+    assert.equal(selfReview.status, 403);
+  }
+  const coordinator = await login(205);
+  assert.equal((await (await request(resultPath, { cookie: coordinator })).json()).canReview, true);
+  const approved = await request(resultPath + "/review", {
+    method: "POST", cookie: coordinator, body: { version: submission.version, decision: "approve" },
+  });
+  assert.equal(approved.status, 200);
+  assert.equal((await approved.json()).status, "approved");
+  const evidenceAudits = db.prepare("SELECT actor_id FROM audit_events WHERE entity_type='evidence'").all();
+  assert.deepEqual(evidenceAudits.map(({ actor_id }) => actor_id), [id(208), id(208)]);
+});
+
+test("a failed upload with possibly stored bytes queues an idempotent removal", async (t) => {
+  const objects = new Map();
+  let canDelete = false;
+  const storage = {
+    async put(key, bytes) {
+      objects.set(key, bytes);
+      throw new Error("Synthetic response failure after storage");
+    },
+    async get(key) { return objects.get(key) ?? null; },
+    async delete(key) {
+      if (!canDelete) throw new Error("Synthetic delete unavailable");
+      objects.delete(key);
+    },
+  };
+  const { db, result, evidenceStore, upload } = await setup(t, { storage });
+  assert.equal((await upload("Синтетичні байти")).status, 500);
+  assert.equal(objects.size, 1);
+  assert.equal(await evidenceStore.pendingDeletions(), 1);
+  assert.equal(db.prepare("SELECT version FROM results WHERE id=?").get(result.id).version, result.version);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM evidence_versions").get().n, 0);
+  canDelete = true;
+  assert.equal(await evidenceStore.drainDeletions(), 0);
+  assert.equal(objects.size, 0);
+});
+
+test("inactive measures retain draft history and stop draft edits and uploads", async (t) => {
+  const { db, result, executor, request, upload } = await setup(t);
+  db.prepare("UPDATE measures SET active=0 WHERE id=?").run(id(501));
+  const updated = await request(`/api/results/${result.id}`, {
+    method: "PATCH", cookie: executor, body: { version: result.version, description: "Тестова зміна" },
+  });
+  assert.equal(updated.status, 409);
+  assert.equal((await updated.json()).error.code, "inactive_measure");
+  const uploaded = await upload("Синтетичний файл");
+  assert.equal(uploaded.status, 409);
+  assert.equal((await uploaded.json()).error.code, "inactive_measure");
+  assert.equal((await request(`/api/results/${result.id}`, { cookie: executor })).status, 200);
 });

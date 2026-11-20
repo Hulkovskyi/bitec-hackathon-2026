@@ -112,6 +112,7 @@ function ReportSection({ section }) {
                   <td role="cell">
                     <strong>{row.code} · {row.title}</strong>
                     <small>{row.departmentTitle}</small>
+                    {row.plannedText && <small>Плановий строк: {row.plannedText}</small>}
                   </td>
                   <td role="cell">
                     <span className="report-cell-label" aria-hidden="true">Фактичний строк</span>
@@ -121,6 +122,7 @@ function ReportSection({ section }) {
                   <td role="cell">
                     <span className="report-cell-label" aria-hidden="true">Стан виконання</span>
                     {executionStateLabels[row.executionState]}
+                    {row.sourceResult && !row.sourceResult.markedApproved && <small>У джерелі немає погодження</small>}
                   </td>
                   <td role="cell" className="report-description">
                     <span className="report-cell-label" aria-hidden="true">Опис результату або причина невиконання</span>
@@ -128,9 +130,10 @@ function ReportSection({ section }) {
                     {row.indicator?.actual != null && (
                       <small>
                         Фактичне значення {row.indicator.actual} {row.indicator.unit}
-                        {" · "}Ціль {row.indicator.target} {row.indicator.unit}
+                        {row.indicator.target != null && <>{" · "}Ціль {row.indicator.target} {row.indicator.unit}</>}
                       </small>
                     )}
+                    {row.sourceEvidence?.length > 0 && <small>Назви підтверджень: {row.sourceEvidence.map(({ title }) => title).join("; ")}</small>}
                   </td>
                 </tr>
               ))}
@@ -216,7 +219,9 @@ export function HalfYearReport({ program, api, selectedPeriod, onPeriodChange, o
               <span>{dateLabel(report.period.start)} — {dateLabel(report.period.end)}</span>
             </p>
             <p>
-              <strong>Результати враховано до {dateLabel(report.period.cutoff)}</strong>
+              <strong>{report.source
+                ? "Джерело: синтетичний набір організаторів"
+                : `Результати враховано до ${dateLabel(report.period.cutoff)}`}</strong>
               {dataAsOf !== generatedAt && <span>Дані станом на {dataAsOf}</span>}
               <span>Сформовано {generatedAt}</span>
             </p>

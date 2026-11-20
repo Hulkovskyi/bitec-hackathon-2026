@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { halfYears, kyivToday } from "./periods.js";
+import { measurePeriods } from "./measure-schedule.js";
+import { formatRegistryDate, kyivToday } from "./periods.js";
+import { hasPermission } from "./permissions.js";
 import "./results.css";
 
 const evidenceLimitMiB = import.meta.env.VITE_HOSTED_DEMO === "true" ? 4 : 5;
@@ -41,15 +43,6 @@ const dateTime = (value) =>
 
 const statusText = (result) => statusLabels[result.status] || result.status;
 
-function periodsFor(measure, program) {
-  const start = [measure.effectiveFrom, program.periodStart].sort().at(-1);
-  const end = program.periodEnd;
-  if (measure.scheduleType !== "continuous") {
-    return [{ key: "once", start, end, label: "Одноразовий захід" }];
-  }
-  return halfYears(start, end);
-}
-
 const json = (method, body) => ({ method, body: JSON.stringify(body) });
 
 function RequestError({ error, onRetry }) {
@@ -62,8 +55,40 @@ function RequestError({ error, onRetry }) {
   );
 }
 
+const officialStatuses = {
+  vykonano: "Виконано",
+  chastkovo: "Виконано частково",
+  ne_vykonano: "Не виконано",
+  v_roboti: "У роботі",
+  ne_rozpochato: "Не розпочато",
+};
+
+export function OfficialMeasureResult({ result }) {
+  const year = result.periodKey.slice(0, 4);
+  const half = result.periodKey.endsWith("H1") ? "І півріччя" : "ІІ півріччя";
+  return (
+    <section className="result-panel" aria-label="Архівний результат">
+      <header className="result-panel-heading">
+        <div>
+          <h3>Архівний результат</h3>
+          <p className="result-muted">Зріз організаторів · {year}, {half} · <time dateTime={result.asOf}>{formatRegistryDate(result.asOf)}</time></p>
+        </div>
+      </header>
+      <dl className="inspector-facts">
+        <dt>Стан у джерелі</dt><dd>{officialStatuses[result.status] ?? result.status}</dd>
+        <dt>Погодження у джерелі</dt><dd>{result.markedApproved ? "Позначено погодженим" : "Без позначки погодження"}</dd>
+        {result.actualDate && <><dt>Фактична дата</dt><dd>{formatRegistryDate(result.actualDate)}</dd></>}
+        {result.actual != null && <><dt>Факт і ціль</dt><dd>{result.actual} / {result.target ?? "—"} {result.unit}</dd></>}
+        <dt>Опис</dt><dd>{result.description || "Відсутній"}</dd>
+        <dt>Підтвердження в архіві</dt>
+        <dd>{result.evidence.length ? <ul>{result.evidence.map((title, index) => <li key={index}>{title}</li>)}</ul> : "Відсутні"}</dd>
+      </dl>
+    </section>
+  );
+}
+
 export function ResultPanel({ measure, program, user, options, api, onPlanLockChange, sourceResultId }) {
-  const periods = periodsFor(measure, program);
+  const periods = measurePeriods(measure, program);
   const today = kyivToday();
   const activePeriod = periods.find((period) => period.start <= today && period.end >= today);
   const [periodKey, setPeriodKey] = useState(
@@ -71,12 +96,23 @@ export function ResultPanel({ measure, program, user, options, api, onPlanLockCh
       activePeriod?.key || (today < periods[0]?.start ? periods[0]?.key : periods.at(-1)?.key),
   );
   const period = periods.find((item) => item.key === periodKey);
+  const expectedEvidence = measure.expectedEvidence || (hasPermission(user, "workflow.submit", user.role === "executor")
+    ? "Для повного або часткового виконання додайте файл, що підтверджує описаний результат."
+    : null);
   return (
     <section className="result-panel" aria-label="Результат виконання заходу">
       <header className="result-panel-heading">
         <div>
           <h3>Результат виконання</h3>
           <p className="result-measure-title">{measure.title}</p>
+          {period?.deadline && (
+            <p className="result-muted result-plan-note">
+              Контрольний строк <time dateTime={period.deadline}>{formatRegistryDate(period.deadline)}</time>
+            </p>
+          )}
+          {expectedEvidence && (
+            <p className="result-muted result-plan-note"><strong>Що додати як доказ</strong> {expectedEvidence}</p>
+          )}
         </div>
         {periods.length > 1 && (
           <label className="result-period">
@@ -112,23 +148,27 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, source
   const [createBusy, setCreateBusy] = useState(false);
   const resultPath = `/measures/${measure.id}/results`;
   const assignmentPath = `/measures/${measure.id}/assignment`;
-  const canAssign = user.role === "coordinator";
-  const canExecute = user.role === "executor";
+  const isExecutor = user.role === "executor";
+  const canAssign = !user.preview && hasPermission(user, "workflow.assign", user.role === "coordinator");
+  const canSubmit = !user.preview && hasPermission(user, "workflow.submit", isExecutor);
+  const canTrackAssignments = hasPermission(user, "audit.read", user.role === "coordinator") &&
+    hasPermission(user, "audit.assignments", user.role === "coordinator");
+  const canEditPlan = !user.preview && !isExecutor && hasPermission(user, "registry.write", user.role === "coordinator");
 
   useEffect(() => {
     const controller = new AbortController();
     const requestOptions = { signal: controller.signal };
-    const assignment = canAssign || canExecute
+    const assignment = canAssign || canSubmit
       ? api(`${assignmentPath}?periodKey=${encodeURIComponent(period.key)}`, requestOptions)
           .catch((error) => {
-            if (error.code === "not_found" && canExecute) return null;
+            if (error.code === "not_found" && isExecutor) return null;
             throw error;
           })
       : Promise.resolve(null);
     Promise.all([api(resultPath, requestOptions), assignment])
       .then(([response, currentAssignment]) => {
         if (controller.signal.aborted) return;
-        if (canAssign) {
+        if (canEditPlan) {
           const planFrozen = response.items.some((item) =>
             item.status === "submitted" || item.status === "approved");
           onPlanLockChange(measure.id, planFrozen);
@@ -145,7 +185,7 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, source
         if (!controller.signal.aborted) setRequestError(error);
       });
     return () => controller.abort();
-  }, [api, assignmentPath, canAssign, canExecute, measure.id, onPlanLockChange, period.key, refresh, resultPath, sourceResultId]);
+  }, [api, assignmentPath, canAssign, canEditPlan, canSubmit, isExecutor, measure.id, onPlanLockChange, period.key, refresh, resultPath, sourceResultId]);
 
   function reload() {
     setRequestError(null);
@@ -178,7 +218,8 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, source
   const latest = items[0];
   const openPeriod = measure.active &&
     (!latest || (latest.status === "approved" && latest.outcome !== "completed"));
-  const ownAssignment = canExecute && assignment?.executorId === user.id;
+  const writableExecutorId = measure.active && canSubmit && (!isExecutor || assignment?.executorId === user.id)
+    ? assignment?.executorId : null;
   const allowAssign = measure.active && latest?.status !== "submitted" &&
     !(latest?.status === "approved" && latest.outcome === "completed");
 
@@ -189,9 +230,9 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, source
         <p role="status" className="result-muted">Ревізія із сигналу недоступна в цьому періоді.</p>
       )}
       <div className="result-controls">
-        {canAssign && (
+        {(canAssign || canTrackAssignments) && (
           <div className="result-assignment-tools">
-            {assignment && (
+            {canAssign && assignment && (
               <AssignmentForm
                 key={`${assignment.executorId}-${assignment.version}`}
                 api={api}
@@ -204,12 +245,9 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, source
                 periodKey={period.key}
               />
             )}
-            <AssignmentHistory
-              api={api}
-              measureId={measure.id}
-              periodKey={period.key}
-              refresh={refresh}
-            />
+            {canTrackAssignments && (
+              <AssignmentHistory api={api} measureId={measure.id} periodKey={period.key} refresh={refresh} />
+            )}
           </div>
         )}
         <div className="result-toolbar">
@@ -226,7 +264,7 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, source
               </select>
             </label>
           ) : <p className="result-muted">За цей період ще немає результату.</p>}
-          {ownAssignment && openPeriod && (
+          {writableExecutorId && openPeriod && (
             <button type="button" disabled={createBusy} onClick={createDraft}>
               {latest ? "Створити наступну версію" : "Створити чернетку"}
             </button>
@@ -243,7 +281,7 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, source
           today={today}
           refresh={refresh}
           onChanged={reload}
-          ownAssignment={ownAssignment}
+          writableExecutorId={writableExecutorId}
           unit={measure.indicator.unit}
           executors={options?.executors || []}
         />
@@ -371,7 +409,7 @@ function draftFields(result) {
 }
 
 function ResultDetail({
-  api, executors, onChanged, ownAssignment, period, refresh, resultId, today, unit, user,
+  api, executors, onChanged, period, refresh, resultId, today, unit, user, writableExecutorId,
 }) {
   const [result, setResult] = useState(null);
   const [fields, setFields] = useState(null);
@@ -410,12 +448,11 @@ function ResultDetail({
       : <p role="status">Завантажуємо вибрану версію…</p>;
   }
 
-  const editable = ownAssignment && result.executorId === user.id &&
+  const editable = writableExecutorId === result.executorId &&
     ["draft", "returned"].includes(result.status);
-  const canReview = user.role === "coordinator" && result.status === "submitted" &&
-    result.executorId !== user.id;
-  const canCheck = ["admin", "coordinator"].includes(user.role);
-  const canAudit = ["executor", "coordinator", "admin"].includes(user.role);
+  const canReview = !user.preview && result.status === "submitted" && result.canReview;
+  const canCheck = hasPermission(user, "workflow.review", ["coordinator", "admin"].includes(user.role));
+  const canAudit = hasPermission(user, "audit.read", ["executor", "coordinator", "admin"].includes(user.role));
   const busyOrLoading = Boolean(busy) || loading;
 
   async function act(action, url, request) {

@@ -4,7 +4,8 @@ import {
   reportFilename,
 } from "../../../shared/half-year-report.mjs";
 import { forbidden, kyivDate, measureScope, programAllowed, selectMeasure } from "./registry.js";
-import { workInterval } from "./result-access.js";
+import { hasPermission } from "./permissions.js";
+import { effectiveAssignment, workDeadline, workInterval } from "./result-access.js";
 import { meetsIndicatorTarget } from "./risk-flags.js";
 import { choice, invalid, keys, uuid } from "./validation.js";
 
@@ -28,6 +29,7 @@ function reportQuery(query, today) {
   return {
     programId,
     format,
+    today,
     period: { key: `${year}-H${half}`, year, half, start, end, cutoff: today < end ? today : end },
   };
 }
@@ -50,19 +52,17 @@ function compareText(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-async function reportEntry(plan, period, readRevisions) {
+async function reportEntry(plan, period, readRevisions, executorId) {
   const recurrent = plan.schedule_type === "continuous";
   const periodKey = recurrent ? period.key : "once";
   const interval = recurrent ? workInterval(plan, periodKey) : null;
   if (recurrent ? !interval : plan.effective_from > period.end) return null;
 
-  const deadline = recurrent ? interval[1] : plan.planned_date;
-  const revisions = await readRevisions.all(plan.id, periodKey, period.cutoff);
+  const deadline = workDeadline(plan, periodKey, interval);
+  const revisions = await readRevisions.all(plan.id, periodKey, period.cutoff, ...(executorId ? [executorId] : []));
   const { approved, reviewStatus } = selectResults(revisions, period.cutoff);
-  if (!recurrent && (
-    (deadline > period.end && !approved) ||
-    (approved?.outcome === "completed" && approved.actual_date < period.start)
-  )) return null;
+  if (!recurrent && approved?.outcome === "completed" && approved.actual_date < period.start)
+    return null;
 
   const future = period.cutoff < period.start;
   const result = future ? null : approved;
@@ -110,6 +110,76 @@ async function reportEntry(plan, period, readRevisions) {
   };
 }
 
+async function officialReportEntries(db, plans, departmentIds, period, programId, executorId) {
+  const sourceRows = await db.prepare(`
+    SELECT m.*, r.source_status, r.source_approved, r.source_actual_date,
+           r.source_entered_at, r.source_user_id, r.description, r.measured_value
+    FROM official_measure_metadata m
+    JOIN official_measure_results r ON r.measure_id=m.measure_id AND r.program_id=m.program_id
+    WHERE m.program_id=? AND r.source_period=?
+  `).all(programId, period.key);
+  const claims = await db.prepare(`
+    SELECT measure_id, title, reference_url FROM official_evidence_claims
+    WHERE program_id=? ORDER BY source_id
+  `).all(programId);
+  const evidenceByMeasure = new Map();
+  for (const { measure_id, title, reference_url } of claims) {
+    if (!evidenceByMeasure.has(measure_id)) evidenceByMeasure.set(measure_id, []);
+    evidenceByMeasure.get(measure_id).push({ title, referenceUrl: reference_url });
+  }
+
+  const plansById = new Map(plans.map((plan) => [plan.id, plan]));
+  const entries = [];
+  for (const source of sourceRows) {
+    const plan = plansById.get(source.measure_id);
+    if (!plan || !departmentIds.has(source.source_department_id)) continue;
+    if (executorId && source.source_user_id !== null && source.source_user_id !== executorId) continue;
+    const recurring = source.source_schedule_type !== "one_time";
+    const completed = source.source_status === "vykonano";
+    const dueLater = !recurring && source.source_planned_date > period.end && !completed;
+    const sourceOutcome = { vykonano: "completed", chastkovo: "partial" }[source.source_status];
+    const executionState = dueLater ? "not_due" : sourceOutcome ?? "not_completed";
+    entries.push({
+      sectionCode: source.source_section_code,
+      departmentCode: plan.department_code,
+      row: {
+        measureId: plan.id,
+        periodKey: recurring ? period.key : "once",
+        departmentId: source.source_department_id,
+        departmentTitle: source.source_department_title,
+        code: plan.code,
+        title: source.source_title,
+        sectionOrder: source.section_order,
+        effectiveFrom: plan.effective_from,
+        plannedDate: recurring ? period.end : source.source_planned_date,
+        plannedText: source.plan_text,
+        actualDate: recurring ? period.end : completed ? source.source_actual_date : null,
+        executionState,
+        resultDescription: dueLater ? "" : source.description,
+        resultId: null,
+        resultRevision: null,
+        resultDate: null,
+        carriedForward: false,
+        reviewStatus: null,
+        sourceResult: {
+          status: source.source_status,
+          markedApproved: Boolean(source.source_approved),
+          enteredAt: source.source_entered_at,
+        },
+        sourceEvidence: evidenceByMeasure.get(plan.id) ?? [],
+        indicator: {
+          unit: source.indicator_unit,
+          baseline: null,
+          target: source.indicator_target,
+          actual: source.measured_value,
+          targetReached: meetsIndicatorTarget(source.measured_value, source.indicator_target, "increase"),
+        },
+      },
+    });
+  }
+  return entries;
+}
+
 function summarize(rows) {
   const counts = Object.fromEntries(Object.keys(executionStateLabels).map((state) => [state, 0]));
   const problemRows = [];
@@ -121,6 +191,7 @@ function summarize(rows) {
       problemRows.push({
         measureId, periodKey, resultId, code, title, departmentTitle, executionState,
         targetReached: row.indicator.targetReached,
+        ...(row.sourceResult ? { source: "official" } : {}),
       });
     }
   }
@@ -132,7 +203,7 @@ function summarize(rows) {
   };
 }
 
-async function buildReport(db, user, { programId, period }) {
+async function buildReport(db, user, { programId, period, today }) {
   await programAllowed(db, user, programId);
   const program = await db.prepare(`
     SELECT id, code, title, period_start AS periodStart, period_end AS periodEnd
@@ -148,7 +219,7 @@ async function buildReport(db, user, { programId, period }) {
     SELECT d.id FROM departments d WHERE d.program_id=? ${departmentFilter} ORDER BY d.code, d.id
   `).all(programId, ...(user.role === "admin" ? [] : [user.id]));
   const visible = measureScope(user);
-  const plans = await db.prepare(`
+  const scopedPlans = await db.prepare(`
     SELECT plan.*, p.period_start, p.period_end, s.code AS section_code,
            d.code AS department_code, d.title AS department_title
     FROM (${selectMeasure} WHERE s.program_id=? AND ${visible.sql}) plan
@@ -156,30 +227,48 @@ async function buildReport(db, user, { programId, period }) {
     JOIN sections s ON s.id=plan.section_id
     JOIN departments d ON d.id=plan.department_id
   `).all(programId, ...visible.params);
+  const executorId = user.role === "executor" ? user.id : null;
+  const plans = [];
+  for (const plan of scopedPlans) {
+    const periodKey = plan.schedule_type === "one_time" ? "once" : period.key;
+    if (!executorId || (await effectiveAssignment(db, plan, periodKey)).executorId === executorId) plans.push(plan);
+  }
   const readRevisions = db.prepare(`
     SELECT id, revision, status, outcome, result_date, actual_date, created_at, description,
            non_completion_reason, measured_value, plan_snapshot_json
     FROM results WHERE measure_id=? AND period_key=?
       AND (result_date <= ? OR result_date IS NULL)
+      ${executorId ? "AND executor_id=?" : ""}
     ORDER BY revision DESC
   `);
   const sections = sectionTitles.map((title, index) => ({ code: index + 1, title, rows: [] }));
-  const entries = [];
-  for (const plan of plans) {
-    const entry = await reportEntry(plan, period, readRevisions);
-    if (entry) entries.push(entry);
+  const archive = await db.prepare(`
+    SELECT source_as_of FROM official_dataset_batches
+    WHERE program_id=? AND source_period=? AND source_as_of<=?
+  `).get(programId, period.key, today);
+  const departmentIds = departments.map(({ id }) => id);
+  let entries;
+  if (archive) {
+    entries = await officialReportEntries(db, plans, new Set(departmentIds), period, programId, executorId);
+  } else {
+    entries = [];
+    for (const plan of plans) {
+      const entry = await reportEntry(plan, period, readRevisions, executorId);
+      if (entry) entries.push(entry);
+    }
   }
   entries.sort((a, b) => a.sectionCode - b.sectionCode ||
-    compareText(a.departmentCode, b.departmentCode) || compareText(a.row.code, b.row.code) ||
-    compareText(a.row.measureId, b.row.measureId));
+    (archive ? a.row.sectionOrder - b.row.sectionOrder : compareText(a.departmentCode, b.departmentCode)) ||
+    compareText(a.row.code, b.row.code) || compareText(a.row.measureId, b.row.measureId));
   for (const { sectionCode, row } of entries) sections[sectionCode - 1].rows.push(row);
   const generatedAt = new Date().toISOString();
   return {
     program,
     period,
     generatedAt,
-    dataAsOf: generatedAt,
-    scope: { programId, departmentIds: departments.map(({ id }) => id) },
+    dataAsOf: archive?.source_as_of ?? generatedAt,
+    ...(archive ? { source: { type: "organizer_synthetic", asOf: archive.source_as_of } } : {}),
+    scope: { programId, departmentIds },
     sections,
     summary: summarize(entries.map(({ row }) => row)),
   };
@@ -187,7 +276,7 @@ async function buildReport(db, user, { programId, period }) {
 
 export function mountReportRoutes(app, db, { today }) {
   app.get("/api/reports/half-year", async (req, res) => {
-    if (req.user.role === "executor") forbidden();
+    if (!hasPermission(req.user, "reports.read")) forbidden();
     const query = reportQuery(req.query, today());
     const report = await db.transaction(
       (snapshot) => buildReport(snapshot, req.user, query),

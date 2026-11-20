@@ -1,3 +1,8 @@
+import { useRef, useState } from "react";
+import { PasswordChange } from "./PasswordChange.jsx";
+import { RolePreviewBanner, RolePreviewPicker } from "./RolePreview.jsx";
+import { hasPermission } from "./permissions.js";
+
 const glyphs = {
   brand: <><path d="M12 3 20 6v5c0 5-3.4 8.1-8 10-4.6-1.9-8-5-8-10V6Z" /><path d="m8.6 11.9 2.3 2.3 4.5-4.5" /></>,
   dashboard: <><rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /></>,
@@ -5,6 +10,9 @@ const glyphs = {
   signals: <><path d="M10.3 4.8 3 18a1.6 1.6 0 0 0 1.4 2.3h15.2A1.6 1.6 0 0 0 21 18l-7.3-13.2a2 2 0 0 0-3.4 0Z" /><path d="M12 9v4m0 3.5h.01" /></>,
   approvals: <><circle cx="12" cy="12" r="9" /><path d="m8 12 2.5 2.5L16 9" /></>,
   report: <><rect x="5" y="3" width="14" height="18" rx="2" /><path d="M9 16v-4m3 4V8m3 8v-6" /></>,
+  passport: <><path d="M4 5h6a2 2 0 0 1 2 2v13a3 3 0 0 0-3-3H4Zm16 0h-6a2 2 0 0 0-2 2v13a3 3 0 0 1 3-3h5Z" /><path d="M7 9h2m6 0h2" /></>,
+  corruptionRisks: <><path d="M12 3 20 6v5c0 5-3.4 8.1-8 10-4.6-1.9-8-5-8-10V6Z" /><path d="M12 8v4m0 3h.01" /></>,
+  access: <><circle cx="9" cy="8" r="3" /><path d="M3 20v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2m2-14a3 3 0 0 1 0 6m4 8v-2a4 4 0 0 0-3-4" /></>,
   plus: <path d="M12 5v14M5 12h14" />,
   search: <><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 4 4" /></>,
   chevron: <path d="m7 10 5 5 5-5" />,
@@ -32,14 +40,15 @@ function Brand() {
 }
 
 const navigation = [
-  { key: "dashboard", label: "Огляд", visible: (role) => role !== "admin" },
+  { key: "dashboard", label: "Огляд", visible: (user) => hasPermission(user, "analytics.read", true) },
   { key: "registry", label: "Реєстр", visible: () => true },
-  { key: "signals", label: "Сигнали", visible: (role) => ["coordinator", "leader", "analyst"].includes(role) },
-  { key: "approvals", label: "Погодження", visible: (role) => role === "coordinator" },
-  { key: "report", label: "Звіти", visible: (role) => role !== "executor" },
+  { key: "corruptionRisks", label: "Корупційні ризики", visible: (user) => hasPermission(user, "risks.read", user.role !== "executor") },
+  { key: "signals", label: "Сигнали", visible: (user) => user.role !== "executor" && hasPermission(user, "analytics.read", true) },
+  { key: "approvals", label: "Погодження", visible: (user) => hasPermission(user, "workflow.review", user.role === "coordinator") },
+  { key: "report", label: "Звіти", visible: (user) => hasPermission(user, "reports.read", user.role !== "executor") },
 ];
 
-export function SignIn({ sessionForm, loading, error }) {
+export function SignIn({ title, children }) {
   return (
     <main className="sign-in">
       <div className="sign-in-layout">
@@ -48,60 +57,131 @@ export function SignIn({ sessionForm, loading, error }) {
           <span className="sign-in-team">Digital Anti-Corruption Monitor<br />ITT-Zholudi</span>
         </div>
         <section className="sign-in-panel">
-          <span className="demo">Синтетичні дані</span>
-          <h1>Вхід у демосесію</h1>
-          <p>Оберіть демокористувача, щоб відкрити доступні йому заходи та панелі.</p>
-          {sessionForm}
-          {error}
-          {loading && <p role="status" className="count">Завантаження…</p>}
+          <h1>{title}</h1>
+          {children}
         </section>
       </div>
     </main>
   );
 }
 
-export function Workspace({ user, role, sessionForm, logout, busy, programPicker, activeView, onNavigate, children }) {
+export function Workspace({
+  user, role, logout, changePassword, rolePreview, busy, programPicker, activeView, onNavigate,
+  programNavigation = true, manageAccess = false, importRegistry = false, children,
+}) {
+  const account = useRef(null);
+  const summary = useRef(null);
+  const [accountPanel, setAccountPanel] = useState(null);
+  const preview = user.preview;
   const initials = user.displayName.split(/\s+/).slice(0, 2).map((part) => part[0]).join("");
+  function openAccountPanel(panel) {
+    account.current.open = false;
+    setAccountPanel(panel);
+  }
+  function closeAccountPanel() {
+    setAccountPanel(null);
+    summary.current?.focus();
+  }
   return (
     <div className="workspace">
       <a className="skip-link" href="#workspace-content">До вмісту</a>
       <aside className="workspace-sidebar">
-        <div className="workspace-brand-row">
-          <Brand />
-          <span className="demo workspace-demo-mobile">Синтетичні дані</span>
-        </div>
+        <Brand />
         {onNavigate && (
           <nav className="workspace-nav" aria-label="Подання програми">
-            {navigation.filter(({ visible }) => visible(user.role)).map(({ key, label }) => (
+            {programNavigation && navigation.filter(({ visible }) => visible(user)).map(({ key, label }) => (
               <button key={key} type="button" aria-current={activeView === key ? "page" : undefined}
                 onClick={() => onNavigate(key)}>
                 <Glyph name={key} />
                 <span>{label}</span>
               </button>
             ))}
+            {manageAccess && programNavigation && (
+              <button type="button" aria-current={activeView === "departments" ? "page" : undefined}
+                onClick={() => onNavigate("departments")}>
+                <Glyph name="access" />
+                <span>Підрозділи</span>
+              </button>
+            )}
+            {manageAccess && (
+              <button type="button" aria-current={activeView === "access" ? "page" : undefined}
+                onClick={() => onNavigate("access")}>
+                <Glyph name="access" />
+                <span>Користувачі й ролі</span>
+              </button>
+            )}
+            {manageAccess && (
+              <button type="button" aria-current={activeView === "programManagement" ? "page" : undefined}
+                onClick={() => onNavigate("programManagement")}>
+                <Glyph name="report" />
+                <span>Програми</span>
+              </button>
+            )}
+            {importRegistry && (
+              <button type="button" aria-current={activeView === "registryImport" ? "page" : undefined}
+                onClick={() => onNavigate("registryImport")}>
+                <Glyph name="registry" />
+                <span>Імпорт реєстру</span>
+              </button>
+            )}
+            {programNavigation && (
+              <button type="button" aria-current={activeView === "passport" ? "page" : undefined}
+                onClick={() => onNavigate("passport")}>
+                <Glyph name="passport" />
+                <span>Паспорт програми</span>
+              </button>
+            )}
           </nav>
         )}
         <span className="workspace-team">ITT-Zholudi</span>
       </aside>
       <div className="workspace-main">
-        <header className="workspace-topbar">
-          {programPicker}
-          <div className="workspace-tools">
-            <span className="demo">Синтетичні дані</span>
-            <details className="workspace-account">
-              <summary aria-label={`Демосесія · ${user.displayName} · ${role}`}>
-                <span className="account-avatar" aria-hidden="true">{initials}</span>
-                <span className="account-name"><strong>{user.displayName}</strong><span>{role}</span></span>
-                <Glyph name="chevron" size={16} />
-              </summary>
-              <div className="account-menu">
-                {sessionForm}
-                <button type="button" className="secondary" onClick={logout} disabled={busy}>Вийти</button>
-              </div>
-            </details>
-          </div>
-        </header>
-        <main id="workspace-content" className="workspace-content">{children}</main>
+        <div className={preview ? "workspace-preview-header" : "workspace-header"}>
+          <header className="workspace-topbar">
+            {programPicker}
+            <div className="workspace-tools">
+              <details className="workspace-account" ref={account}>
+                <summary ref={summary} aria-label={`Обліковий запис · ${user.displayName} · ${role}`}>
+                  <span className="account-avatar" aria-hidden="true">{initials}</span>
+                  <span className="account-name"><strong>{user.displayName}</strong><span>{role}</span></span>
+                  <Glyph name="chevron" size={16} />
+                </summary>
+                <div className="account-menu">
+                  {!preview && user.profile && (
+                    <dl className="account-profile">
+                      <dt>Логін</dt><dd>{user.profile.username}</dd>
+                      <dt>Підрозділ</dt><dd>{user.profile.department}</dd>
+                      <dt>Посада</dt><dd>{user.profile.position}</dd>
+                      <dt>Керівник</dt><dd>{user.profile.managerName ?? "—"}</dd>
+                    </dl>
+                  )}
+                  {!preview && changePassword && accountPanel !== "password" && (
+                    <button type="button" className="secondary" onClick={() => openAccountPanel("password")} disabled={busy}>Змінити пароль</button>
+                  )}
+                  {!preview && rolePreview?.onStart && accountPanel !== "rolePreview" && (
+                    <button type="button" className="secondary" onClick={() => openAccountPanel("rolePreview")} disabled={busy}>
+                      Перегляд від імені користувача
+                    </button>
+                  )}
+                  {preview && (
+                    <button type="button" className="secondary" onClick={rolePreview.onExit} disabled={rolePreview.busy}>
+                      Вийти з режиму перегляду
+                    </button>
+                  )}
+                  <button type="button" className="secondary" onClick={logout} disabled={busy}>Вийти</button>
+                </div>
+              </details>
+            </div>
+          </header>
+          {preview && <RolePreviewBanner preview={preview} onExit={rolePreview.onExit}
+            busy={rolePreview.busy} error={rolePreview.error} />}
+        </div>
+        <main id="workspace-content" className="workspace-content">
+          {!preview && accountPanel === "password" && <PasswordChange onSave={changePassword} onCancel={closeAccountPanel} />}
+          {!preview && accountPanel === "rolePreview" && <RolePreviewPicker api={rolePreview.api}
+            onStart={rolePreview.onStart} onCancel={closeAccountPanel} />}
+          {children}
+        </main>
       </div>
     </div>
   );

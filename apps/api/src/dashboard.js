@@ -1,14 +1,17 @@
-import { measureScope, missing, programAllowed, scope, selectMeasure } from "./registry.js";
-import { canReadResult, effectiveAssignment } from "./result-access.js";
+import { forbidden, measureScope, missing, programAllowed, scope, selectMeasure } from "./registry.js";
+import { hasPermission } from "./permissions.js";
+import { canReadResult, effectiveAssignment, workInterval } from "./result-access.js";
 import { currentEvidence } from "./result-workflow.js";
+import { officialRiskRuleCodes, readOfficialRiskFlags } from "./official-risk-flags.js";
+import { mountRecommendationDecisionRoutes } from "./recommendation-decisions.js";
 import { deadlineFlag, evaluateRiskFlags, selectRevisions, startedDeadlines } from "./risk-flags.js";
 import { choice, keys, pagination, uuid } from "./validation.js";
 
 const metrics = ["measures", "completed", "overdue", "overdueMeasures", "dueSoon", "pendingReview"];
 const ruleCodes = ["overdue", "due_soon", "missing_evidence", "target_not_met", "closed_without_improvement"];
 
-async function readQuery(db, user, query, selector, values) {
-  keys(query, ["programId", "departmentId", selector, "page", "pageSize"], ["programId"]);
+async function readQuery(db, user, query, selector, values, extra = []) {
+  keys(query, ["programId", "departmentId", selector, "page", "pageSize", ...extra], ["programId"]);
   const programId = uuid(query.programId);
   const departmentId = query.departmentId === undefined ? null : uuid(query.departmentId);
   const filter = query[selector] === undefined ? undefined : choice(query[selector], values);
@@ -21,15 +24,20 @@ async function readQuery(db, user, query, selector, values) {
   return { programId, departmentId, filter, ...paging };
 }
 
-async function scopedEntries(db, user, { programId, departmentId }, asOf) {
+async function scopedEntries(db, user, { programId, departmentId, measureId }, asOf) {
   const visible = measureScope(user);
   const plans = await db.prepare(`
-    SELECT plan.*, p.period_start, p.period_end
+    SELECT plan.*, p.period_start, p.period_end, source.source_period,
+           source.source_status, source_plan.source_schedule_type
     FROM (
       ${selectMeasure}
-      WHERE s.program_id=? AND ${visible.sql} ${departmentId ? "AND m.department_id=?" : ""}
+      WHERE s.program_id=? AND ${visible.sql} ${departmentId ? "AND m.department_id=?" : ""} ${measureId ? "AND m.id=?" : ""}
     ) plan JOIN programs p ON p.id=plan.program_id
-  `).all(programId, ...visible.params, ...(departmentId ? [departmentId] : []));
+    LEFT JOIN official_dataset_batches batch ON batch.program_id=plan.program_id AND batch.source_as_of<=?
+    LEFT JOIN official_measure_results source ON source.measure_id=plan.id
+      AND source.program_id=plan.program_id AND source.source_period=batch.source_period
+    LEFT JOIN official_measure_metadata source_plan ON source_plan.measure_id=source.measure_id
+  `).all(programId, ...visible.params, ...(departmentId ? [departmentId] : []), ...(measureId ? [measureId] : []), asOf);
   const readRevisions = db.prepare(`
     SELECT id, measure_id, period_key, revision, status, executor_id, outcome, measured_value
     FROM results WHERE measure_id=?
@@ -75,15 +83,10 @@ function periodLists(entries, asOf) {
       const { approved, latest } = byPeriod.get(periodKey) ?? {};
       const item = { measureId: plan.id, periodKey, code: plan.code, title: plan.title, deadline };
       const completed = approved?.outcome === "completed";
-      const timing = deadlineFlag({ measureId: plan.id, periodKey }, {
-        active: plan.active,
-        deadline,
-        today: asOf,
-        completed,
-      });
+      const timing = deadlineFlag(plan, periodKey, deadline, asOf, approved);
       periods.push({
         item,
-        active: plan.active && (periodKey === "once" || asOf <= deadline),
+        active: plan.active && (periodKey === "once" || asOf <= workInterval(plan, periodKey)?.[1]),
         completed,
         overdue: timing?.ruleCode === "overdue",
         dueSoon: timing?.ruleCode === "due_soon",
@@ -162,8 +165,7 @@ async function checkEvidence(evidence, file) {
   }
 }
 
-async function riskFlags(db, evidence, entries, asOf, paging) {
-  const ruleCode = paging.filter;
+async function liveRiskFlags(db, evidence, entries, asOf, ruleCode) {
   const needsEvidence = ruleCode === undefined || ruleCode === "missing_evidence";
   const ruleEntries = [];
   for (const { plan, deadlines, revisions, byPeriod, allowedResultIds } of entries) {
@@ -182,38 +184,71 @@ async function riskFlags(db, evidence, entries, asOf, paging) {
     ruleEntries.push({ plan, revisions, allowedResultIds, evidenceByResult, allowedPeriodKeys: new Set(deadlines.keys()) });
   }
   const byMeasureId = new Map(entries.map((entry) => [entry.plan.id, entry]));
-  const rows = evaluateRiskFlags(ruleEntries, { today: () => asOf, ruleCode }).items
+  return evaluateRiskFlags(ruleEntries, { today: () => asOf, ruleCode }).items
     .map((flag) => {
       const { plan, deadlines } = byMeasureId.get(flag.measureId);
-      return { ...flag, code: plan.code, title: plan.title, deadline: deadlines.get(flag.periodKey) };
+      return {
+        ...flag, subjectType: "measure", subjectId: flag.measureId, departmentId: plan.department_id,
+        code: plan.code, title: plan.title, deadline: deadlines.get(flag.periodKey),
+      };
     })
     .sort((left, right) => comparePeriods(left, right) || compareText(left.ruleCode, right.ruleCode));
-  return {
-    asOf,
-    items: pageOf(rows, paging),
-    total: rows.length,
-    page: paging.page,
-    pageSize: paging.pageSize,
-  };
+}
+
+async function flagsForSource(db, user, evidence, query, now) {
+  if (query.source === "official") {
+    const archive = await db.prepare(`
+      SELECT source_as_of AS asOf, source_period AS periodKey
+      FROM official_dataset_batches WHERE program_id=? AND source_as_of <= ?
+    `).get(query.programId, now);
+    if (!archive) return { asOf: now, archive: null, rows: [] };
+    const rows = await readOfficialRiskFlags(db, user, {
+      programId: query.programId, departmentId: query.departmentId ?? null,
+      asOf: archive.asOf, ruleCode: query.filter,
+    });
+    return { asOf: archive.asOf, archive, rows };
+  }
+  const entries = await scopedEntries(db, user, query, now);
+  return { asOf: now, rows: await liveRiskFlags(db, evidence, entries, now, query.filter) };
 }
 
 export function mountDashboardRoutes(app, db, { today, evidence }) {
   app.get("/api/dashboard", async (req, res) => {
+    const canReadAnalytics = hasPermission(req.user, "analytics.read");
+    if (!canReadAnalytics && !(req.query.metric === "pendingReview" &&
+        hasPermission(req.user, "workflow.review"))) forbidden();
     const asOf = today();
     const body = await db.transaction(async (db) => {
       const query = await readQuery(db, req.user, req.query, "metric", metrics);
       const entries = await scopedEntries(db, req.user, query, asOf);
       return dashboard(db, entries, asOf, query);
     }, { readOnly: true });
-    res.json(body);
+    res.json(canReadAnalytics ? body : { ...body, counts: { pendingReview: body.total }, completionRate: null });
   });
   app.get("/api/risk-flags", async (req, res) => {
+    if (!hasPermission(req.user, "analytics.read")) forbidden();
     const asOf = today();
     const body = await db.transaction(async (db) => {
-      const query = await readQuery(db, req.user, req.query, "ruleCode", ruleCodes);
-      const entries = await scopedEntries(db, req.user, query, asOf);
-      return riskFlags(db, evidence, entries, asOf, query);
+      const source = req.query.source === undefined ? "live" : choice(req.query.source, ["live", "official"]);
+      const codes = source === "official" ? officialRiskRuleCodes : ruleCodes;
+      const query = await readQuery(db, req.user, req.query, "ruleCode", codes, ["source"]);
+      const { asOf: snapshotDate, rows, archive } = await flagsForSource(db, req.user, evidence, { ...query, source }, asOf);
+      return {
+        asOf: snapshotDate, items: pageOf(rows, query), total: rows.length,
+        page: query.page, pageSize: query.pageSize,
+        ...(source === "official" ? { archive } : {}),
+      };
     }, { readOnly: true });
     res.json(body);
+  });
+  mountRecommendationDecisionRoutes(app, db, {
+    today,
+    async getVisibleSignal(tx, user, { programId, source, ruleCode, subjectType, subjectId, periodKey }) {
+      if (source === "live" && subjectType !== "measure") return undefined;
+      const query = { programId, source, filter: ruleCode, ...(source === "live" ? { measureId: subjectId } : {}) };
+      const { rows } = await flagsForSource(tx, user, evidence, query, today());
+      return rows.find((row) => row.ruleCode === ruleCode && row.subjectType === subjectType &&
+        row.subjectId === subjectId && row.periodKey === periodKey);
+    },
   });
 }

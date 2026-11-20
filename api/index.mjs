@@ -32,14 +32,17 @@ function start() {
     ssl: { ca: SUPABASE_DB_CA, rejectUnauthorized: true },
   });
   return createApp(db, {
-    demoMode: true,
     secureCookies: true,
     serveWeb: false,
     allowedOrigins: [publicOrigin.origin],
     evidenceStore: createEvidenceStore(db, { storage }),
     async checkReadiness() {
-      if (!await db.prepare("SELECT 1 FROM programs LIMIT 1").get())
-        throw new Error("Demo registry has not been seeded");
+      if (!await db.prepare("SELECT 1 FROM account_roles WHERE id='admin'").get())
+        throw new Error("Account roles have not been initialized");
+      await db.prepare("SELECT manager_id FROM credential_accounts LIMIT 1").get();
+      await db.prepare("SELECT session_id_hash FROM account_session_previews LIMIT 1").get();
+      await db.prepare("SELECT id FROM risk_flag_decisions LIMIT 1").get();
+      await db.prepare("SELECT risk_id FROM official_risk_metadata LIMIT 1").get();
       await storage.checkPrivateBucket();
     },
   });
@@ -51,12 +54,12 @@ export default function handler(req, res) {
     try {
       app = start();
     } catch {
-      console.error("BITEC hosted demo configuration is incomplete or invalid");
+      console.error("BITEC hosted configuration is incomplete or invalid");
       res.statusCode = 503;
       res.setHeader("Content-Type", "application/json");
       res.setHeader("Cache-Control", "no-store");
       res.end(JSON.stringify({
-        error: { code: "unavailable", message: "Онлайн-демо ще не налаштовано" },
+        error: { code: "unavailable", message: "Онлайн-застосунок ще не налаштовано" },
       }));
       return;
     }

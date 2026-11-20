@@ -1,19 +1,22 @@
 import { randomUUID } from "node:crypto";
 import { adaptDatabase } from "./database.js";
+import { hasPermission, loadPermissions } from "./permissions.js";
 import {
   audit,
+  executorAccountFilter,
   forbidden,
   kyivDate,
   measure,
   missing,
-  scope,
 } from "./registry.js";
 import {
+  assertActiveMeasure,
   assertPeriod,
   assertResultEditor,
   canReadResult,
   effectiveAssignment,
   getMeasurePlan,
+  isIndependentReviewer,
   planForScope,
   readResultForUser,
   validPeriodKey,
@@ -71,10 +74,12 @@ async function validateForDecision(db, result, plan, today, verifyEvidence) {
   await validateResultDates(db, result, plan, today);
 
   const evidence = await currentEvidence(db, result);
-  if (
-    outcome !== "not_completed" &&
-    (result.actual_date !== result.result_date || !Number.isFinite(result.measured_value) || evidence.length === 0)
-  ) invalid("Потрібні фактична дата, виміряне значення й актуальний доказ виконавця");
+  if (outcome !== "not_completed") {
+    if (result.actual_date !== result.result_date || evidence.length === 0)
+      invalid("Потрібні фактична дата й актуальний доказ виконавця");
+    if (plan.target !== null && !Number.isFinite(result.measured_value))
+      invalid("Потрібне виміряне значення індикатора");
+  }
   if (result.measured_value !== null && !Number.isFinite(result.measured_value))
     invalid("Некоректне виміряне значення");
 
@@ -100,6 +105,7 @@ function planSnapshot(row) {
     title: plan.title,
     description: plan.description,
     scheduleType: plan.scheduleType,
+    ...(plan.recurrence ? { recurrence: plan.recurrence } : {}),
     plannedDate: plan.plannedDate,
     effectiveFrom: plan.effectiveFrom,
     indicator: plan.indicator,
@@ -108,10 +114,6 @@ function planSnapshot(row) {
 
 const versionConflict = () =>
   new ApiError(409, "version_conflict", "Версія результату змінилася");
-
-function inactiveMeasure() {
-  throw new ApiError(409, "inactive_measure", "Захід неактивний");
-}
 
 function latestResult(db, measureId, periodKey) {
   return db.prepare(
@@ -129,8 +131,13 @@ async function hasPlanAssignment(db, plan, userId) {
   if (plan.executor_id !== userId) return false;
   const halfIndex = (value) => Number(value.slice(0, 4)) * 2 + Number(value.slice(5, 7) >= "07");
   const start = plan.period_start > plan.effective_from ? plan.period_start : plan.effective_from;
-  const available = halfIndex(plan.period_end) - halfIndex(start) + 1;
-  return overrides.length < available;
+  const end = plan.period_end;
+  if (plan.recurrence === "annual_april_may") {
+    const firstYear = Number(start.slice(0, 4)) + Number(start.slice(5) > "05-31");
+    const lastYear = Number(end.slice(0, 4)) - Number(end.slice(5) < "04-01");
+    return overrides.length < lastYear - firstYear + 1;
+  }
+  return overrides.length < halfIndex(end) - halfIndex(start) + 1;
 }
 
 async function assignmentForUser(db, plan, user, periodKey) {
@@ -159,13 +166,13 @@ export async function listResults(database, user, measureId) {
 }
 
 export async function createResult(db, user, measureId, input) {
-  if (user.role !== "executor") forbidden();
+  if (!hasPermission(user, "workflow.submit")) forbidden();
   keys(input, ["periodKey"], ["periodKey"]);
   const periodKey = validPeriodKey(input.periodKey);
   return adaptDatabase(db).transaction(async (db) => {
     const plan = await planForScope(db, user, measureId);
-    await assignmentForUser(db, plan, user, periodKey);
-    if (!plan.active) inactiveMeasure();
+    const { executorId } = await assignmentForUser(db, plan, user, periodKey);
+    assertActiveMeasure(plan);
 
     const previous = await latestResult(db, plan.id, periodKey);
     if (previous && previous.status !== "approved")
@@ -179,7 +186,7 @@ export async function createResult(db, user, measureId, input) {
          (id, measure_id, period_key, revision, supersedes_id, executor_id, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
     ).get(randomUUID(), plan.id, periodKey, (previous?.revision ?? 0) + 1,
-      previous?.id ?? null, user.id, now, now);
+      previous?.id ?? null, executorId, now, now);
     await audit(db, user.id, "create", "result", result.id, null, result);
     return result;
   });
@@ -198,7 +205,7 @@ const resultFields = {
 };
 
 export async function patchResult(db, user, resultId, input, { today = kyivDate } = {}) {
-  if (user.role !== "executor") forbidden();
+  if (!hasPermission(user, "workflow.submit")) forbidden();
   keys(input, ["version", ...Object.keys(resultFields)], ["version"]);
   const version = positive(input.version);
   const fields = Object.entries(resultFields).filter(([key]) => Object.hasOwn(input, key));
@@ -231,7 +238,7 @@ export async function readAssignment(database, user, measureId, periodKey) {
 }
 
 export async function assignExecutor(db, user, measureId, input) {
-  if (user.role !== "coordinator") forbidden();
+  if (!hasPermission(user, "workflow.assign")) forbidden();
   keys(input, ["periodKey", "executorId", "version"], ["periodKey", "executorId", "version"]);
   const executorId = uuid(input.executorId);
   const version = input.version === 0 ? 0 : positive(input.version);
@@ -239,7 +246,7 @@ export async function assignExecutor(db, user, measureId, input) {
     const plan = await planForScope(db, user, measureId);
     const periodKey = input.periodKey;
     assertPeriod(plan, periodKey);
-    if (!plan.active) inactiveMeasure();
+    assertActiveMeasure(plan);
     const before = await effectiveAssignment(db, plan, periodKey);
     if (version !== before.version) throw versionConflict();
 
@@ -252,7 +259,7 @@ export async function assignExecutor(db, user, measureId, input) {
       `SELECT 1 FROM users u
        JOIN user_scopes us ON us.user_id=u.id
        WHERE u.id=? AND u.role='executor' AND u.active=1
-         AND us.program_id=? AND us.department_id=?`,
+         AND us.program_id=? AND us.department_id=? ${executorAccountFilter(user)}`,
     ).get(executorId, plan.program_id, plan.department_id);
     if (!eligible) invalid("Виконавець не має доступу до підрозділу");
 
@@ -297,21 +304,21 @@ export async function transitionResult(
   const approve = action === "approve";
 
   return adaptDatabase(db).transaction(async (db) => {
-    const actor = await db.prepare("SELECT id, role FROM users WHERE id=? AND active=1").get(uuid(actorId));
-    if (!actor) throw new ApiError(401, "unauthenticated", "Користувач недоступний");
-    if (actor.role !== (submit ? "executor" : "coordinator")) forbidden();
+    const user = await db.prepare("SELECT id, role FROM users WHERE id=? AND active=1").get(uuid(actorId));
+    if (!user) throw new ApiError(401, "unauthenticated", "Користувач недоступний");
+    const actor = await loadPermissions(db, user);
+    if (!hasPermission(actor, submit ? "workflow.submit" : "workflow.review")) forbidden();
 
     const readResult = db.prepare("SELECT * FROM results WHERE id=?");
     const result = await readResult.get(uuid(resultId));
     if (!result) missing();
     const plan = await getMeasurePlan(db, result.measure_id);
-    if (!plan || !(await scope(db, actor, plan.program_id, plan.department_id))) missing();
+    if (!(await canReadResult(db, actor, result, plan))) missing();
     if (submit) {
-      if (result.executor_id !== actor.id ||
-          (await effectiveAssignment(db, plan, result.period_key)).executorId !== actor.id)
+      if ((await effectiveAssignment(db, plan, result.period_key)).executorId !== result.executor_id)
         missing();
-      if (!plan.active) inactiveMeasure();
-    } else if (result.executor_id === actor.id) {
+      assertActiveMeasure(plan);
+    } else if (!(await isIndependentReviewer(db, result, actor.id))) {
       forbidden();
     }
 

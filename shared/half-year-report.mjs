@@ -31,13 +31,23 @@ export function formatReportCsv(report) {
     "Дата результату", "Версія результату", "Перенесено з попереднього періоду",
     "Одиниця виміру", "Базове значення", "Цільове значення", "Фактичне значення", "Ціль досягнуто",
   ];
+  if (report.source) {
+    header.push(
+      "Номер у розділі", "Назви підтверджень із джерела",
+      "Погоджено за даними джерела", "Джерело станом на",
+    );
+  }
   const records = report.sections.flatMap(({ title, rows }) =>
     rows.map((row) => [
-      row.measureId, title, row.departmentTitle, row.code, row.title, row.plannedDate,
+      row.measureId, title, row.departmentTitle, row.code, row.title, row.plannedText ?? row.plannedDate,
       row.actualDate, executionStateLabels[row.executionState], row.resultDescription,
       row.resultDate, row.resultRevision, yesNo(row.carriedForward),
       row.indicator.unit, row.indicator.baseline, row.indicator.target, row.indicator.actual,
       yesNo(row.indicator.targetReached),
+      ...(report.source ? [
+        row.sectionOrder, row.sourceEvidence.map(({ title }) => title).join("; "),
+        row.sourceResult.markedApproved ? "Так" : "Ні", report.source.asOf,
+      ] : []),
     ]),
   );
   return "\uFEFF" + [header, ...records].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";

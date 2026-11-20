@@ -1,5 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { adaptDatabase } from "./database.js";
+import { purgeMeasureRows } from "./measure-purge.js";
+import { hasPermission } from "./permissions.js";
 import {
   ApiError,
   invalid,
@@ -24,6 +26,7 @@ export const measureFields = [
   "plannedDate",
   "indicator",
 ];
+const recurrences = ["weekly", "monthly", "quarterly", "annual_april_may"];
 export const roles = ["executor", "coordinator", "leader", "analyst", "admin"];
 export const missing = () => {
   throw new ApiError(404, "not_found", "Запис не знайдено");
@@ -57,6 +60,24 @@ export function measureScope(user) {
   };
 }
 
+export function executorAccountFilter(user) {
+  return ["password", "preview"].includes(user?.authKind) ? `AND EXISTS (
+    SELECT 1 FROM credential_accounts a WHERE a.user_id=u.id AND a.status='approved'
+  )` : "";
+}
+
+export function riskCatalogScope(user, { includeUnowned = false } = {}) {
+  if (!user || user.role === "admin") return { sql: "1=1", params: [] };
+  return { sql: `(
+    EXISTS (SELECT 1 FROM user_scopes us WHERE us.user_id=? AND us.program_id=r.program_id
+      AND us.department_id=ri.owner_department_id)
+    OR EXISTS (SELECT 1 FROM measures m JOIN sections s ON s.id=m.section_id
+      JOIN user_scopes us ON us.program_id=s.program_id AND us.department_id=m.department_id
+      WHERE m.risk_id=r.id AND s.program_id=r.program_id AND us.user_id=?)
+    ${includeUnowned ? "OR ri.risk_id IS NULL" : ""}
+  )`, params: [user.id, user.id] };
+}
+
 export function access(user, { periodKey, today = kyivDate() } = {}) {
   const { sql, params } = measureScope(user);
   const conditions = [sql];
@@ -69,8 +90,11 @@ export function access(user, { periodKey, today = kyivDate() } = {}) {
   const year = period.slice(0, 4);
   const halfStart = year + (period.endsWith("H1") ? "-01-01" : "-07-01");
   const halfEnd = year + (period.endsWith("H1") ? "-06-30" : "-12-31");
+  const firstHalf = period.endsWith("H1");
+  const annualWindow = firstHalf ? `OR (m.effective_from<=? AND p.period_end>=?)` : "";
   const continuous = `(m.schedule_type='continuous' AND m.effective_from<=?
-    AND EXISTS (SELECT 1 FROM programs p WHERE p.id=s.program_id AND p.period_end>=?))`;
+    AND EXISTS (SELECT 1 FROM programs p WHERE p.id=s.program_id AND p.period_end>=?
+      AND (m.recurrence IS NULL OR m.recurrence<>'annual_april_may' ${annualWindow})))`;
 
   if (periodKey === "once") {
     conditions.push("m.schedule_type='one_time'");
@@ -79,6 +103,7 @@ export function access(user, { periodKey, today = kyivDate() } = {}) {
       ? `(m.schedule_type='one_time' OR ${continuous})`
       : continuous);
     params.push(halfEnd, halfStart);
+    if (firstHalf) params.push(`${year}-05-31`, `${year}-04-01`);
   }
   const executor = `COALESCE((
     SELECT a.executor_id FROM period_assignments a WHERE a.measure_id=m.id
@@ -107,7 +132,8 @@ export function measure(row) {
     code: row.code,
     title: row.title,
     description: row.description,
-    scheduleType: row.schedule_type,
+    scheduleType: row.recurrence ? "periodic" : row.schedule_type,
+    ...(row.recurrence ? { recurrence: row.recurrence } : {}),
     plannedDate: row.planned_date,
     active: !!row.active,
     effectiveFrom: row.effective_from,
@@ -124,15 +150,52 @@ export function measure(row) {
     },
   };
 }
+async function getOfficialResult(db, user, row, today) {
+  if (!hasPermission(user, "analytics.read") && !hasPermission(user, "reports.read")) forbidden();
+  const archive = await db.prepare(`
+    SELECT r.source_period, b.source_as_of, r.source_status, r.source_approved,
+           r.source_actual_date, r.source_user_id, r.description, r.measured_value,
+           m.source_department_id, m.indicator_target, m.indicator_unit
+    FROM official_measure_results r
+    JOIN official_measure_metadata m ON m.measure_id=r.measure_id AND m.program_id=r.program_id
+    JOIN official_dataset_batches b ON b.program_id=r.program_id AND b.source_period=r.source_period
+    WHERE r.measure_id=? AND r.program_id=? AND b.source_as_of<=?
+  `).get(row.id, row.program_id, today);
+  if (!archive || !await scope(db, user, row.program_id, archive.source_department_id) ||
+    (user.role === "executor" && archive.source_user_id !== null && archive.source_user_id !== user.id)) missing();
+  if (user.role === "executor" && row.schedule_type !== "one_time") {
+    const assignment = await db.prepare("SELECT executor_id FROM period_assignments WHERE measure_id=? AND period_key=?")
+      .get(row.id, archive.source_period);
+    if ((assignment?.executor_id ?? row.executor_id) !== user.id) missing();
+  }
+  const evidence = await db.prepare(`
+    SELECT title FROM official_evidence_claims WHERE program_id=? AND measure_id=? ORDER BY source_id
+  `).all(row.program_id, row.id);
+  return {
+    periodKey: archive.source_period, asOf: archive.source_as_of, status: archive.source_status,
+    markedApproved: Boolean(archive.source_approved), actualDate: archive.source_actual_date,
+    description: archive.description, actual: archive.measured_value,
+    target: archive.indicator_target, unit: archive.indicator_unit,
+    evidence: evidence.map(({ title }) => title),
+  };
+}
+
 export async function getMeasure(database, user, id, options) {
   const db = adaptDatabase(database);
   const rule = access(user, options);
-  const row = await db
-    .prepare(`${selectPeriodMeasure(rule)} WHERE m.id=? AND ${rule.sql}`)
-    .get(rule.period, id, ...rule.params);
+  const row = await db.prepare(`
+    SELECT ${measureColumns}, ${rule.executor} AS effective_executor_id, source.expected_evidence
+    ${measureTables} LEFT JOIN official_measure_metadata source ON source.measure_id=m.id AND source.program_id=s.program_id
+    WHERE m.id=? AND ${rule.sql}
+  `).get(rule.period, id, ...rule.params);
   if (!row) missing();
-  const value = periodMeasure(row, user, rule.period);
-  return user.role === "coordinator"
+  const expectedEvidence = row.expected_evidence?.trim();
+  const value = {
+    ...periodMeasure(row, user, rule.period),
+    ...(expectedEvidence ? { expectedEvidence } : {}),
+    ...(options?.archive ? { officialResult: await getOfficialResult(db, user, row, options.today) } : {}),
+  };
+  return hasPermission(user, "registry.write")
     ? { ...value, planFrozen: await planIsFrozen(db, id) }
     : value;
 }
@@ -142,7 +205,8 @@ export function periodMeasure(row, user, period) {
     ...measure(row),
     executorId: row.effective_executor_id,
     periodKey: row.schedule_type === "one_time" ? "once" : period,
-    ...(user.role === "coordinator" ? { baseExecutorId: row.executor_id } : {}),
+    ...(hasPermission(user, "registry.write") || hasPermission(user, "workflow.assign")
+      ? { baseExecutorId: row.executor_id } : {}),
   };
 }
 
@@ -187,6 +251,7 @@ export async function validateMeasure(
   user,
   oldProgram,
   today = kyivDate(),
+  { allowUnspecifiedIndicators = false, previousMeasure = null } = {},
 ) {
   const db = adaptDatabase(database);
   const value = {
@@ -198,7 +263,7 @@ export async function validateMeasure(
     code: text(input.code, 50),
     title: text(input.title),
     description: text(input.description, 4000, true),
-    scheduleType: choice(input.scheduleType, ["one_time", "continuous"]),
+    scheduleType: choice(input.scheduleType, ["one_time", "continuous", "periodic"]),
   };
   const section = await db
     .prepare(
@@ -214,20 +279,21 @@ export async function validateMeasure(
     invalid("Некоректний підрозділ");
   if (user && !(await scope(db, user, section.program_id, value.departmentId)))
     forbidden();
-  const executor = await db
-    .prepare(
-      "SELECT 1 FROM users u JOIN user_scopes us ON us.user_id=u.id WHERE u.id=? AND u.active=1 AND u.role='executor' AND us.program_id=? AND us.department_id=?",
-    )
-    .get(value.executorId, section.program_id, value.departmentId);
-  if (!executor) invalid("Виконавець недоступний у вибраному підрозділі");
+  if (previousMeasure?.executorId !== value.executorId || previousMeasure?.departmentId !== value.departmentId) {
+    const executor = await db.prepare(`
+      SELECT 1 FROM users u JOIN user_scopes us ON us.user_id=u.id
+      WHERE u.id=? AND u.active=1 AND u.role='executor' AND us.program_id=? AND us.department_id=?
+        ${executorAccountFilter(user)}
+    `).get(value.executorId, section.program_id, value.departmentId);
+    if (!executor) invalid("Виконавець недоступний у вибраному підрозділі");
+  }
   if (section.code === 2) {
-    if (
-      !value.riskId ||
-      !(await db
-        .prepare("SELECT 1 FROM risks WHERE id=? AND program_id=?")
-        .get(value.riskId, section.program_id))
-    )
-      invalid("Оберіть ризик цієї програми");
+    const visible = riskCatalogScope(user, { includeUnowned: true });
+    const risk = value.riskId && await db.prepare(`
+      SELECT 1 FROM risks r LEFT JOIN risk_indicators ri ON ri.risk_id=r.id
+      WHERE r.id=? AND r.program_id=? AND ${visible.sql}
+    `).get(value.riskId, section.program_id, ...visible.params);
+    if (!risk) invalid("Оберіть доступний ризик цієї програми");
   } else if (value.riskId !== null)
     invalid("Ризик дозволений лише для розділу 2");
   value.effectiveFrom =
@@ -248,8 +314,21 @@ export async function validateMeasure(
       value.plannedDate > section.period_end
     )
       invalid("Дата поза періодом програми");
-  } else if (input.plannedDate !== null)
-    invalid("Постійний захід не має планової дати");
+  } else if (input.plannedDate !== null) {
+    invalid("Для повторюваного заходу планова дата визначається за періодом");
+  }
+  if (value.scheduleType === "periodic") {
+    value.recurrence = choice(input.recurrence, recurrences);
+    if (user && value.recurrence === "annual_april_may") {
+      const end = section.period_end;
+      const firstYear = Number(value.effectiveFrom.slice(0, 4)) + Number(value.effectiveFrom.slice(5) > "05-31");
+      const lastYear = Number(end.slice(0, 4)) - Number(end.slice(5) < "04-01");
+      if (firstYear > lastYear) invalid("У межах програми немає доступного періоду квітень–травень");
+    }
+  } else {
+    if (input.recurrence != null) invalid("Повторюваність доступна лише для періодичного заходу");
+    value.recurrence = null;
+  }
   const i = input.indicator;
   keys(
     i,
@@ -258,18 +337,23 @@ export async function validateMeasure(
   );
   if (
     ![i.baseline, i.target].every(
-      (n) => typeof n === "number" && Number.isFinite(n),
+      (n) => Number.isFinite(n) || (allowUnspecifiedIndicators && n === null),
     )
   )
     invalid("Значення індикатора мають бути скінченними числами");
-  choice(i.direction, ["increase", "decrease", "maintain"]);
-  if (
+  if (!allowUnspecifiedIndicators || i.direction !== null)
+    choice(i.direction, ["increase", "decrease", "maintain"]);
+  if (i.baseline !== null && i.target !== null && (
     (i.direction === "increase" && i.target < i.baseline) ||
     (i.direction === "decrease" && i.target > i.baseline) ||
     (i.direction === "maintain" && i.target !== i.baseline)
-  )
+  ))
     invalid("Ціль не відповідає напряму індикатора");
-  value.indicator = { ...i, title: text(i.title), unit: text(i.unit, 50) };
+  value.indicator = {
+    ...i,
+    title: text(i.title),
+    unit: allowUnspecifiedIndicators && i.unit === null ? null : text(i.unit, 50),
+  };
   return value;
 }
 export function stableIndicatorId(measureId) {
@@ -285,7 +369,10 @@ async function insertMeasure(
   indicatorId = randomUUID(),
 ) {
   const now = new Date().toISOString();
-  await db.prepare("INSERT INTO measures VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+  await db.prepare(`INSERT INTO measures (
+    id,section_id,department_id,executor_id,risk_id,code,title,description,schedule_type,
+    planned_date,active,version,effective_from,created_at,updated_at,recurrence
+  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
     id,
     value.sectionId,
     value.departmentId,
@@ -294,13 +381,14 @@ async function insertMeasure(
     value.code,
     value.title,
     value.description,
-    value.scheduleType,
+    value.scheduleType === "periodic" ? "continuous" : value.scheduleType,
     value.plannedDate,
     1,
     1,
     value.effectiveFrom,
     now,
     now,
+    value.recurrence,
   );
   const i = value.indicator;
   await db.prepare("INSERT INTO indicators VALUES (?,?,?,?,?,?,?)").run(
@@ -315,10 +403,10 @@ async function insertMeasure(
   return id;
 }
 export async function saveMeasure(database, user, input, id, { today = kyivDate } = {}) {
-  if (user.role !== "coordinator") forbidden();
+  if (!hasPermission(user, "registry.write")) forbidden();
   keys(
     input,
-    id ? [...measureFields, "version", "active"] : measureFields,
+    [...measureFields, "recurrence", ...(id ? ["version", "active"] : [])],
     id ? ["version"] : measureFields,
   );
   if (id) positive(input.version);
@@ -340,17 +428,23 @@ export async function saveMeasure(database, user, input, id, { today = kyivDate 
       : input;
     if (before && !Object.hasOwn(input, "indicator"))
       delete combined.indicator.id;
+    const indicatorFields = ["unit", "baseline", "target", "direction"];
+    const preservesMissingValues = before != null && indicatorFields.every((field) =>
+      combined.indicator?.[field] !== null || before.indicator[field] === null
+    );
     const value = await validateMeasure(
       db,
       combined,
       user,
       before?.programId,
       dateToday,
+      { allowUnspecifiedIndicators: preservesMissingValues, previousMeasure: before },
     );
     if (before && (
       value.departmentId !== before.departmentId ||
       value.executorId !== before.executorId ||
-      value.scheduleType !== before.scheduleType
+      value.scheduleType !== before.scheduleType ||
+      value.recurrence !== (before.recurrence ?? null)
     ) && await db.prepare(
       `SELECT 1 FROM results WHERE measure_id=?
        UNION ALL SELECT 1 FROM period_assignments WHERE measure_id=? LIMIT 1`,
@@ -365,7 +459,7 @@ export async function saveMeasure(database, user, input, id, { today = kyivDate 
     if (id) {
       const result = await db
         .prepare(
-          "UPDATE measures SET section_id=?,department_id=?,executor_id=?,risk_id=?,code=?,title=?,description=?,schedule_type=?,planned_date=?,active=?,version=version+1,updated_at=? WHERE id=? AND version=?",
+          "UPDATE measures SET section_id=?,department_id=?,executor_id=?,risk_id=?,code=?,title=?,description=?,schedule_type=?,planned_date=?,recurrence=?,active=?,version=version+1,updated_at=? WHERE id=? AND version=?",
         )
         .run(
           value.sectionId,
@@ -375,8 +469,9 @@ export async function saveMeasure(database, user, input, id, { today = kyivDate 
           value.code,
           value.title,
           value.description,
-          value.scheduleType,
+          value.scheduleType === "periodic" ? "continuous" : value.scheduleType,
           value.plannedDate,
+          value.recurrence,
           Number(value.active),
           new Date().toISOString(),
           id,
@@ -403,6 +498,22 @@ export async function saveMeasure(database, user, input, id, { today = kyivDate 
   });
 }
 
+
+export async function deleteMeasure(database, user, id, version) {
+  if (user.role !== "admin") forbidden();
+  positive(version);
+  await adaptDatabase(database).transaction(async (db) => {
+    const lock = db.dialect === "postgres" ? " FOR UPDATE" : "";
+    const before = await db.prepare("SELECT version FROM measures WHERE id=?" + lock).get(id);
+    if (!before) missing();
+    if (before.version !== version) {
+      throw new ApiError(409, "version_conflict", "Запис змінено. Оновіть картку та повторіть видалення");
+    }
+    await purgeMeasureRows(db, [id]);
+    await audit(db, user.id, "delete", "measure", id, before, null);
+  });
+}
+
 const importGroups = [
   "programs",
   "sections",
@@ -416,7 +527,7 @@ export async function importRegistry(
   database,
   actor,
   payload,
-  { seed = false, inTransaction = false } = {},
+  { seed = false, inTransaction = false, allowUnspecifiedIndicators = false } = {},
 ) {
   keys(
     payload,
@@ -533,11 +644,13 @@ export async function importRegistry(
     for (const r of payload.measures) {
       keys(
         r,
-        ["id", "effectiveFrom", ...measureFields],
+        ["id", "effectiveFrom", "recurrence", ...measureFields],
         ["id", "effectiveFrom", ...measureFields],
       );
       await record("measures", async () => {
-        const value = await validateMeasure(db, r, null);
+        const value = await validateMeasure(db, r, null, null, undefined, {
+          allowUnspecifiedIndicators,
+        });
         await insertMeasure(
           db,
           value,

@@ -1,4 +1,5 @@
 import { adaptDatabase } from "./database.js";
+import { hasPermission } from "./permissions.js";
 import { forbidden, missing, scope, selectMeasure } from "./registry.js";
 import { ApiError, invalid, uuid } from "./validation.js";
 
@@ -37,11 +38,24 @@ export function workInterval(plan, periodKey) {
   const half = halfYearKey.exec(periodKey);
   if (!half) return null;
   const [, year, number] = half;
+  if (plan.recurrence === "annual_april_may" &&
+      (number !== "1" || start > `${year}-05-31` || end < `${year}-04-01`)) {
+    return null;
+  }
   const halfStart = year + (number === "1" ? "-01-01" : "-07-01");
   const halfEnd = year + (number === "1" ? "-06-30" : "-12-31");
   const first = start > halfStart ? start : halfStart;
   const last = end < halfEnd ? end : halfEnd;
   return first <= last ? [first, last] : null;
+}
+
+export function workDeadline(plan, periodKey, interval) {
+  if (plan.schedule_type === "one_time") return plan.planned_date;
+  if (plan.recurrence === "annual_april_may") {
+    const mayEnd = `${periodKey.slice(0, 4)}-05-31`;
+    return mayEnd < interval[1] ? mayEnd : interval[1];
+  }
+  return interval[1];
 }
 
 export function assertPeriod(plan, periodKey) {
@@ -77,13 +91,29 @@ export async function readResultForUser(database, user, resultId) {
   return result;
 }
 
+export async function isIndependentReviewer(db, result, actorId) {
+  if (result.executor_id === actorId) return false;
+  const submissions = await db.prepare(`
+    SELECT actor_id, after_json FROM audit_events
+    WHERE entity_type='result' AND entity_id=? AND action='submit'
+  `).all(result.id);
+  // The version distinguishes submissions even if their audit timestamps are equal.
+  const submission = submissions.find(({ after_json }) => JSON.parse(after_json)?.version === result.version);
+  return submission?.actor_id !== actorId;
+}
+
+export function assertActiveMeasure(plan) {
+  if (!plan.active) throw new ApiError(409, "inactive_measure", "Захід неактивний");
+}
+
 export async function assertResultEditor(db, user, result) {
-  if (user.role !== "executor") forbidden();
+  if (!hasPermission(user, "workflow.submit")) forbidden();
   const plan = await planForScope(db, user, result.measure_id);
   if (
-    result.executor_id !== user.id ||
-    (await effectiveAssignment(db, plan, result.period_key)).executorId !== user.id
+    (user.role === "executor" && result.executor_id !== user.id) ||
+    (await effectiveAssignment(db, plan, result.period_key)).executorId !== result.executor_id
   ) missing();
+  assertActiveMeasure(plan);
   if (!["draft", "returned"].includes(result.status))
     throw new ApiError(409, "invalid_transition", "Редагування для цього стану недоступне");
 }

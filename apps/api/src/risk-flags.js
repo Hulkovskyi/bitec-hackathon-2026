@@ -1,5 +1,5 @@
 import { kyivDate } from "./registry.js";
-import { workInterval } from "./result-access.js";
+import { workDeadline, workInterval } from "./result-access.js";
 
 const millisecondsPerDay = 86_400_000;
 
@@ -25,7 +25,7 @@ export function startedDeadlines(plan, today) {
       const periodKey = `${String(year).padStart(4, "0")}-H${half}`;
       const interval = workInterval(plan, periodKey);
       if (interval && interval[0] <= today) {
-        deadlines.push({ periodKey, deadline: interval[1] });
+        deadlines.push({ periodKey, deadline: workDeadline(plan, periodKey, interval) });
       }
     }
   }
@@ -54,10 +54,20 @@ export function selectRevisions(measureId, revisions) {
   return byPeriod;
 }
 
-export function deadlineFlag(source, { active, deadline, today, completed }) {
-  if (completed) return null;
+export function deadlineFlag(plan, periodKey, deadline, today, approved) {
+  if (approved?.outcome === "completed") return null;
+
+  // RF1 in the organizers' archive covers dated measures. Recurring archive
+  // rows describe the source half-year and carry no dated overdue obligation.
+  if (!approved && plan.source_period) {
+    const archiveCoversDeadline = periodKey === "once"
+      ? plan.source_schedule_type === "one_time" && plan.source_status === "vykonano"
+      : plan.source_schedule_type !== "one_time" && plan.source_period === periodKey;
+    if (archiveCoversDeadline) return null;
+  }
 
   const remaining = daysBetween(today, deadline);
+  const source = { measureId: plan.id, periodKey };
   if (remaining < 0) {
     return {
       ...source,
@@ -67,7 +77,7 @@ export function deadlineFlag(source, { active, deadline, today, completed }) {
       suggestedAction: "Уточніть причину прострочення й узгодьте подальші дії.",
     };
   }
-  if (active && remaining <= 7) {
+  if (plan.active && remaining <= 7) {
     return {
       ...source,
       ruleCode: "due_soon",
@@ -127,8 +137,8 @@ function indicatorFlags(source, plan, result) {
   if (!Number.isFinite(result.measured_value)) return [];
 
   const actual = Number(result.measured_value.toFixed(6));
-  const target = Number(plan.target.toFixed(6));
-  const baseline = Number(plan.baseline.toFixed(6));
+  const target = Number.isFinite(plan.target) ? Number(plan.target.toFixed(6)) : null;
+  const baseline = Number.isFinite(plan.baseline) ? Number(plan.baseline.toFixed(6)) : null;
   const { direction } = plan;
   const comparison = {
     ...source,
@@ -150,7 +160,7 @@ function indicatorFlags(source, plan, result) {
       suggestedAction: "Звірте вимірювання з ціллю й уточніть потрібні дії.",
     });
   }
-  if (result.outcome === "completed" && noImprovement) {
+  if (result.outcome === "completed" && baseline !== null && noImprovement) {
     flags.push({
       ...comparison,
       ruleCode: "closed_without_improvement",
@@ -182,12 +192,7 @@ export function evaluateRiskFlags(entries, { today = kyivDate, ruleCode } = {}) 
 
       const { approved, submitted } = byPeriod.get(periodKey) ?? {};
       const source = { measureId: plan.id, periodKey };
-      const timing = deadlineFlag(source, {
-        active: plan.active,
-        deadline,
-        today: asOf,
-        completed: approved?.outcome === "completed",
-      });
+      const timing = deadlineFlag(plan, periodKey, deadline, asOf, approved);
       if (timing) {
         if (includes(timing.ruleCode)) items.push(timing);
         if (timing.ruleCode === "overdue") {
