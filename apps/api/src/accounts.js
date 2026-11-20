@@ -149,9 +149,15 @@ export function mountLoginRoutes(app, db, options) {
   )`;
   app.get("/api/auth/options", (req, res) => {
     keys(req.query, []);
-    res.json({ demoEnabled: options.demoMode });
+    res.json({ demoEnabled: options.demoMode, registrationEnabled: options.registrationEnabled });
   });
-  app.post("/api/auth/register", rateLimit(30, 10 * 60_000), async (req, res) => {
+  const requireRegistration = (_req, _res, next) => {
+    if (!options.registrationEnabled) {
+      throw new ApiError(403, "registration_disabled", "Реєстрація в цьому середовищі недоступна");
+    }
+    next();
+  };
+  app.post("/api/auth/register", requireRegistration, rateLimit(30, 10 * 60_000), async (req, res) => {
     keys(req.query, []);
     const fields = ["username", "password", "fullName", "department", "position"];
     keys(req.body, fields, fields);

@@ -43,7 +43,8 @@ function ErrorMessage({ error }) {
   ) : null;
 }
 function App() {
-  const [demoEnabled, setDemoEnabled] = useState(false);
+  const [authOptions, setAuthOptions] = useState({ demoEnabled: false, registrationEnabled: false });
+  const { demoEnabled, registrationEnabled } = authOptions;
   const [users, setUsers] = useState([]),
     [user, setUser] = useState(null),
     [choice, setChoice] = useState("");
@@ -81,7 +82,7 @@ function App() {
     ])
       .then(async ([options, current]) => {
         if (controller.signal.aborted) return;
-        setDemoEnabled(options.demoEnabled);
+        setAuthOptions(options);
         setUser(current);
         const result = options.demoEnabled
           ? await api("/demo/users", { signal: controller.signal })
@@ -194,7 +195,7 @@ function App() {
   );
   const errorMessage = <ErrorMessage error={error} />;
   if (!user) {
-    return <AccountEntry demoForm={sessionForm} loading={loading} error={errorMessage}
+    return <AccountEntry demoForm={sessionForm} registrationEnabled={registrationEnabled} loading={loading} error={errorMessage}
       onLogin={(credentials) => authenticate("/auth/login", credentials)} onRegister={register}
       onClearError={() => setError(null)} />;
   }

@@ -407,9 +407,7 @@ function ResultDetail({
 
   const editable = writableExecutorId === result.executorId &&
     ["draft", "returned"].includes(result.status);
-  const canCheck = hasPermission(user, "workflow.review", ["admin", "coordinator"].includes(user.role));
-  const canReview = canCheck && result.status === "submitted" &&
-    result.executorId !== user.id;
+  const canReview = result.status === "submitted" && result.canReview;
   const canAudit = hasPermission(user, "audit.read", ["executor", "coordinator", "admin"].includes(user.role));
   const busyOrLoading = Boolean(busy) || loading;
 

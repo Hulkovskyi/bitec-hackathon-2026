@@ -28,6 +28,7 @@ export function createApp(
   database,
   {
     demoMode = false,
+    registrationEnabled = true,
     today = kyivDate,
     evidenceDirectory = defaultEvidenceDirectory,
     evidenceStore,
@@ -77,7 +78,7 @@ export function createApp(
     next();
   });
   app.use(express.json({ limit: "1mb" }));
-  const authOptions = { demoMode, secureCookies };
+  const authOptions = { demoMode, registrationEnabled: !demoMode && registrationEnabled, secureCookies };
   mountLoginRoutes(app, database, authOptions);
   mountSessionRoutes(app, database, authOptions);
   mountAccountAdminRoutes(app, database);

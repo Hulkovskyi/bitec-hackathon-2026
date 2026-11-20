@@ -8,6 +8,7 @@ function start() {
     DACM_DATABASE_URL,
     DACM_PUBLIC_ORIGIN,
     DACM_DEMO_MODE,
+    DACM_REGISTRATION_ENABLED,
     SUPABASE_DB_CA,
     SUPABASE_URL,
     SUPABASE_SECRET_KEY,
@@ -32,9 +33,10 @@ function start() {
   const db = openPostgres(databaseUrl.href, {
     ssl: { ca: SUPABASE_DB_CA, rejectUnauthorized: true },
   });
-  const demoMode = DACM_DEMO_MODE === "true";
+  const demoMode = DACM_DEMO_MODE !== "false";
   return createApp(db, {
     demoMode,
+    registrationEnabled: DACM_REGISTRATION_ENABLED === "true",
     secureCookies: true,
     serveWeb: false,
     allowedOrigins: [publicOrigin.origin],
@@ -55,12 +57,12 @@ export default function handler(req, res) {
     try {
       app = start();
     } catch {
-      console.error("BITEC hosted demo configuration is incomplete or invalid");
+      console.error("BITEC hosted configuration is incomplete or invalid");
       res.statusCode = 503;
       res.setHeader("Content-Type", "application/json");
       res.setHeader("Cache-Control", "no-store");
       res.end(JSON.stringify({
-        error: { code: "unavailable", message: "Онлайн-демо ще не налаштовано" },
+        error: { code: "unavailable", message: "Онлайн-застосунок ще не налаштовано" },
       }));
       return;
     }

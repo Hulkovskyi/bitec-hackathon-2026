@@ -10,6 +10,7 @@ const accountTitles = {
   pending: "Заявка на розгляді",
   rejected: "Заявку відхилено",
 };
+const entryLabels = { demo: "Демовхід", login: "Вхід", register: "Реєстрація" };
 
 function Credentials({ register, username }) {
   return (
@@ -30,10 +31,13 @@ function Credentials({ register, username }) {
   );
 }
 
-export function AccountEntry({ demoForm, loading, error, onLogin, onRegister, onClearError }) {
-  const [mode, setMode] = useState("login");
+export function AccountEntry({ demoForm, registrationEnabled, loading, error, onLogin, onRegister, onClearError }) {
+  const [mode, setMode] = useState(null);
   const [registration, setRegistration] = useState(null);
-  const selected = mode === "demo" && !demoForm ? "login" : mode;
+  const availableModes = ["login"];
+  if (demoForm) availableModes.unshift("demo");
+  if (registrationEnabled && !demoForm) availableModes.push("register");
+  const selected = availableModes.includes(mode) ? mode : availableModes[0];
   const registering = selected === "register";
 
   async function submit(event) {
@@ -56,16 +60,16 @@ export function AccountEntry({ demoForm, loading, error, onLogin, onRegister, on
 
   return (
     <SignIn title={accountTitles[selected]} demo={selected === "demo"}>
-      <div className="account-switch" role="group" aria-label="Спосіб входу">
-        <button type="button" className="secondary" aria-pressed={selected === "login"}
-          onClick={() => changeMode("login")} disabled={loading}>Вхід</button>
-        <button type="button" className="secondary" aria-pressed={selected === "register"}
-          onClick={() => changeMode("register")} disabled={loading}>Реєстрація</button>
-        {demoForm && (
-          <button type="button" className="secondary" aria-pressed={selected === "demo"}
-            onClick={() => changeMode("demo")} disabled={loading}>Демовхід</button>
-        )}
-      </div>
+      {availableModes.length > 1 && (
+        <div className="account-switch" role="group" aria-label="Спосіб входу">
+          {availableModes.map((option) => (
+            <button key={option} type="button" className="secondary" aria-pressed={selected === option}
+              onClick={() => changeMode(option)} disabled={loading}>
+              {entryLabels[option]}
+            </button>
+          ))}
+        </div>
+      )}
       {selected === "demo" ? (
         <>
           <p>Оберіть демокористувача, щоб відкрити доступні йому заходи та панелі.</p>

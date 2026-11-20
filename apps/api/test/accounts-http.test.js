@@ -15,12 +15,12 @@ const applicant = {
 };
 const administrator = { ...applicant, username: "local.admin", fullName: "Тестовий Адміністратор" };
 
-async function setup(t, demoMode = false) {
+async function setup(t, options = {}) {
   const db = new DatabaseSync(":memory:");
   migrate(db);
   await seed(db, { demoMode: true });
   const admin = await createFirstAdministrator(db, administrator);
-  const server = createApp(db, { demoMode, secureCookies: true, today: () => "2026-11-17" }).listen(0, "127.0.0.1");
+  const server = createApp(db, { ...options, secureCookies: true, today: () => "2026-11-17" }).listen(0, "127.0.0.1");
   await once(server, "listening");
   t.after(async () => {
     await new Promise((resolve) => server.close(resolve));
@@ -47,7 +47,7 @@ async function setup(t, demoMode = false) {
 
 test("registration and login gate application decisions and apply role updates to existing sessions", async (t) => {
   const { db, request, login, admin } = await setup(t);
-  assert.deepEqual((await request("/auth/options")).data, { demoEnabled: false });
+  assert.deepEqual((await request("/auth/options")).data, { demoEnabled: false, registrationEnabled: true });
   assert.equal((await request("/demo/users")).status, 404);
   assert.equal((await request("/auth/register", { method: "POST", body: applicant, from: "https://foreign.example" })).status, 403);
   assert.equal((await request("/auth/register", { method: "POST", body: { ...applicant, role: "admin" } })).status, 400);
@@ -130,16 +130,32 @@ test("registration and login gate application decisions and apply role updates t
   assert.equal((await request("/me", { cookie: rotated.cookie })).status, 401);
 });
 
-test("rejected applications remain blocked, including when synthetic demo login is enabled", async (t) => {
-  const { db, request, login } = await setup(t, true);
+test("synthetic demo sessions reject credential accounts and registration is blocked", async (t) => {
+  const { db, request, admin } = await setup(t, { demoMode: true, registrationEnabled: true });
   await assert.rejects(createFirstAdministrator(db, { ...administrator, username: "other.admin" }), { code: "admin_exists" });
+  assert.deepEqual((await request("/auth/options")).data, { demoEnabled: true, registrationEnabled: false });
+  const registration = await request("/auth/register", { method: "POST", body: applicant });
+  assert.equal(registration.status, 403);
+  assert.equal(registration.data.error.code, "registration_disabled");
+  assert.equal(db.prepare("SELECT COUNT(*) AS total FROM credential_accounts").get().total, 1);
   const demoUsers = (await request("/demo/users")).data.items;
-  assert.ok(demoUsers.every(({ displayName }) => displayName !== administrator.fullName));
+  assert.ok(demoUsers.every(({ id }) => id !== admin.id));
+  assert.equal((await request("/demo/session", { method: "POST", body: { userId: admin.id } })).status, 401);
   const demoAdminId = demoUsers.find(({ role }) => role === "admin").id;
   const demo = await request("/demo/session", { method: "POST", body: { userId: demoAdminId } });
   assert.equal(demo.status, 201);
   assert.equal((await request("/admin/access", { cookie: demo.cookie })).status, 403);
+});
 
+test("working environments can close registration and retain password login", async (t) => {
+  const { request, login } = await setup(t, { registrationEnabled: false });
+  assert.deepEqual((await request("/auth/options")).data, { demoEnabled: false, registrationEnabled: false });
+  assert.equal((await request("/auth/register", { method: "POST", body: applicant })).status, 403);
+  assert.equal((await login(administrator)).status, 201);
+});
+
+test("rejected applications remain blocked", async (t) => {
+  const { db, request, login } = await setup(t);
   assert.equal((await request("/auth/register", { method: "POST", body: applicant })).status, 201);
   const { cookie, data: { userId } } = await login(applicant);
   await request("/access-application/submit", { method: "POST", cookie, body: {} });
@@ -152,7 +168,6 @@ test("rejected applications remain blocked, including when synthetic demo login 
   assert.equal(rejected.decisionReason, reason);
   assert.equal((await request("/programs", { cookie })).status, 403);
   assert.equal((await request("/access-application/submit", { method: "POST", cookie, body: {} })).status, 409);
-  assert.equal((await request("/demo/session", { method: "POST", body: { userId } })).status, 401);
   assert.deepEqual(db.prepare("SELECT action,actor_id FROM audit_events WHERE entity_id=? ORDER BY occurred_at").all(userId)
     .map(({ action, actor_id }) => [action, actor_id]), [["submit", userId], ["reject", admin.data.userId]]);
 });

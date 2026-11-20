@@ -14,6 +14,7 @@ import {
   canReadResult,
   effectiveAssignment,
   getMeasurePlan,
+  isIndependentReviewer,
   planForScope,
   readResultForUser,
   validPeriodKey,
@@ -319,7 +320,7 @@ export async function transitionResult(
       if ((await effectiveAssignment(db, plan, result.period_key)).executorId !== result.executor_id)
         missing();
       if (!plan.active) inactiveMeasure();
-    } else if (result.executor_id === actor.id) {
+    } else if (!(await isIndependentReviewer(db, result, actor.id))) {
       forbidden();
     }
 

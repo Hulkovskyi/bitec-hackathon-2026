@@ -1,6 +1,6 @@
 import { forbidden } from "./registry.js";
 import { hasPermission } from "./permissions.js";
-import { readResultForUser } from "./result-access.js";
+import { isIndependentReviewer, readResultForUser } from "./result-access.js";
 import {
   assignExecutor,
   createResult,
@@ -52,6 +52,8 @@ async function resultDetail(db, result, user, evidenceStore) {
   ).all(result.id);
   return {
     ...resultJson(result),
+    canReview: result.status === "submitted" && hasPermission(user, "workflow.review") &&
+      await isIndependentReviewer(db, result, user.id),
     evidence: [...latest.values()],
     evidenceHistory,
     reviews,

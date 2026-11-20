@@ -206,8 +206,18 @@ test("admin can manage a measure and its result while uploads retain executor ow
     method: "POST", cookie: admin, body: { version: uploaded.resultVersion },
   });
   assert.equal(submitted.status, 200);
+  const submission = await submitted.json();
+  assert.equal((await (await request(resultPath, { cookie: admin })).json()).canReview, false);
+  for (const decision of ["approve", "return"]) {
+    const selfReview = await request(resultPath + "/review", {
+      method: "POST", cookie: admin, body: { version: submission.version, decision, comment: "Перевірено" },
+    });
+    assert.equal(selfReview.status, 403);
+  }
+  const coordinator = await login(205);
+  assert.equal((await (await request(resultPath, { cookie: coordinator })).json()).canReview, true);
   const approved = await request(resultPath + "/review", {
-    method: "POST", cookie: admin, body: { version: (await submitted.json()).version, decision: "approve" },
+    method: "POST", cookie: coordinator, body: { version: submission.version, decision: "approve" },
   });
   assert.equal(approved.status, 200);
   assert.equal((await approved.json()).status, "approved");
