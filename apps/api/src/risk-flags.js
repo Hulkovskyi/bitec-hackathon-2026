@@ -54,10 +54,20 @@ export function selectRevisions(measureId, revisions) {
   return byPeriod;
 }
 
-export function deadlineFlag(source, { active, deadline, today, completed }) {
-  if (completed) return null;
+export function deadlineFlag(plan, periodKey, deadline, today, approved) {
+  if (approved?.outcome === "completed") return null;
+
+  // RF1 in the organizers' archive covers dated measures. Recurring archive
+  // rows describe the source half-year and carry no dated overdue obligation.
+  if (!approved && plan.source_period) {
+    const archiveCoversDeadline = periodKey === "once"
+      ? plan.source_schedule_type === "one_time" && plan.source_status === "vykonano"
+      : plan.source_schedule_type !== "one_time" && plan.source_period === periodKey;
+    if (archiveCoversDeadline) return null;
+  }
 
   const remaining = daysBetween(today, deadline);
+  const source = { measureId: plan.id, periodKey };
   if (remaining < 0) {
     return {
       ...source,
@@ -67,7 +77,7 @@ export function deadlineFlag(source, { active, deadline, today, completed }) {
       suggestedAction: "Уточніть причину прострочення й узгодьте подальші дії.",
     };
   }
-  if (active && remaining <= 7) {
+  if (plan.active && remaining <= 7) {
     return {
       ...source,
       ruleCode: "due_soon",
@@ -182,12 +192,7 @@ export function evaluateRiskFlags(entries, { today = kyivDate, ruleCode } = {}) 
 
       const { approved, submitted } = byPeriod.get(periodKey) ?? {};
       const source = { measureId: plan.id, periodKey };
-      const timing = deadlineFlag(source, {
-        active: plan.active,
-        deadline,
-        today: asOf,
-        completed: approved?.outcome === "completed",
-      });
+      const timing = deadlineFlag(plan, periodKey, deadline, asOf, approved);
       if (timing) {
         if (includes(timing.ruleCode)) items.push(timing);
         if (timing.ruleCode === "overdue") {

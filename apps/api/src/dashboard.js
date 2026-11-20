@@ -24,12 +24,17 @@ async function readQuery(db, user, query, selector, values) {
 async function scopedEntries(db, user, { programId, departmentId }, asOf) {
   const visible = measureScope(user);
   const plans = await db.prepare(`
-    SELECT plan.*, p.period_start, p.period_end
+    SELECT plan.*, p.period_start, p.period_end, source.source_period,
+           source.source_status, source_plan.source_schedule_type
     FROM (
       ${selectMeasure}
       WHERE s.program_id=? AND ${visible.sql} ${departmentId ? "AND m.department_id=?" : ""}
     ) plan JOIN programs p ON p.id=plan.program_id
-  `).all(programId, ...visible.params, ...(departmentId ? [departmentId] : []));
+    LEFT JOIN official_dataset_batches batch ON batch.program_id=plan.program_id AND batch.source_as_of<=?
+    LEFT JOIN official_measure_results source ON source.measure_id=plan.id
+      AND source.program_id=plan.program_id AND source.source_period=batch.source_period
+    LEFT JOIN official_measure_metadata source_plan ON source_plan.measure_id=source.measure_id
+  `).all(programId, ...visible.params, ...(departmentId ? [departmentId] : []), asOf);
   const readRevisions = db.prepare(`
     SELECT id, measure_id, period_key, revision, status, executor_id, outcome, measured_value
     FROM results WHERE measure_id=?
@@ -75,12 +80,7 @@ function periodLists(entries, asOf) {
       const { approved, latest } = byPeriod.get(periodKey) ?? {};
       const item = { measureId: plan.id, periodKey, code: plan.code, title: plan.title, deadline };
       const completed = approved?.outcome === "completed";
-      const timing = deadlineFlag({ measureId: plan.id, periodKey }, {
-        active: plan.active,
-        deadline,
-        today: asOf,
-        completed,
-      });
+      const timing = deadlineFlag(plan, periodKey, deadline, asOf, approved);
       periods.push({
         item,
         active: plan.active && (periodKey === "once" || asOf <= deadline),
