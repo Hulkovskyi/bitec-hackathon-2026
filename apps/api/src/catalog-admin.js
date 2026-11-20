@@ -161,6 +161,12 @@ export function mountCatalogAdminRoutes(app, db) {
       const before = await readRisk(tx, programId, id);
       const indicator = await tx.prepare("SELECT * FROM risk_indicators WHERE risk_id=?").get(id);
       if (indicator) await tx.prepare("DELETE FROM risk_indicators WHERE risk_id=?").run(id);
+      await tx.prepare(`
+        DELETE FROM audit_events
+        WHERE entity_type='risk_flag_decision' AND entity_id IN (
+          SELECT id FROM risk_flag_decisions WHERE program_id=? AND risk_id=?
+        )
+      `).run(programId, id);
       const removed = await tx.prepare("DELETE FROM risks WHERE program_id=? AND id=?").run(programId, id);
       if (!removed.changes) missing();
       await audit(tx, req.user.id, "delete", "risk", id, { ...before, programId, indicator }, null);

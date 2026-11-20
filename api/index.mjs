@@ -41,6 +41,8 @@ function start() {
         throw new Error("Account roles have not been initialized");
       await db.prepare("SELECT manager_id FROM credential_accounts LIMIT 1").get();
       await db.prepare("SELECT session_id_hash FROM account_session_previews LIMIT 1").get();
+      await db.prepare("SELECT id FROM risk_flag_decisions LIMIT 1").get();
+      await db.prepare("SELECT risk_id FROM official_risk_metadata LIMIT 1").get();
       await storage.checkPrivateBucket();
     },
   });

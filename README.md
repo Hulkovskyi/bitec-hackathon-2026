@@ -16,7 +16,7 @@
 - Як виконавець відкрийте призначений захід і подайте результат із синтетичним TXT. Координатор може повернути його на доопрацювання або погодити після оновлення доказу. [Опис сценарію погодження](docs/workflow.md)
 - Як координатор або керівник відкрийте **Звіти**, перемкніть півріччя, перегляньте довідку та завантажте CSV. [Звітність](docs/reporting.md) · [Наскрізна перевірка](docs/verification.md)
 - Відкрийте **Огляд** або **Сигнали**, виберіть показник і перейдіть до відповідного заходу та періоду. [Правила й показники](docs/analytics.md)
-- Імпортуйте офіційний синтетичний набір BITEC і звірте 50 рядків звіту H1 з еталоном. [Як імпортувати й перевірити набір](#локальне-демо-на-офіційному-наборі-bitec)
+- Імпортуйте офіційний синтетичний набір BITEC і звірте 50 рядків звіту H1 і 29 архівних сигналів з еталоном. [Як імпортувати й перевірити набір](#локальне-демо-на-офіційному-наборі-bitec)
 
 ![Звіт координатора за ІІ півріччя на синтетичних даних](docs/images/integrated-report-h2.jpg)
 
@@ -63,14 +63,14 @@ npm start
 
 ### Локальне демо на офіційному наборі BITEC
 
-Після `npm ci` розпакуйте `dani/nabir.json` з архіву організаторів. Скрипт імпортує його в окремий файл SQLite і з параметром `--verify` запускає тимчасовий локальний API для звірки. [Синтетичний ZIP BITEC](https://hack.bitec.com.ua/wp-content/uploads/2026/11/zavdannia-2-syntetychnyi-nabir-63022726.zip)
+Після `npm ci` розпакуйте `dani/nabir.json` і `kliuch/ochikuvani-sygnaly.csv` з архіву організаторів. Скрипт імпортує його в окремий файл SQLite і з параметром `--verify` запускає тимчасовий локальний API для звірки. [Синтетичний ZIP BITEC](https://hack.bitec.com.ua/wp-content/uploads/2026/11/zavdannia-2-syntetychnyi-nabir-63022726.zip)
 
 **PowerShell**
 
 ```powershell
 $env:DEMO_MODE = 'true'
 $env:DATABASE_PATH = './data/official-bitec.sqlite'
-node scripts/import-official-dataset.mjs 'C:\шлях\до\dani\nabir.json' $env:DATABASE_PATH --verify
+node scripts/import-official-dataset.mjs 'C:\шлях\до\dani\nabir.json' $env:DATABASE_PATH --verify --risk-key 'C:\шлях\до\kliuch\ochikuvani-sygnaly.csv'
 ```
 
 **Bash або Zsh**
@@ -78,10 +78,10 @@ node scripts/import-official-dataset.mjs 'C:\шлях\до\dani\nabir.json' $env
 ```bash
 export DEMO_MODE=true
 export DATABASE_PATH=./data/official-bitec.sqlite
-node scripts/import-official-dataset.mjs '/шлях/до/dani/nabir.json' "$DATABASE_PATH" --verify
+node scripts/import-official-dataset.mjs '/шлях/до/dani/nabir.json' "$DATABASE_PATH" --verify --risk-key '/шлях/до/kliuch/ochikuvani-sygnaly.csv'
 ```
 
-Очікуваний результат звірки містить `rows: 50`, `referenceRows: 50` і `differences: []`. Щоб переглянути імпортовану програму в браузері, створіть першого адміністратора в тому самому `DATABASE_PATH`, запустіть застосунок і відкрийте **Звіти → 2026 · І півріччя**.
+Очікуваний результат звірки містить `rows: 50`, `referenceRows: 50` і `differences: []`. Для сигналів очікуються `expected: 29`, `observed: 29`, `matched: 29` та порожні списки розбіжностей. Щоб переглянути імпортовану програму в браузері, створіть першого адміністратора в тому самому `DATABASE_PATH`, запустіть застосунок і відкрийте **Звіти → 2026 · І півріччя** або **Сигнали → Зріз організаторів**.
 
 ## Як влаштовано
 

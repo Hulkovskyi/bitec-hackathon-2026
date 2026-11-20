@@ -152,6 +152,15 @@ function normalizeOfficialDataset(input) {
       number(row.znachennia), text(row.dzherelo, 1000), null,
     ];
   });
+  const endOfPeriodReadings = new Map();
+  for (const [, id, readingOn, actual] of readings) {
+    if (readingOn > "2026-06-30") continue;
+    const previous = endOfPeriodReadings.get(id);
+    if (!previous || readingOn > previous.readingOn) {
+      endOfPeriodReadings.set(id, { readingOn, actual });
+    }
+  }
+  const riskMetadata = [];
   const riskIndicators = [...inputRisks.values()].map((row) => {
     const id = riskId(row.id);
     const baseline = number(row.indykator_bazove);
@@ -163,10 +172,18 @@ function normalizeOfficialDataset(input) {
     if (targetOn < baselineReading[2] || (direction === "increase" ? target < baseline : target > baseline)) {
       invalid(`Некоректна ціль ризику: ${row.id}`);
     }
+    const owner = departmentId(row.vlasnyk_pidrozdil_id);
+    const unit = text(row.odynytsia, 50);
+    const likelihood = choice(row.imovirnist_x, [1, 2, 3, 4]);
+    const impact = choice(row.naslidky_y, [1, 2, 3, 4]);
+    const reading = endOfPeriodReadings.get(id);
+    riskMetadata.push([
+      id, program.id, owner, text(row.id, 50), text(row.nazva), baseline, baselineReading[2],
+      target, unit, likelihood, impact, reading?.actual ?? null, reading?.readingOn ?? null,
+    ]);
     return [
-      id, program.id, departmentId(row.vlasnyk_pidrozdil_id), text(row.indykator_ryzyku),
-      text(row.odynytsia, 50), direction, baseline, baselineReading[2], target, targetOn,
-      text(row.zmist, 4000), choice(row.imovirnist_x, [1, 2, 3, 4]), choice(row.naslidky_y, [1, 2, 3, 4]),
+      id, program.id, owner, text(row.indykator_ryzyku), unit, direction, baseline, baselineReading[2],
+      target, targetOn, text(row.zmist, 4000), likelihood, impact,
     ];
   });
 
@@ -184,9 +201,12 @@ function normalizeOfficialDataset(input) {
     if ((scheduleType === "one_time") !== (plannedDate !== null)) invalid(`Некоректний строк: ${row.id}`);
     const target = optionalNumber(row.indykator_tsil);
     const unit = optionalText(row.indykator_odynytsia, 50);
+    const direction = target === null ? null : "increase";
     const title = text(row.zmist);
     const indicatorTitle = text(row.indykator_vykonannia);
     const id = measureId(row.id);
+    const code = text(row.id, 50);
+    const linkedRiskId = row.ryzyk_id === "" ? null : riskId(row.ryzyk_id);
     const executor = referenced(inputUsers, row.vykonavets_korystuvach_id, "korystuvachi");
     if (executor.rol !== "VYK" || executor.pidrozdil_id !== department.id) {
       invalid(`Виконавець заходу поза підрозділом: ${row.id}`);
@@ -195,14 +215,15 @@ function normalizeOfficialDataset(input) {
       id, program.id, positive(row.nomer_u_rozdili), planText, scheduleType, plannedDate,
       title, departmentId(department.id), department.nazva, section.nomer, indicatorTitle, target, unit,
       text(row.potribni_pidtverdzhennia, 4000, true), text(row.resursy, 4000, true),
+      linkedRiskId, code, department.id, direction,
     ]);
     return {
       id, sectionId: idFor("section", row.rozdil_kod), departmentId: departmentId(department.id),
-      executorId: userId(executor.id), riskId: row.ryzyk_id === "" ? null : riskId(row.ryzyk_id),
-      code: text(row.id, 50), title, description: "", scheduleType, plannedDate,
+      executorId: userId(executor.id), riskId: linkedRiskId,
+      code, title, description: "", scheduleType, plannedDate,
       ...(recurrence ? { recurrence } : {}),
       effectiveFrom: program.periodStart,
-      indicator: { title: indicatorTitle, unit, baseline: null, target, direction: target === null ? null : "increase" },
+      indicator: { title: indicatorTitle, unit, baseline: null, target, direction },
     };
   });
 
@@ -245,7 +266,7 @@ function normalizeOfficialDataset(input) {
   });
 
   return {
-    sourceAsOf, reportPeriod, programId: program.id, passport, riskIndicators, readings,
+    sourceAsOf, reportPeriod, programId: program.id, passport, riskIndicators, readings, riskMetadata,
     metadata, results, evidence, deadlineChanges,
     registry: {
       schemaVersion: 1, synthetic: true, programs: [program],
@@ -297,14 +318,20 @@ export async function importOfficialDataset(database, input, { demoMode = false 
       VALUES (?,?,?,?,?,?)`, data.readings);
     await insertRows(db, `
       INSERT INTO official_dataset_batches
-        (program_id, source_period, source_as_of, source_hash, imported_at)
-      VALUES (?,?,?,?,?)`, [[programId, reportPeriod, sourceAsOf, sourceHash, new Date().toISOString()]]);
+        (program_id, source_period, source_as_of, source_hash, imported_at, source_signals)
+      VALUES (?,?,?,?,?,1)`, [[programId, reportPeriod, sourceAsOf, sourceHash, new Date().toISOString()]]);
+    await insertRows(db, `
+      INSERT INTO official_risk_metadata
+        (risk_id, program_id, owner_department_id, code, title, baseline, baseline_on, target,
+         unit, likelihood, impact, actual, reading_on)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, data.riskMetadata);
     await insertRows(db, `
       INSERT INTO official_measure_metadata
         (measure_id, program_id, section_order, plan_text, source_schedule_type, source_planned_date,
          source_title, source_department_id, source_department_title, source_section_code,
-         indicator_title, indicator_target, indicator_unit, expected_evidence, resources)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, data.metadata);
+         indicator_title, indicator_target, indicator_unit, expected_evidence, resources, source_risk_id,
+         source_code, source_department_code, source_indicator_direction)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, data.metadata);
     await insertRows(db, `
       INSERT INTO official_measure_results
         (measure_id, program_id, source_period, source_status, source_approved, source_actual_date,

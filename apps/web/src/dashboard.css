@@ -569,3 +569,30 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.dashboard-decisions {
+  margin-top: 16px;
+}
+
+.dashboard-decision-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.dashboard-decision-list li,
+.dashboard-flag-decision {
+  border-top: 1px solid var(--line);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+
+.dashboard-decision-list h3 {
+  overflow-wrap: anywhere;
+  margin-bottom: 4px;
+}
+
+.dashboard-decision-details dd {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

@@ -103,14 +103,22 @@ async function http(t, db, today) {
   const origin = "http://127.0.0.1:3001";
   const base = `http://127.0.0.1:${server.address().port}/api`;
   const { items } = await (await fetch(base + "/demo/users")).json();
-  return async (role, query) => {
+  return async (role, query, { method = "GET", body } = {}) => {
     const actor = items.find((user) => user.role === role);
     const session = await fetch(base + "/demo/session", {
       method: "POST", headers: { Origin: origin, "Content-Type": "application/json" },
       body: JSON.stringify({ userId: actor.id }),
     });
     assert.equal(session.status, 201);
-    return fetch(base + query, { headers: { Cookie: session.headers.get("set-cookie").split(";")[0] } });
+    return fetch(base + query, {
+      method,
+      headers: {
+        Cookie: session.headers.get("set-cookie").split(";")[0],
+        Origin: origin,
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
   };
 }
 
@@ -171,6 +179,54 @@ test("H1 reproduces organizer fields and keeps historical report evidence scoped
   assert.equal(executor.status, 403);
 });
 
+test("expected evidence is available on an accessible measure detail", async (t) => {
+  const db = inMemory(t);
+  const input = fixture();
+  input.tablytsi.zakhody[1].potribni_pidtverdzhennia = "Документ іншого підрозділу";
+  input.tablytsi.zakhody[2].potribni_pidtverdzhennia = "";
+  const { programId } = await importOfficialDataset(db, input, { demoMode: true });
+  const request = await http(t, db, () => input.meta.data_zrizu);
+  const idFor = db.prepare("SELECT id FROM measures WHERE code=?");
+  const detail = await request("leader", `/measures/${idFor.get("Z-P").id}?periodKey=2026-H1`);
+  assert.equal(detail.status, 200);
+  assert.equal((await detail.json()).expectedEvidence, "Навчальний документ");
+  const blank = await request("leader", `/measures/${idFor.get("Z-F").id}`);
+  assert.equal(blank.status, 200);
+  assert.equal((await blank.json()).expectedEvidence, undefined);
+  const outsideScope = await request("leader", `/measures/${idFor.get("Z-L").id}`);
+  assert.equal(outsideScope.status, 404);
+  assert.equal(JSON.stringify(await outsideScope.json()).includes("Документ іншого підрозділу"), false);
+  const listed = await request("leader", `/measures?programId=${programId}`);
+  assert.equal(listed.status, 200);
+  assert.ok((await listed.json()).items.every((item) => !Object.hasOwn(item, "expectedEvidence")));
+});
+
+test("an archive signal can open its source result only within archive and registry scope", async (t) => {
+  const db = inMemory(t);
+  const input = fixture();
+  await importOfficialDataset(db, input, { demoMode: true });
+  let today = "2026-07-06";
+  const request = await http(t, db, () => today);
+  const find = db.prepare("SELECT id, department_id FROM measures WHERE code=?");
+  const visible = find.get("Z-P");
+  const hidden = find.get("Z-L");
+  const path = `/measures/${visible.id}`;
+  assert.equal((await (await request("leader", path)).json()).officialResult, undefined);
+  const archive = await request("leader", path + "?source=official");
+  assert.equal(archive.status, 200);
+  assert.deepEqual((await archive.json()).officialResult, {
+    periodKey: "2026-H1", asOf: today, status: "chastkovo", markedApproved: true, actualDate: null,
+    description: "Виконано 60 %.", actual: 60, target: 100, unit: "%", evidence: ["Умовний документ"],
+  });
+  assert.equal((await request("leader", `/measures/${hidden.id}?source=official`)).status, 404);
+  today = "2026-07-05";
+  assert.equal((await request("leader", path + "?source=official")).status, 404);
+  today = "2026-07-06";
+  db.prepare("UPDATE measures SET department_id=? WHERE id=?").run(visible.department_id, hidden.id);
+  assert.equal((await request("leader", `/measures/${hidden.id}`)).status, 200);
+  assert.equal((await request("leader", `/measures/${hidden.id}?source=official`)).status, 404);
+});
+
 test("organizer deadlines honor the available H1 archive and keep other periods and live approvals", async (t) => {
   const db = inMemory(t);
   const input = fixture();
@@ -213,4 +269,148 @@ test("organizer deadlines honor the available H1 archive and keep other periods 
   `).run(randomUUID(), asOf, asOf);
   const afterApproval = await (await request("coordinator", riskPath)).json();
   assert.deepEqual(rowKeys(afterApproval), [["Z-D", "once"], ["Z-L", "once"]]);
+});
+
+test("official signal totals and repeated overdue cases use only accessible archive records", async (t) => {
+  const db = inMemory(t);
+  const input = fixture();
+  const { zakhody, vykonannia_2026_h1 } = input.tablytsi;
+  for (const [index, deadline] of ["2026-06-30", "2026-06-29", "2026-07-01"].entries()) {
+    const code = `Z-B${index}`;
+    zakhody.push({
+      ...zakhody[1], id: code, nomer_u_rozdili: index + 4,
+      strok_data: deadline, zmist: `Перевірка межі ${index}`,
+    });
+    vykonannia_2026_h1.push({
+      ...vykonannia_2026_h1[1], zakhid_id: code, status: "v_roboti",
+      fakt_data: "", opys_rezultatu: "Робота триває.",
+    });
+  }
+  const { programId } = await importOfficialDataset(db, input, { demoMode: true });
+  const request = await http(t, db, () => "2027-01-01");
+  const path = `/risk-flags?programId=${programId}&source=official`;
+  const flags = async (role, query = "") => {
+    const response = await request(role, path + query);
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const overview = await flags("coordinator", "&ruleCode=RF1&pageSize=1");
+  assert.equal(overview.asOf, input.meta.data_zrizu);
+  assert.equal(overview.total, 2);
+  assert.deepEqual(overview.items.map(({ code, deadline }) => [code, deadline]), [["Z-B0", "2026-06-30"]]);
+  const leader = await flags("leader", "&ruleCode=RF1&pageSize=1");
+  assert.equal(leader.total, 0);
+  const aggregate = await flags("coordinator", "&ruleCode=RF6");
+  assert.deepEqual(aggregate.items.map(({ subjectType, code, sourceValues }) => [
+    subjectType, code, sourceValues.overdueCount, sourceValues.overdueCodes,
+  ]), [["department", "P2", 2, "Z-B0, Z-B1"]]);
+  assert.equal((await flags("leader", "&ruleCode=RF6")).total, 0);
+  assert.deepEqual((await flags("coordinator", "&ruleCode=RF7e")).items.map(({ code }) => code), ["Z-F", "Z-B2"]);
+  assert.deepEqual((await flags("coordinator", "&ruleCode=RF5")).items.map(({ sourceValues }) => [
+    sourceValues.actual, sourceValues.target, sourceValues.unit, sourceValues.direction,
+  ]), [[60, 100, "%", "increase"]]);
+  assert.deepEqual((await flags("coordinator", "&ruleCode=RF2")).items.map(({ code }) => code), ["Z-L"]);
+});
+
+test("official risk metrics use snapshot values and honor current ownership", async (t) => {
+  const db = inMemory(t);
+  const input = fixture();
+  const { ryzyky, vymiriuvannia_indykatoriv, zakhody, vykonannia_2026_h1 } = input.tablytsi;
+  for (const [id, baseline, target, actual] of [["KR-X", 0, 100, 9], ["KR-Y", 10, 9, 9.9], ["KR-Z", 0, 100, 0]]) {
+    ryzyky.push({
+      id, nazva: `Синтетичний ризик ${id}`, zmist: "Умовний ризик", vlasnyk_pidrozdil_id: "P1",
+      indykator_ryzyku: "Частка", odynytsia: "%", indykator_bazove: baseline, indykator_tsil: target,
+      napriam: target >= baseline ? "більше" : "менше", data_tsili: "2026-12-31", imovirnist_x: 3, naslidky_y: 2,
+    });
+    vymiriuvannia_indykatoriv.push(
+      { ryzyk_id: id, data: "2026-01-01", znachennia: baseline, dzherelo: "База" },
+      { ryzyk_id: id, data: "2026-06-28", znachennia: actual, dzherelo: "Вимірювання" },
+    );
+  }
+  Object.assign(zakhody[0], { rozdil_kod: "R2", ryzyk_id: "KR-X" });
+  Object.assign(zakhody[1], { rozdil_kod: "R2", ryzyk_id: "KR-Y" });
+  vykonannia_2026_h1[0].status = "vykonano";
+  const { programId } = await importOfficialDataset(db, input, { demoMode: true });
+  const request = await http(t, db, () => input.meta.data_zrizu);
+  const flags = async (rule, role = "coordinator") => {
+    const response = await request(role, `/risk-flags?programId=${programId}&source=official&ruleCode=${rule}`);
+    assert.equal(response.status, 200);
+    return (await response.json()).items;
+  };
+  const [weak] = await flags("RF3");
+  assert.equal(weak.code, "Z-P");
+  assert.equal(weak.sourceValues.progressPercent, 9);
+  assert.equal((await flags("RF3")).length, 1);
+  assert.equal((await flags("RF3", "leader")).length, 1);
+  assert.equal((await flags("RF3", "executor")).length, 0);
+  const withoutMeasure = await flags("RF7d");
+  assert.deepEqual(withoutMeasure.map(({ code }) => code), ["KR-Z"]);
+  db.exec("UPDATE official_dataset_batches SET source_signals=0");
+  assert.match((await flags("RF3"))[0].sourceValues.riskDataSource, /Поточні довідники/);
+  assert.match((await flags("RF7d"))[0].sourceValues.riskDataSource, /Поточні довідники/);
+  db.exec("UPDATE official_dataset_batches SET source_signals=1");
+
+  const { subjectType, subjectId, periodKey, ruleCode } = weak;
+  const key = { programId, source: "official", subjectType, subjectId, periodKey, ruleCode };
+  const path = "/risk-flag-decisions";
+  const available = await request("coordinator", `${path}/assignees?${new URLSearchParams(key)}`);
+  assert.equal(available.status, 200);
+  const { items, signalVersion } = await available.json();
+  const saved = await request("coordinator", path, { method: "PUT", body: {
+    ...key, signalVersion, version: 0, action: "Перевірити прогрес індикатора",
+    assigneeId: items[0].id, dueDate: input.meta.data_zrizu,
+  } });
+  assert.equal(saved.status, 200);
+  const decision = await saved.json();
+  const decisions = async (role) => {
+    const response = await request(role, `${path}?programId=${programId}`);
+    assert.equal(response.status, 200);
+    return (await response.json()).items;
+  };
+  assert.deepEqual(await decisions("leader"), [decision]);
+
+  db.exec(`
+    UPDATE risk_indicators SET owner_department_id=(SELECT id FROM departments WHERE code='P2'),
+      target=baseline, likelihood=1, impact=1;
+    UPDATE measures SET risk_id=(SELECT id FROM risks WHERE code='KR-Z'), code='changed-' || code;
+    UPDATE risks SET code='changed-' || code;
+  `);
+  assert.deepEqual(await flags("RF3"), [weak]);
+  assert.deepEqual(await flags("RF7d"), withoutMeasure);
+  assert.deepEqual(await flags("RF3", "leader"), []);
+  assert.deepEqual(await flags("RF7d", "leader"), []);
+  assert.deepEqual(await decisions("leader"), []);
+  assert.deepEqual(await decisions("coordinator"), [decision]);
+
+  db.exec(`
+    UPDATE measures SET risk_id=NULL;
+    DELETE FROM risk_measurements;
+    DELETE FROM risk_indicators;
+    DELETE FROM risks;
+  `);
+  assert.deepEqual(await flags("RF3"), []);
+  assert.deepEqual(await flags("RF7d"), []);
+  assert.deepEqual(await decisions("coordinator"), []);
+  assert.equal(db.prepare("SELECT count(*) AS total FROM official_risk_metadata").get().total, 0);
+});
+
+test("RF4 includes the similarity threshold and excludes results with numbers or links", async (t) => {
+  const db = inMemory(t);
+  const input = fixture();
+  const { zakhody, vykonannia_2026_h1 } = input.tablytsi;
+  const title = "Перевірка комісія стандарти експерти реєстри";
+  const words = "Перевірка комісія стандарти";
+  const cases = [words, words + " 7", words + " https://example.org", "Перевірка комісія"];
+  zakhody.push({ ...zakhody[0], id: "Z-Q", nomer_u_rozdili: 4 });
+  vykonannia_2026_h1.push({ ...vykonannia_2026_h1[0], zakhid_id: "Z-Q" });
+  for (const [index, description] of cases.entries()) {
+    zakhody[index].zmist = title;
+    Object.assign(vykonannia_2026_h1[index], { status: "vykonano", opys_rezultatu: description });
+  }
+  const { programId } = await importOfficialDataset(db, input, { demoMode: true });
+  const request = await http(t, db, () => input.meta.data_zrizu);
+  const response = await request("coordinator", `/risk-flags?programId=${programId}&source=official&ruleCode=RF4`);
+  assert.equal(response.status, 200);
+  const { items } = await response.json();
+  assert.deepEqual(items.map(({ code, sourceValues }) => [code, sourceValues.similarityPercent]), [["Z-P", 60]]);
 });

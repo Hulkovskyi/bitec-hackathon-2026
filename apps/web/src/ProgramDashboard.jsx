@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { halfYears } from "./periods.js";
+import { halfYears, kyivToday } from "./periods.js";
 import "./dashboard.css";
 
 const pageSize = 10;
@@ -70,6 +70,22 @@ const ruleLabels = {
   closed_without_improvement: "Індикатор не покращився",
 };
 
+const officialRuleLabels = {
+  RF1: "Прострочення",
+  RF2: "Брак підтвердних матеріалів",
+  RF3: "Ризик майже не змінився",
+  RF4: "Опис дублює зміст заходу",
+  RF5: "Цілі індикатора не досягнуто",
+  RF6: "Повторні порушення строків",
+  RF7a: "Фактична дата поза періодом",
+  RF7b: "Докази датовано після виконання",
+  RF7c: "Бракує пояснення невиконання",
+  RF7d: "Високий ризик без заходів впливу",
+  RF7e: "Опис заповнено до настання строку",
+};
+
+const flagSources = { live: "Поточний моніторинг", official: "Зріз організаторів" };
+
 const sourceLabels = {
   today: "Дата оцінки",
   deadline: "Строк",
@@ -81,9 +97,37 @@ const sourceLabels = {
   target: "Цільове значення",
   actual: "Фактичне значення",
   direction: "Напрям покращення",
+  periodEnd: "Кінець звітного періоду",
+  sourceAsOf: "Дата архівного зрізу",
+  status: "Стан у джерелі",
+  evidenceCount: "Кількість підтверджень",
+  riskCode: "Код ризику",
+  unit: "Одиниця виміру",
+  readingDate: "Дата вимірювання",
+  progressPercent: "Прогрес до цілі, %",
+  thresholdPercent: "Поріг, %",
+  similarityPercent: "Подібність опису, %",
+  hasNumber: "Указано число",
+  hasLink: "Є посилання",
+  deadlineChangeCount: "Кількість перенесень строку",
+  overdueCount: "Кількість прострочених заходів",
+  overdueCodes: "Коди прострочених заходів",
+  actualDate: "Фактична дата виконання",
+  firstEvidenceDate: "Дата першого підтвердження",
+  descriptionPresent: "Є опис результату",
+  riskScore: "Бал ризику",
+  riskLevel: "Рівень ризику",
+  linkedMeasureCount: "Кількість заходів впливу",
+  riskDataSource: "Джерело даних ризику",
+  indicatorDataSource: "Джерело напряму індикатора",
 };
 
 const sourceValueLabels = {
+  status: {
+    vykonano: "Виконано", chastkovo: "Виконано частково", ne_vykonano: "Не виконано",
+    v_roboti: "У роботі", ne_rozpochato: "Не розпочато",
+  },
+  riskLevel: { low: "Низький", medium: "Середній", high: "Високий", critical: "Критичний" },
   direction: { increase: "Збільшення", decrease: "Зменшення", maintain: "Збереження" },
   issue: {
     no_current_evidence: "Немає актуального доказу",
@@ -178,8 +222,11 @@ function Pagination({ data, label, onPageChange }) {
   );
 }
 
-export function ProgramDashboard({ program, userRole, programContext, departments, api, onOpenMeasure, mode = "overview" }) {
-  const [departmentId, setDepartmentId] = useState("");
+export function ProgramDashboard({
+  program, userRole, programContext, departments, api, onOpenMeasure, onOpenSubject, canOpenRisk, mode = "overview",
+  initialDepartmentId = "",
+}) {
+  const [departmentId, setDepartmentId] = useState(initialDepartmentId);
   const view = roleViews[userRole] ?? roleViews.analyst;
   const title = { signals: "Сигнали", approvals: "Погодження" }[mode] ?? view.title;
   const showDepartment = userRole !== "executor" && departments.length > 0;
@@ -199,8 +246,8 @@ export function ProgramDashboard({ program, userRole, programContext, department
         </div>
         {showDepartment && (
           <label>
-            Підрозділ
-            <select value={departmentId} onChange={(event) => setDepartmentId(event.target.value)}>
+            <span id="dashboard-department-label">Підрозділ</span>
+            <select aria-labelledby="dashboard-department-label" value={departmentId} onChange={(event) => setDepartmentId(event.target.value)}>
               <option value="">Усі доступні підрозділи</option>
               {departments.map(({ id, title }) => <option key={id} value={id}>{title}</option>)}
             </select>
@@ -209,7 +256,7 @@ export function ProgramDashboard({ program, userRole, programContext, department
       </header>
       {mode === "signals" ? (
         <RiskFlags key={departmentId} api={api} scope={scope} periods={periods}
-          onOpenMeasure={onOpenMeasure} />
+          onOpenSubject={onOpenSubject} canOpenRisk={canOpenRisk} onOpenMeasure={onOpenMeasure} showDecisions />
       ) : (
         <DashboardScope key={`${mode}:${departmentId}`} api={api} scope={scope}
           view={view} periods={periods} onlyApprovals={mode === "approvals"}
@@ -430,54 +477,234 @@ function MeasureList({ items, periods, onOpenMeasure }) {
   );
 }
 
-function RiskFlags({ api, scope, periods, onOpenMeasure }) {
-  const [filter, setFilter] = useState({ ruleCode: "", page: 1 });
+function RiskFlags(props) {
+  if (!props.showDecisions) return <RiskFlagList {...props} />;
+  return <RiskDecisions {...props} />;
+}
+
+function RiskFlagList({ api, scope, periods, onOpenMeasure, onOpenSubject, canOpenRisk, showDecisions = false, renderDecision }) {
+  const [filter, setFilter] = useState({ source: "live", ruleCode: "", page: 1 });
   const query = new URLSearchParams({
     ...scope,
+    ...(filter.source === "official" ? { source: "official" } : {}),
     ...(filter.ruleCode ? { ruleCode: filter.ruleCode } : {}),
     page: String(filter.page),
   });
   const request = useDashboardQuery(api, `/risk-flags?${query}`);
+  const labels = filter.source === "official" ? officialRuleLabels : ruleLabels;
   return (
-    <section className="dashboard-panel dashboard-flags-panel" aria-labelledby="dashboard-flags-title">
-      <div className="dashboard-heading dashboard-panel-heading dashboard-flags-heading">
-        <h2 id="dashboard-flags-title">Сигнали ризику</h2>
-        <label>
-          Правило
-          <select value={filter.ruleCode} onChange={(event) => setFilter({ ruleCode: event.target.value, page: 1 })}>
-            <option value="">Усі правила</option>
-            {Object.entries(ruleLabels).map(([code, label]) => (
-              <option key={code} value={code}>{label}</option>
-            ))}
-          </select>
-        </label>
-      </div>
-      <div className="dashboard-panel-body">
-        <RequestState request={request} label="сигнали ризику" />
-        {request.data && (
-          <>
-            <p className="count dashboard-signal-count" role="status">Сигналів: {request.data.total}</p>
-            {request.data.items.length ? (
-              <ul className="dashboard-flags" role="list">
-                {request.data.items.map((item) => (
-                  <RiskFlag key={`${item.measureId}:${item.periodKey}:${item.ruleCode}`}
-                    item={item} periods={periods} onOpenMeasure={onOpenMeasure} />
-                ))}
-              </ul>
-            ) : <p className="empty">За цим фільтром сигналів немає.</p>}
-            <Pagination data={request.data} label="Сторінки сигналів"
-              onPageChange={(page) => setFilter({ ...filter, page })} />
-          </>
-        )}
-      </div>
-    </section>
+    <>
+      <section className="dashboard-panel dashboard-flags-panel" aria-labelledby="dashboard-flags-title">
+        <div className="dashboard-heading dashboard-panel-heading dashboard-flags-heading">
+          <h2 id="dashboard-flags-title">Сигнали ризику</h2>
+          {showDecisions && (
+            <label>
+              <span id="dashboard-flag-source-label">Джерело</span>
+              <select aria-labelledby="dashboard-flag-source-label" value={filter.source} onChange={(event) => {
+                setFilter({ source: event.target.value, ruleCode: "", page: 1 });
+              }}>
+                {Object.entries(flagSources).map(([source, label]) => <option key={source} value={source}>{label}</option>)}
+              </select>
+            </label>
+          )}
+          <label>
+            <span id="dashboard-flag-rule-label">Правило</span>
+            <select aria-labelledby="dashboard-flag-rule-label" value={filter.ruleCode} onChange={(event) => setFilter({ ...filter, ruleCode: event.target.value, page: 1 })}>
+              <option value="">Усі правила</option>
+              {Object.entries(labels).map(([code, label]) => (
+                <option key={code} value={code}>{filter.source === "official" ? `${code} · ` : ""}{label}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div className="dashboard-panel-body">
+          <RequestState request={request} label="сигнали ризику" />
+          {request.data && (
+            <>
+              {request.data.archive && <p className="count">
+                {periodLabel(request.data.archive.periodKey, periods)} · станом на {formatDate(request.data.archive.asOf)}
+              </p>}
+              <p className="count dashboard-signal-count" role="status">Сигналів: {request.data.total}</p>
+              {request.data.items.length ? (
+                <ul className="dashboard-flags" role="list">
+                  {request.data.items.map((item) => (
+                    <RiskFlag key={decisionKey(filter.source, item)}
+                      item={item} source={filter.source} periods={periods} onOpenMeasure={onOpenMeasure}
+                      onOpenSubject={onOpenSubject} canOpenRisk={canOpenRisk}>
+                      {renderDecision?.(filter.source, item)}
+                    </RiskFlag>
+                  ))}
+                </ul>
+              ) : <p className="empty">{request.data.archive === null
+                ? "Для цієї програми немає архівного зрізу."
+                : "За цим фільтром сигналів немає."}</p>}
+              <Pagination data={request.data} label="Сторінки сигналів"
+                onPageChange={(page) => setFilter({ ...filter, page })} />
+            </>
+          )}
+        </div>
+      </section>
+    </>
   );
 }
 
-function RiskFlag({ item, periods, onOpenMeasure }) {
-  const title = ruleLabels[item.ruleCode] || "Сигнал ризику";
+function decisionKey(source, item) {
+  return [source, item.subjectType ?? "measure", item.subjectId ?? item.measureId, item.periodKey, item.ruleCode].join(":");
+}
+
+function RiskDecisions(props) {
+  const { api, scope, periods } = props;
+  const [notice, setNotice] = useState("");
+  const [page, setPage] = useState(1);
+  const query = new URLSearchParams({ ...scope, page: String(page) });
+  const request = useDashboardQuery(api, `/risk-flag-decisions?${query}`);
+  const data = request.data ?? request.previousData;
+  const decisions = new Map((data?.items ?? []).map((item) => [decisionKey(item.source, item), item]));
+
+  return (
+    <>
+      <RiskFlagList {...props} renderDecision={(source, item) => {
+        const recorded = decisions.get(decisionKey(source, item));
+        if (!data?.canDecide && !recorded) return null;
+        const key = {
+          programId: scope.programId, source, ruleCode: item.ruleCode,
+          subjectType: item.subjectType ?? "measure", subjectId: item.subjectId ?? item.measureId,
+          periodKey: item.periodKey,
+        };
+        return <FlagDecisionEditor api={api} signalKey={key} suggestion={item.suggestedAction}
+          canDecide={Boolean(data?.canDecide)} recorded={recorded} onSave={() => {
+            setNotice("Рішення зафіксовано.");
+            setPage(1);
+            request.retry();
+          }} />;
+      }} />
+      <section className="dashboard-panel dashboard-decisions" aria-labelledby="dashboard-decisions-title">
+        <h2 id="dashboard-decisions-title">Управлінські рішення</h2>
+        {notice && <p className="access-notice" role="status">{notice}</p>}
+        <RequestState request={request} label="управлінські рішення" />
+        {request.data && (request.data.items.length > 0 ? (
+          <ul className="dashboard-decision-list">
+            {request.data.items.map((item) => (
+              <li key={item.id}>
+                <h3>{item.signal.code} · {item.signal.title}</h3>
+                <p className="count">{flagSources[item.source]} · {periodLabel(item.periodKey, periods)}</p>
+                <DecisionDetails item={item} />
+              </li>
+            ))}
+          </ul>
+        ) : <p className="empty">У цьому поданні ще немає зафіксованих рішень.</p>)}
+        {request.data?.pageSize && <Pagination data={request.data} label="Сторінки рішень" onPageChange={setPage} />}
+      </section>
+    </>
+  );
+}
+
+function DecisionDetails({ item }) {
+  return (
+    <dl className="dashboard-decision-details">
+      <dt>Дія</dt><dd>{item.action}</dd>
+      <dt>Відповідальний</dt><dd>{item.assigneeName}</dd>
+      <dt>Строк</dt><dd><time dateTime={item.dueDate}>{formatDate(item.dueDate)}</time></dd>
+      <dt>Зафіксував</dt><dd>{item.deciderName}</dd>
+    </dl>
+  );
+}
+
+function FlagDecisionEditor({ api, signalKey, suggestion, canDecide, recorded, onSave }) {
+  const [editor, setEditor] = useState(null);
+  const [record, setRecord] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const decision = record ?? recorded;
+
+  async function open() {
+    setError(null);
+    setBusy(true);
+    try {
+      const data = await api(`/risk-flag-decisions/assignees?${new URLSearchParams(signalKey)}`);
+      setEditor(data);
+      if (data.decision) setRecord(data.decision);
+    } catch (cause) {
+      setError(cause);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function save(event) {
+    event.preventDefault();
+    if (busy) return;
+    const payload = Object.fromEntries(new FormData(event.currentTarget));
+    setError(null);
+    setBusy(true);
+    try {
+      const saved = await api("/risk-flag-decisions", {
+        method: "PUT",
+        body: JSON.stringify({
+          ...signalKey, ...payload, version: editor.decision?.version ?? 0, signalVersion: editor.signalVersion,
+        }),
+      });
+      setRecord(saved);
+      setEditor(null);
+      onSave();
+    } catch (cause) {
+      setError(cause);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="dashboard-flag-decision">
+      {decision && !editor && <DecisionDetails item={decision} />}
+      {!editor && canDecide && (
+        <button type="button" className="secondary" disabled={busy} onClick={open}>
+          {busy ? "Завантаження…" : decision ? "Змінити рішення" : "Зафіксувати рішення"}
+        </button>
+      )}
+      {editor && (
+        <form onSubmit={save}>
+          <fieldset disabled={busy}>
+            <label>
+              Управлінська дія
+              <textarea name="action" required maxLength={2000} rows={3} autoFocus
+                defaultValue={editor.decision?.action ?? suggestion ?? ""} />
+            </label>
+            <div className="form-grid">
+              <label>
+                Відповідальний
+                <select name="assigneeId" required defaultValue={editor.decision?.assigneeId ?? ""}>
+                  <option value="">Оберіть відповідального</option>
+                  {editor.items.map(({ id, displayName }) => <option key={id} value={id}>{displayName}</option>)}
+                </select>
+              </label>
+              <label>
+                Строк виконання
+                <input name="dueDate" type="date" required min={kyivToday()}
+                  defaultValue={editor.decision?.dueDate ?? ""} />
+              </label>
+            </div>
+          </fieldset>
+          <div className="actions">
+            <button disabled={busy || !editor.items.length}>{busy ? "Зберігаємо…" : "Зберегти рішення"}</button>
+            <button type="button" className="secondary" disabled={busy}
+              onClick={() => { setEditor(null); setError(null); }}>Скасувати</button>
+          </div>
+          {!editor.items.length && <p className="count">У цьому підрозділі немає активних відповідальних користувачів.</p>}
+        </form>
+      )}
+      {error && <p className="error" role="alert">{error.message}</p>}
+    </div>
+  );
+}
+
+function RiskFlag({ item, source, periods, onOpenMeasure, onOpenSubject, canOpenRisk, children }) {
+  const title = source === "official"
+    ? `${item.ruleCode} · ${officialRuleLabels[item.ruleCode]}`
+    : ruleLabels[item.ruleCode] ?? item.ruleCode;
   const sourceValues = item.sourceValues ?? {};
   const sources = Object.entries(sourceLabels).filter(([key]) => sourceValues[key] != null);
+  const subject = { type: item.subjectType ?? "measure", id: item.subjectId ?? item.measureId };
   return (
     <li>
       <details>
@@ -503,9 +730,16 @@ function RiskFlag({ item, periods, onOpenMeasure }) {
           {item.suggestedAction && (
             <p><strong>Рекомендована дія:</strong> {item.suggestedAction}</p>
           )}
-          <button type="button" className="link" onClick={() => onOpenMeasure(item)}>
-            {item.code} · {item.title}
-          </button>
+          {item.measureId ? (
+            <button type="button" className="link" onClick={() => onOpenMeasure({ ...item, source })}>
+              Відкрити захід {item.code}
+            </button>
+          ) : onOpenSubject && (subject.type !== "risk" || canOpenRisk) && (
+            <button type="button" className="link" onClick={() => onOpenSubject(subject)}>
+              {subject.type === "risk" ? "Відкрити ризик" : "Відкрити огляд підрозділу"} {item.code}
+            </button>
+          )}
+          {children}
         </div>
       </details>
     </li>
@@ -513,8 +747,8 @@ function RiskFlag({ item, periods, onOpenMeasure }) {
 }
 
 function SourceValue({ field, label, value }) {
-  const displayedValue = ["deadline", "today"].includes(field)
-    ? formatDate(value)
-    : sourceValueLabels[field]?.[value] ?? value;
+  const displayedValue = typeof value === "boolean" ? (value ? "Так" : "Ні")
+    : typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) ? formatDate(value)
+      : sourceValueLabels[field]?.[value] ?? String(value);
   return <><dt>{label}</dt><dd>{displayedValue}</dd></>;
 }

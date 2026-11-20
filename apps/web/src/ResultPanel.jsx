@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { measurePeriods } from "./measure-schedule.js";
-import { kyivToday } from "./periods.js";
+import { formatRegistryDate, kyivToday } from "./periods.js";
 import { hasPermission } from "./permissions.js";
 import "./results.css";
 
@@ -55,6 +55,38 @@ function RequestError({ error, onRetry }) {
   );
 }
 
+const officialStatuses = {
+  vykonano: "Виконано",
+  chastkovo: "Виконано частково",
+  ne_vykonano: "Не виконано",
+  v_roboti: "У роботі",
+  ne_rozpochato: "Не розпочато",
+};
+
+export function OfficialMeasureResult({ result }) {
+  const year = result.periodKey.slice(0, 4);
+  const half = result.periodKey.endsWith("H1") ? "І півріччя" : "ІІ півріччя";
+  return (
+    <section className="result-panel" aria-label="Архівний результат">
+      <header className="result-panel-heading">
+        <div>
+          <h3>Архівний результат</h3>
+          <p className="result-muted">Зріз організаторів · {year}, {half} · <time dateTime={result.asOf}>{formatRegistryDate(result.asOf)}</time></p>
+        </div>
+      </header>
+      <dl className="inspector-facts">
+        <dt>Стан у джерелі</dt><dd>{officialStatuses[result.status] ?? result.status}</dd>
+        <dt>Погодження у джерелі</dt><dd>{result.markedApproved ? "Позначено погодженим" : "Без позначки погодження"}</dd>
+        {result.actualDate && <><dt>Фактична дата</dt><dd>{formatRegistryDate(result.actualDate)}</dd></>}
+        {result.actual != null && <><dt>Факт і ціль</dt><dd>{result.actual} / {result.target ?? "—"} {result.unit}</dd></>}
+        <dt>Опис</dt><dd>{result.description || "Відсутній"}</dd>
+        <dt>Підтвердження в архіві</dt>
+        <dd>{result.evidence.length ? <ul>{result.evidence.map((title, index) => <li key={index}>{title}</li>)}</ul> : "Відсутні"}</dd>
+      </dl>
+    </section>
+  );
+}
+
 export function ResultPanel({ measure, program, user, options, api, onPlanLockChange, sourceResultId }) {
   const periods = measurePeriods(measure, program);
   const today = kyivToday();
@@ -64,12 +96,23 @@ export function ResultPanel({ measure, program, user, options, api, onPlanLockCh
       activePeriod?.key || (today < periods[0]?.start ? periods[0]?.key : periods.at(-1)?.key),
   );
   const period = periods.find((item) => item.key === periodKey);
+  const expectedEvidence = measure.expectedEvidence || (hasPermission(user, "workflow.submit", user.role === "executor")
+    ? "Для повного або часткового виконання додайте файл, що підтверджує описаний результат."
+    : null);
   return (
     <section className="result-panel" aria-label="Результат виконання заходу">
       <header className="result-panel-heading">
         <div>
           <h3>Результат виконання</h3>
           <p className="result-measure-title">{measure.title}</p>
+          {period?.deadline && (
+            <p className="result-muted result-plan-note">
+              Контрольний строк <time dateTime={period.deadline}>{formatRegistryDate(period.deadline)}</time>
+            </p>
+          )}
+          {expectedEvidence && (
+            <p className="result-muted result-plan-note"><strong>Що додати як доказ</strong> {expectedEvidence}</p>
+          )}
         </div>
         {periods.length > 1 && (
           <label className="result-period">
