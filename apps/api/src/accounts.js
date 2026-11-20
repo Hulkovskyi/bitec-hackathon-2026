@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from "no
 import { promisify } from "node:util";
 import { adaptDatabase, databaseConstraintKind } from "./database.js";
 import { rolePermissions } from "./permissions.js";
-import { audit, missing } from "./registry.js";
+import { audit, forbidden, missing } from "./registry.js";
 import { ApiError, invalid, keys, text, uuid } from "./validation.js";
 
 const cookieName = "dacm_session";
@@ -99,7 +99,7 @@ async function startSession(db, req, res, options, userId, kind, verifiedPasswor
     .status(201).json({ userId });
 }
 
-function rateLimit(requests, windowMs) {
+function rateLimit(requests, windowMs, clientKey = (req) => req.ip) {
   const clients = new Map();
   let nextCleanup = 0;
   return (req, res, next) => {
@@ -110,7 +110,7 @@ function rateLimit(requests, windowMs) {
       }
       nextCleanup = now + windowMs;
     }
-    const client = req.ip;
+    const client = clientKey(req);
     let entry = clients.get(client);
     if (!entry || entry.until <= now) {
       entry = { count: 0, until: now + windowMs };
@@ -253,6 +253,40 @@ export function mountSessionRoutes(app, db, options) {
     }
     if (!req.user) throw new ApiError(401, "unauthenticated", "Увійдіть у систему");
     next();
+  });
+  app.post("/api/auth/password", rateLimit(10, 10 * 60_000, (req) => req.user.id), async (req, res) => {
+    if (req.user.authKind !== "password") forbidden();
+    keys(req.query, []);
+    const fields = ["currentPassword", "newPassword"];
+    keys(req.body, fields, fields);
+    const currentPassword = validateAccountPassword(req.body.currentPassword, 1);
+    const newPassword = validateAccountPassword(req.body.newPassword);
+    if (Buffer.from(currentPassword).equals(Buffer.from(newPassword))) {
+      invalid("Новий пароль має відрізнятися від поточного");
+    }
+    const id = req.user.id;
+    const sessionHash = digest(tokenFrom(req));
+    const current = await db.prepare("SELECT password_hash FROM credential_accounts WHERE user_id=?").get(id);
+    if (!(await passwordMatches(currentPassword, current?.password_hash)) || !current) {
+      throw new ApiError(401, "invalid_credentials", "Невірний поточний пароль");
+    }
+    const replacementHash = await passwordHash(newPassword);
+    await db.transaction(async (tx) => {
+      const { changes } = await tx.prepare(`
+        UPDATE credential_accounts SET password_hash=?
+        WHERE user_id=? AND password_hash=? AND status='approved'
+          AND EXISTS (SELECT 1 FROM users u WHERE u.id=credential_accounts.user_id AND u.active=1)
+          AND EXISTS (
+            SELECT 1 FROM account_sessions s
+            WHERE s.user_id=credential_accounts.user_id AND s.id_hash=? AND s.expires_at>?
+          )
+      `).run(replacementHash, id, current.password_hash, sessionHash, new Date().toISOString());
+      if (changes !== 1) throw new ApiError(409, "password_changed", "Пароль або сеанс уже змінився. Увійдіть знову");
+      await tx.prepare("DELETE FROM account_sessions WHERE user_id=?").run(id);
+      await tx.prepare("DELETE FROM sessions WHERE user_id=?").run(id);
+      await audit(tx, id, "change_password", "account", id, null, null);
+    });
+    res.clearCookie(cookieName, cookieOptions(req, options)).status(204).end();
   });
   app.delete("/api/session", async (req, res) => {
     await db.transaction((tx) => deleteSession(tx, tokenFrom(req)));

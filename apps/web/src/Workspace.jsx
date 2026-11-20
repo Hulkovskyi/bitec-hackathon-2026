@@ -1,3 +1,5 @@
+import { useRef, useState } from "react";
+import { PasswordChange } from "./PasswordChange.jsx";
 import { hasPermission } from "./permissions.js";
 
 const glyphs = {
@@ -64,10 +66,21 @@ export function SignIn({ title, children }) {
 }
 
 export function Workspace({
-  user, role, logout, busy, programPicker, activeView, onNavigate,
+  user, role, logout, changePassword, busy, programPicker, activeView, onNavigate,
   programNavigation = true, manageAccess = false, importRegistry = false, children,
 }) {
+  const account = useRef(null);
+  const summary = useRef(null);
+  const [changingPassword, setChangingPassword] = useState(false);
   const initials = user.displayName.split(/\s+/).slice(0, 2).map((part) => part[0]).join("");
+  function openPasswordChange() {
+    account.current.open = false;
+    setChangingPassword(true);
+  }
+  function closePasswordChange() {
+    setChangingPassword(false);
+    summary.current?.focus();
+  }
   return (
     <div className="workspace">
       <a className="skip-link" href="#workspace-content">До вмісту</a>
@@ -104,8 +117,8 @@ export function Workspace({
         <header className="workspace-topbar">
           {programPicker}
           <div className="workspace-tools">
-            <details className="workspace-account">
-              <summary aria-label={`Обліковий запис · ${user.displayName} · ${role}`}>
+            <details className="workspace-account" ref={account}>
+              <summary ref={summary} aria-label={`Обліковий запис · ${user.displayName} · ${role}`}>
                 <span className="account-avatar" aria-hidden="true">{initials}</span>
                 <span className="account-name"><strong>{user.displayName}</strong><span>{role}</span></span>
                 <Glyph name="chevron" size={16} />
@@ -119,12 +132,18 @@ export function Workspace({
                     <dt>Керівник</dt><dd>{user.profile.managerName ?? "—"}</dd>
                   </dl>
                 )}
+                {changePassword && !changingPassword && (
+                  <button type="button" className="secondary" onClick={openPasswordChange} disabled={busy}>Змінити пароль</button>
+                )}
                 <button type="button" className="secondary" onClick={logout} disabled={busy}>Вийти</button>
               </div>
             </details>
           </div>
         </header>
-        <main id="workspace-content" className="workspace-content">{children}</main>
+        <main id="workspace-content" className="workspace-content">
+          {changingPassword && <PasswordChange onSave={changePassword} onCancel={closePasswordChange} />}
+          {children}
+        </main>
       </div>
     </div>
   );

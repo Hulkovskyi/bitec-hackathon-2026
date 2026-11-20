@@ -197,6 +197,12 @@ test("synthetic demo users cannot provision accounts or impersonate credential a
   assert.equal(demo.status, 201);
   assert.equal((await request("/admin/access", { cookie: demo.cookie })).status, 403);
   assert.equal((await provision(enrollment, demo.cookie)).status, 403);
+  const password = await request("/auth/password", {
+    method: "POST", cookie: demo.cookie,
+    body: { currentPassword: employee.password, newPassword: "synthetic-new-passphrase" },
+  });
+  assert.equal(password.status, 403);
+  assert.equal(password.data.error.code, "forbidden");
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM credential_accounts").get().n, 1);
 });
 
@@ -224,4 +230,100 @@ test("legacy applicants require approval and fresh login after self-service clos
   assert.equal(decision.status, 200);
   assert.equal((await request("/me", { cookie })).status, 401);
   assert.equal((await login(employee)).status, 201);
+});
+
+test("password change verifies the old secret, revokes only the owner's sessions and preserves access", async (t) => {
+  const { db, request, login, provision, enrollment } = await setup(t);
+  const adminSession = await login(administrator);
+  const created = await provision(enrollment, adminSession.cookie);
+  assert.equal(created.status, 201);
+  const userId = created.data.id;
+  const first = await login(employee);
+  const second = await login(employee);
+  assert.equal(first.status, 201);
+  assert.equal(second.status, 201);
+  assert.notEqual(first.cookie, second.cookie);
+
+  const storedHash = () => db.prepare("SELECT password_hash FROM credential_accounts WHERE user_id=?")
+    .get(userId).password_hash;
+  const audit = () => db.prepare("SELECT * FROM audit_events WHERE entity_id=? ORDER BY occurred_at,id").all(userId);
+  const beforeEvents = audit();
+  const previousHash = storedHash();
+  const newPassword = "synthetic-new-passphrase";
+  const change = (cookie, currentPassword, next) => request("/auth/password", {
+    method: "POST", cookie, body: { currentPassword, newPassword: next },
+  });
+
+  const anonymous = await change(undefined, employee.password, newPassword);
+  assert.equal(anonymous.status, 401);
+  const wrong = await change(first.cookie, "wrong-current-passphrase", newPassword);
+  assert.equal(wrong.status, 401);
+  assert.equal(wrong.data.error.code, "invalid_credentials");
+  for (const invalid of ["short", employee.password]) {
+    const rejected = await change(first.cookie, employee.password, invalid);
+    assert.equal(rejected.status, 400);
+    assert.equal(rejected.data.error.code, "validation_error");
+  }
+  assert.equal(storedHash(), previousHash);
+  assert.deepEqual(audit(), beforeEvents);
+  const beforeProfile = await request("/me", { cookie: first.cookie });
+  assert.equal(beforeProfile.status, 200);
+  assert.equal((await request("/me", { cookie: second.cookie })).status, 200);
+
+  const updated = await change(first.cookie, employee.password, newPassword);
+  assert.equal(updated.status, 204);
+  assert.match(updated.setCookie, /^dacm_session=;.*Expires=/i);
+  assert.match(updated.setCookie, /HttpOnly/);
+  assert.match(updated.setCookie, /Secure/);
+  const nextHash = storedHash();
+  assert.notEqual(nextHash, previousHash);
+  assert.match(nextHash, /^[a-f0-9]{32}:[a-f0-9]{128}$/);
+  const afterEvents = audit();
+  const beforeIds = new Set(beforeEvents.map(({ id }) => id));
+  const addedEvents = afterEvents.filter(({ id }) => !beforeIds.has(id));
+  assert.equal(addedEvents.length, 1);
+  const [event] = addedEvents;
+  assert.equal(event.actor_id, userId);
+  assert.equal(event.action, "change_password");
+  assert.equal(event.entity_type, "account");
+  assert.equal(event.before_json, null);
+  assert.equal(event.after_json, null);
+  const auditText = JSON.stringify(addedEvents);
+  for (const secret of [employee.password, newPassword, previousHash, nextHash]) {
+    assert.ok(!auditText.includes(secret), "password material must stay outside the audit");
+  }
+
+  assert.equal((await request("/me", { cookie: first.cookie })).status, 401);
+  assert.equal((await request("/me", { cookie: second.cookie })).status, 401);
+  assert.equal((await request("/me", { cookie: adminSession.cookie })).status, 200);
+  assert.equal((await login(employee)).status, 401);
+  const signedIn = await login({ ...employee, password: newPassword });
+  assert.equal(signedIn.status, 201);
+  assert.deepEqual((await request("/me", { cookie: signedIn.cookie })).data, beforeProfile.data);
+});
+
+test("simultaneous password changes commit at most one new password", async (t) => {
+  const { db, request, login, admin } = await setup(t);
+  const first = await login(administrator);
+  const second = await login(administrator);
+  assert.equal(first.status, 201);
+  assert.equal(second.status, 201);
+  const auditCount = () => db.prepare("SELECT COUNT(*) AS n FROM audit_events WHERE entity_id=?").get(admin.id).n;
+  const before = auditCount();
+  const passwords = ["synthetic-first-new-secret", "synthetic-second-new-secret"];
+  const changes = await Promise.all([first.cookie, second.cookie].map((cookie, index) =>
+    request("/auth/password", {
+      method: "POST", cookie,
+      body: { currentPassword: administrator.password, newPassword: passwords[index] },
+    })));
+  const winner = changes.findIndex(({ status }) => status === 204);
+  assert.notEqual(winner, -1);
+  const rejected = changes[1 - winner];
+  // Both requests may read the same hash, or the second may be authenticated
+  // only after the first transaction has revoked its session.
+  assert.ok([401, 409].includes(rejected.status), JSON.stringify(rejected));
+  if (rejected.status === 409) assert.equal(rejected.data.error.code, "password_changed");
+  assert.equal(auditCount(), before + 1);
+  assert.equal((await login({ ...administrator, password: passwords[winner] })).status, 201);
+  assert.equal((await login({ ...administrator, password: passwords[1 - winner] })).status, 401);
 });

@@ -42,6 +42,27 @@
   color: var(--positive);
 }
 
+.sign-in-panel .access-notice {
+  color: var(--positive);
+}
+
+.account-menu > button + button {
+  margin-top: 8px;
+}
+
+.password-change {
+  max-width: 34rem;
+  margin-top: 0;
+}
+
+.password-change .account-switch {
+  margin-bottom: 0;
+}
+
+@media print {
+  .password-change { display: none; }
+}
+
 .access-filter-bar {
   display: flex;
   flex-wrap: wrap;

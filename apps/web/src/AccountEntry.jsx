@@ -1,7 +1,7 @@
 import { SignIn } from "./Workspace.jsx";
 import "./account.css";
 
-export function AccountEntry({ loading, error, onLogin }) {
+export function AccountEntry({ loading, error, notice, onLogin }) {
   function submit(event) {
     event.preventDefault();
     if (!loading) onLogin(Object.fromEntries(new FormData(event.currentTarget)));
@@ -9,6 +9,7 @@ export function AccountEntry({ loading, error, onLogin }) {
 
   return (
     <SignIn title="Вхід до системи">
+      {notice && <p className="access-notice" role="status">{notice}</p>}
       <form className="session-form" onSubmit={submit}>
         <label>
           Логін

@@ -44,6 +44,7 @@ function ErrorMessage({ error }) {
 }
 function App() {
   const [user, setUser] = useState(null);
+  const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(true),
     [error, setError] = useState(null);
   const [attempt, setAttempt] = useState(0);
@@ -103,6 +104,7 @@ function App() {
     setError(null);
     try {
       await api("/auth/login", { method: "POST", body: JSON.stringify(credentials) });
+      setNotice("");
       sessionChannel.current?.postMessage("changed");
       refreshSession();
     } catch (e) {
@@ -110,6 +112,18 @@ function App() {
       setLoading(false);
     }
   }
+  async function changePassword(credentials) {
+    try {
+      await api("/auth/password", { method: "POST", body: JSON.stringify(credentials) });
+    } catch (cause) {
+      if (cause.status === 401 && cause.code !== "invalid_credentials") refreshSession();
+      throw cause;
+    }
+    setNotice("Пароль змінено. Увійдіть із новим паролем.");
+    sessionChannel.current?.postMessage("changed");
+    refreshSession();
+  }
+
   async function logout() {
     setLoading(true);
     setError(null);
@@ -126,12 +140,12 @@ function App() {
   }
   const errorMessage = <ErrorMessage error={error} />;
   if (!user) {
-    return <AccountEntry loading={loading} error={errorMessage} onLogin={authenticate} />;
+    return <AccountEntry loading={loading} error={errorMessage} notice={notice} onLogin={authenticate} />;
   }
   return <Registry key={user.id} api={sessionApi} user={user}
-    logout={logout} busy={loading} sessionError={errorMessage} />;
+    logout={logout} changePassword={changePassword} busy={loading} sessionError={errorMessage} />;
 }
-function Registry({ api, user, logout, busy, sessionError }) {
+function Registry({ api, user, logout, changePassword, busy, sessionError }) {
   const manageAccess = user.authKind === "password" && user.role === "admin";
   const importRegistry = hasPermission(user, "registry.import", user.role === "admin");
   const [navigation, setNavigation] = useState(manageAccess ? "access" : null);
@@ -165,7 +179,7 @@ function Registry({ api, user, logout, busy, sessionError }) {
     </label>
   );
   const shell = {
-    user, role: user.roleName ?? roleNames[user.role], logout, busy, programPicker,
+    user, role: user.roleName ?? roleNames[user.role], logout, changePassword, busy, programPicker,
     manageAccess, importRegistry,
   };
   const program = programs?.find(({ id }) => id === programId);
