@@ -132,7 +132,7 @@ test("migration and explicit seed are repeatable without overwriting data", asyn
     assert.deepEqual(
       db.prepare("SELECT version FROM schema_migrations ORDER BY version")
         .all().map(({ version }) => version),
-      [1, 2, 3, 4, 5, 6, 7, 8],
+      [1, 2, 3, 4, 5, 6, 7, 8, 9],
     );
     assert.equal(db.prepare("PRAGMA foreign_keys").get().foreign_keys, 1);
   } finally {
@@ -440,7 +440,7 @@ test("create and patch: assignment, optimistic version, validation, immutable ac
   assert.deepEqual((await request(path, { cookie })).data, snapshot);
 });
 
-test("only an administrator can delete an unused measure and its indicator with an audit record", async (t) => {
+test("only an administrator can delete a measure with a current version and record it in the audit", async (t) => {
   const { db, request, login } = await setup(t);
   const admin = await login(208);
   const coordinator = await login(205);
@@ -473,39 +473,103 @@ test("only an administrator can delete an unused measure and its indicator with 
   const [event] = events;
   assert.equal(event.actor_id, id(208));
   assert.equal(event.entity_type, "measure");
-  assert.equal(JSON.parse(event.before_json).indicator.id, created.data.indicator.id);
+  assert.deepEqual(JSON.parse(event.before_json), { version: 1 });
   assert.equal(event.after_json, null);
 });
 
-test("measure deletion preserves results, period assignments and imported history", async (t) => {
+test("measure deletion removes an in-progress revision chain, evidence, assignments and source rows", async (t) => {
   const { db, request, login } = await setup(t);
   const admin = await login(208);
-  db.prepare(`
-    INSERT INTO results (id, measure_id, period_key, revision, executor_id, created_at, updated_at)
-    VALUES (?, ?, 'once', 1, ?, '2026-11-17', '2026-11-17')
-  `).run(id(701), id(501), id(201));
+  const insertResult = db.prepare(`
+    INSERT INTO results (id, measure_id, period_key, revision, supersedes_id, executor_id, status, created_at, updated_at)
+    VALUES (?, ?, 'once', ?, ?, ?, ?, '2026-11-17', '2026-11-17')
+  `);
+  insertResult.run(id(701), id(501), 1, null, id(201), "approved");
+  insertResult.run(id(702), id(501), 2, id(701), id(201), "submitted");
+  insertResult.run(id(703), id(502), 1, null, id(202), "draft");
   db.prepare("INSERT INTO period_assignments (measure_id, period_key, executor_id) VALUES (?, 'once', ?)")
-    .run(id(502), id(202));
+    .run(id(501), id(201));
+  db.prepare(`
+    INSERT INTO result_reviews (id,result_id,decision,actor_id,created_at,result_version)
+    VALUES (?,?,'approve',?,'2026-11-17',1)
+  `).run(id(704), id(701), id(205));
+  const insertEvidence = db.prepare(`
+    INSERT INTO evidence_versions (
+      id,result_id,logical_file_id,revision,original_name,storage_key,media_type,byte_size,sha256,uploaded_by,created_at
+    ) VALUES (?,?,?,1,'synthetic.txt',?,'text/plain',1,?,?,'2026-11-17')
+  `);
+  insertEvidence.run(id(711), id(701), id(721), id(731), "a".repeat(64), id(201));
+  insertEvidence.run(id(712), id(703), id(722), id(732), "b".repeat(64), id(202));
   db.prepare(`
     INSERT INTO official_dataset_batches (program_id, source_period, source_as_of, source_hash, imported_at)
     VALUES (?, '2026-H1', '2026-07-06', ?, '2026-07-06')
   `).run(id(1), "a".repeat(64));
-  db.prepare(`
+  const insertSourceMeasure = db.prepare(`
     INSERT INTO official_measure_metadata (
       measure_id, program_id, section_order, plan_text, source_schedule_type, source_title, source_department_id,
       source_department_title, source_section_code, indicator_title, expected_evidence, resources
-    ) VALUES (?, ?, 1, 'Навчальний план', 'continuous', 'Архівний захід', ?, 'Навчальний підрозділ', 3, 'Індикатор', '', '')
-  `).run(id(503), id(1), id(102));
+    ) VALUES (?, ?, ?, 'Навчальний план', 'continuous', 'Архівний захід', ?, 'Навчальний підрозділ', 3, 'Індикатор', '', '')
+  `);
+  insertSourceMeasure.run(id(501), id(1), 1, id(101));
+  insertSourceMeasure.run(id(503), id(1), 2, id(102));
+  db.prepare(`
+    INSERT INTO official_measure_results (measure_id,program_id,source_period,source_status,source_approved,description)
+    VALUES (?,?,'2026-H1','v_roboti',0,'Навчальний результат')
+  `).run(id(501), id(1));
+  db.prepare(`
+    INSERT INTO official_evidence_claims (
+      id,measure_id,program_id,source_id,title,kind,document_date,source_uploaded_at,source_user_id,source_checksum
+    ) VALUES (?,?,?,'source-1','Навчальний доказ','file','2026-06-30','2026-06-30',?,?)
+  `).run(id(741), id(501), id(1), id(201), "a".repeat(64));
+  db.prepare(`
+    INSERT INTO official_deadline_changes (
+      id,measure_id,program_id,decision_date,old_deadline,new_deadline,reason,source_user_id
+    ) VALUES (?,?,?,'2026-05-01','2026-05-31','2026-06-30','Навчальна зміна',?)
+  `).run(id(742), id(501), id(1), id(205));
+  const indicatorId = db.prepare("SELECT id FROM indicators WHERE measure_id=?").get(id(501)).id;
+  const auditRows = [
+    ["measure", id(501)], ["period_assignment", id(501)], ["result", id(701)],
+    ["result", id(702)], ["result_review", id(704)], ["evidence", id(711)], ["indicator", indicatorId],
+    ["registry", id(750)], ["result", id(703)], ["evidence", id(712)],
+  ];
+  const insertAudit = db.prepare(`
+    INSERT INTO audit_events (id,actor_id,action,entity_type,entity_id,after_json,occurred_at)
+    VALUES (?,?,'create',?,?,'"Навчальний запис"','2026-11-17')
+  `);
+  for (const [kind, entity] of auditRows) insertAudit.run(randomUUID(), id(208), kind, entity);
+  const remove = (n) => request("/api/measures/" + id(n), {
+    method: "DELETE", cookie: admin, body: { version: 1 },
+  });
 
-  const before = counts(db);
-  for (const n of [501, 502, 503]) {
-    const response = await request("/api/measures/" + id(n), {
-      method: "DELETE", cookie: admin, body: { version: 1 },
-    });
-    assert.equal(response.status, 409);
-    assert.equal(response.data.error.code, "measure_in_use");
+  db.exec(`
+    CREATE TRIGGER fail_purge_audit BEFORE INSERT ON audit_events
+    WHEN NEW.action='delete' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;
+  `);
+  assert.equal((await remove(501)).status, 500);
+  assert.ok(db.prepare("SELECT id FROM results WHERE id=?").get(id(702)));
+  assert.ok(db.prepare("SELECT id FROM evidence_versions WHERE id=?").get(id(711)));
+  assert.equal(db.prepare("SELECT count(*) AS n FROM evidence_deletions").get().n, 0);
+  db.exec("DROP TRIGGER fail_purge_audit");
+
+  assert.equal((await remove(501)).status, 204);
+  for (const table of [
+    "results", "period_assignments", "official_measure_metadata",
+    "official_measure_results", "official_evidence_claims", "official_deadline_changes",
+  ]) {
+    assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table} WHERE measure_id=?`).get(id(501)).n, 0);
   }
-  assert.deepEqual(counts(db), before);
+  assert.equal(db.prepare("SELECT id FROM evidence_versions WHERE id=?").get(id(711)), undefined);
+  assert.equal(db.prepare("SELECT id FROM result_reviews WHERE id=?").get(id(704)), undefined);
+  assert.ok(db.prepare("SELECT id FROM evidence_versions WHERE id=?").get(id(712)));
+  assert.ok(db.prepare("SELECT program_id FROM official_dataset_batches WHERE program_id=?").get(id(1)));
+  assert.ok(db.prepare("SELECT id FROM measures WHERE id=?").get(id(502)));
+  assert.equal(db.prepare("SELECT count(*) AS n FROM audit_events WHERE action='create'").get().n, 3);
+
+  assert.equal((await remove(503)).status, 204);
+  assert.equal(db.prepare("SELECT program_id FROM official_dataset_batches WHERE program_id=?").get(id(1)), undefined);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM programs").get().n, 2);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM departments").get().n, 3);
+  assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
 });
 
 test("import is create-only, bounded, validated, admin-only and fully transactional", async (t) => {

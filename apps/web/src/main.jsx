@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { AccountEntry } from "./AccountEntry.jsx";
 import { AdminAccess } from "./AdminAccess.jsx";
 import { DeleteAction } from "./DeleteAction.jsx";
+import { EvidenceCleanup } from "./EvidenceCleanup.jsx";
 import { DepartmentAdmin } from "./DepartmentAdmin.jsx";
 import { HalfYearReport } from "./HalfYearReport.jsx";
 import { ProgramDashboard } from "./ProgramDashboard.jsx";
@@ -523,6 +524,9 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
   return (
     <Workspace {...shell} activeView={view} onNavigate={navigate}>
       {sessionError}
+      {shell.manageAccess && (view === "registry" || view === "departments") && (
+        <EvidenceCleanup api={api} revision={refresh} />
+      )}
       {view === "registry" && <header className="section-heading">
         <div>
           <h1 id="registry-title" tabIndex={-1}>Реєстр заходів</h1>
@@ -690,13 +694,15 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
                       : <button className="link" type="button" onClick={() => setEditing(true)}>Редагувати захід</button>
                   )}
                 </div>
-                {shell.manageAccess && <DeleteAction key={selected.id} label="Видалити захід"
-                  prompt={`Видалити захід «${selected.code}»?`} onDelete={async () => {
-                    await api(`/measures/${selected.id}`, { method: "DELETE", body: JSON.stringify({ version: selected.version }) });
+                {shell.manageAccess && <DeleteAction key={selected.id} label="Видалити захід" confirmLabel="Видалити назавжди"
+                  prompt={`Остаточно видалити захід «${selected.code}» та всі його результати, призначення й докази?`} onDelete={async () => {
+                    const outcome = await api(`/measures/${selected.id}`, { method: "DELETE", body: JSON.stringify({ version: selected.version }) });
                     setRefresh((value) => value + 1);
                     if (detailView.current !== deletionView) return;
                     clearDetail();
-                    setRegistryNotice(`Захід «${selected.code}» видалено.`);
+                    setRegistryNotice(outcome
+                      ? `Захід «${selected.code}» видалено. Файли доказів очікують очищення.`
+                      : `Захід «${selected.code}» видалено.`);
                     requestAnimationFrame(() => document.getElementById("registry-title")?.focus());
                   }} />}
               </article>

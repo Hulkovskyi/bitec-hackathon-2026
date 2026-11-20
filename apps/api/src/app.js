@@ -84,7 +84,28 @@ export function createApp(
   mountLoginRoutes(app, database, authOptions);
   mountSessionRoutes(app, database, authOptions);
   mountAccountAdminRoutes(app, database);
-  mountDepartmentAdminRoutes(app, database);
+  async function finishDeletion(res) {
+    let pendingEvidence;
+    try {
+      pendingEvidence = await evidence.drainDeletions();
+    } catch {
+      // The record deletion has already committed. Preserve the pending queue.
+      return res.status(202).json({ pendingEvidence: null });
+    }
+    return pendingEvidence
+      ? res.status(202).json({ pendingEvidence })
+      : res.status(204).end();
+  }
+  app.get("/api/admin/evidence-deletions", async (req, res) => {
+    keys(req.query, []);
+    res.json({ pendingEvidence: await evidence.pendingDeletions() });
+  });
+  app.post("/api/admin/evidence-deletions/retry", async (req, res) => {
+    keys(req.query, []);
+    if (req.body !== undefined) keys(req.body, []);
+    return finishDeletion(res);
+  });
+  mountDepartmentAdminRoutes(app, database, { finishDeletion });
   mountCatalogAdminRoutes(app, database);
   app.get("/api/programs", async (req, res) => {
     keys(req.query, []);
@@ -226,7 +247,7 @@ export function createApp(
     keys(req.query, []);
     keys(req.body, ["version"], ["version"]);
     await deleteMeasure(database, req.user, uuid(req.params.id), req.body.version);
-    res.status(204).end();
+    return finishDeletion(res);
   });
   app.get("/api/measures/:id/audit", async (req, res) => {
     const body = await database.transaction(async (database) => {

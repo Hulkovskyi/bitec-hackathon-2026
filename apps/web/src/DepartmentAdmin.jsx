@@ -52,8 +52,8 @@ export function DepartmentAdmin({ api, program, departments, onChange }) {
 
   async function deleteDepartment(id) {
     setNotice("");
-    await api(`${path}/${id}`, { method: "DELETE" });
-    setNotice("Підрозділ видалено.");
+    const outcome = await api(`${path}/${id}`, { method: "DELETE" });
+    setNotice(outcome ? "Підрозділ видалено. Файли доказів очікують очищення." : "Підрозділ видалено.");
     onChange();
   }
 
@@ -77,7 +77,8 @@ export function DepartmentAdmin({ api, program, departments, onChange }) {
                   <div className="account-switch">
                     <button type="button" className="secondary" disabled={busy}
                       onClick={() => open({ type: "edit", id: department.id })}>Редагувати</button>
-                    <DeleteAction label="Видалити підрозділ" prompt={`Видалити «${department.title}»?`}
+                    <DeleteAction label="Видалити підрозділ" confirmLabel="Видалити назавжди"
+                      prompt={`Остаточно видалити «${department.title}» з його заходами, результатами, доказами й призначеними доступами?`}
                       onDelete={() => deleteDepartment(department.id)} />
                   </div>
                 )}

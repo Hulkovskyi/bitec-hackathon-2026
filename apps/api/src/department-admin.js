@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { verifyAdministrator } from "./account-admin.js";
+import { purgeMeasureRows } from "./measure-purge.js";
 import { audit, missing, programAllowed } from "./registry.js";
-import { ApiError, keys, text, uuid } from "./validation.js";
+import { keys, text, uuid } from "./validation.js";
 
 const path = "/api/admin/programs/:programId/departments";
 const departmentFields = ["code", "title"];
@@ -20,7 +21,7 @@ async function findDepartment(db, programId, departmentId) {
   return department ?? missing();
 }
 
-export function mountDepartmentAdminRoutes(app, db) {
+export function mountDepartmentAdminRoutes(app, db, { finishDeletion = (res) => res.status(204).end() } = {}) {
   app.post(path, async (req, res) => {
     const input = departmentInput(req);
     const programId = uuid(req.params.programId);
@@ -59,18 +60,35 @@ export function mountDepartmentAdminRoutes(app, db) {
     const id = uuid(req.params.departmentId);
     await db.transaction(async (tx) => {
       await verifyAdministrator(tx, req.user.id);
-      const before = await findDepartment(tx, programId, id);
-      try {
-        await tx.prepare("DELETE FROM departments WHERE program_id=? AND id=?").run(programId, id);
-      } catch (error) {
-        if (["23001", "23503"].includes(error.code) || error.errcode === 787 ||
-            (error.errcode === 1811 && error.message === "FOREIGN KEY constraint failed")) {
-          throw new ApiError(409, "department_in_use", "Підрозділ пов’язаний із заходами, доступами або історичними записами.");
-        }
-        throw error;
-      }
-      await audit(tx, req.user.id, "delete", "department", id, before, null);
+      await findDepartment(tx, programId, id);
+      const measureIds = (await tx.prepare(`
+        SELECT id FROM measures WHERE department_id=?
+        UNION
+        SELECT measure_id FROM official_measure_metadata WHERE source_department_id=?
+      `).all(id, id)).map((row) => row.id);
+      const { measures } = await purgeMeasureRows(tx, measureIds);
+      const scopes = await tx.prepare("DELETE FROM user_scopes WHERE program_id=? AND department_id=?").run(programId, id);
+      await tx.prepare(`
+        UPDATE program_passports SET coordinator_department_id=NULL
+        WHERE program_id=? AND coordinator_department_id=?
+      `).run(programId, id);
+      const ownedRisks = "SELECT risk_id FROM risk_indicators WHERE program_id=? AND owner_department_id=?";
+      await tx.prepare(`
+        DELETE FROM audit_events
+        WHERE (entity_type IN ('department','departments') AND entity_id=?)
+          OR (entity_type='scopes' AND entity_id LIKE ('%/' || ? || '/' || ?))
+          OR (entity_type='risk_indicator' AND entity_id IN (${ownedRisks}))
+          OR (entity_type='risk_measurement' AND entity_id IN (
+            SELECT id FROM risk_measurements WHERE risk_id IN (${ownedRisks})
+          ))
+      `).run(id, programId, id, programId, id, programId, id);
+      const readings = await tx.prepare(`DELETE FROM risk_measurements WHERE risk_id IN (${ownedRisks})`).run(programId, id);
+      const indicators = await tx.prepare("DELETE FROM risk_indicators WHERE program_id=? AND owner_department_id=?").run(programId, id);
+      await tx.prepare("DELETE FROM departments WHERE program_id=? AND id=?").run(programId, id);
+      await audit(tx, req.user.id, "delete", "department", id, {
+        measures, scopes: scopes.changes, riskIndicators: indicators.changes, riskMeasurements: readings.changes,
+      }, null);
     });
-    res.status(204).end();
+    return finishDeletion(res);
   });
 }
