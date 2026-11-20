@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { roleNames } from "./permissions.js";
 import "./account.css";
 
-const tabs = { applications: "Заявки", accounts: "Облікові записи", roles: "Ролі" };
+const tabs = { accounts: "Облікові записи", roles: "Ролі", applications: "Заявки" };
 const statuses = { pending: "На розгляді", approved: "Схвалено", rejected: "Відхилено" };
 const dateTime = new Intl.DateTimeFormat("uk-UA", {
   dateStyle: "medium", timeStyle: "short", timeZone: "Europe/Kyiv",
@@ -21,18 +21,20 @@ function EditorActions({ busy, incomplete, onCancel, label }) {
   );
 }
 
-function AccessAssignment({ account, roles, departments, approval, busy, error, onSave, onCancel }) {
-  const [roleId, setRoleId] = useState(approval ? "" : account.roleId ?? "");
-  const [departmentIds, setDepartmentIds] = useState(approval ? [] : account.departmentIds);
+function AccessAssignment({ account, roles, departments, label, busy, error, onSave, onCancel, children }) {
+  const [roleId, setRoleId] = useState(account?.roleId ?? "");
+  const [departmentIds, setDepartmentIds] = useState(account?.departmentIds ?? []);
   const adminRole = roles.find(({ id }) => id === roleId)?.baseRole === "admin";
 
   function submit(event) {
     event.preventDefault();
-    onSave({ roleId, departmentIds: adminRole ? [] : departmentIds });
+    const fields = Object.fromEntries(new FormData(event.currentTarget));
+    onSave({ ...fields, roleId, departmentIds: adminRole ? [] : departmentIds });
   }
 
   return (
-    <form className="access-editor" onSubmit={submit}>
+    <form className="access-editor" onSubmit={submit} autoComplete="off">
+      {children}
       <label>
         Роль
         <select value={roleId} onChange={(event) => setRoleId(event.target.value)} required disabled={busy}>
@@ -60,9 +62,42 @@ function AccessAssignment({ account, roles, departments, approval, busy, error, 
         </fieldset>
       )}
       <ErrorMessage error={error} />
-      <EditorActions busy={busy} incomplete={!roleId}
-        onCancel={onCancel} label={approval ? "Схвалити заявку" : "Зберегти доступ"} />
+      <EditorActions busy={busy} incomplete={!roleId} onCancel={onCancel} label={label} />
     </form>
+  );
+}
+
+function AccountCreation({ managers, roles, departments, onSave, onCancel, busy, error }) {
+  return (
+    <div className="access-entry">
+      <h3>Новий обліковий запис</h3>
+      <AccessAssignment roles={roles} departments={departments} label="Створити обліковий запис"
+        onSave={onSave} onCancel={onCancel} busy={busy} error={error}>
+        <label>ПІБ<input name="fullName" maxLength={160} required disabled={busy} /></label>
+        <label>Підрозділ<input name="department" maxLength={160} required disabled={busy} /></label>
+        <label>Посада<input name="position" maxLength={160} required disabled={busy} /></label>
+        <label>
+          Керівник
+          <select name="managerId" defaultValue="" required disabled={busy}>
+            <option value="">Оберіть керівника</option>
+            {managers.map(({ id, fullName, username }) => (
+              <option key={id} value={id}>{fullName} · {username}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Логін
+          <input name="username" autoCapitalize="none" spellCheck={false}
+            minLength={3} maxLength={64} required disabled={busy} />
+        </label>
+        <label>
+          Пароль
+          <input name="password" type="password" autoComplete="new-password" aria-describedby="new-account-password-help"
+            minLength={12} maxLength={128} required disabled={busy} />
+        </label>
+        <p id="new-account-password-help" className="count">Від 12 до 128 символів</p>
+      </AccessAssignment>
+    </div>
   );
 }
 
@@ -151,6 +186,7 @@ function AccountList({ accounts, roles, departments, applications, currentUserId
             {role && (
               <dl className="account-profile">
                 <dt>Роль</dt><dd>{role.name}</dd>
+                <dt>Керівник</dt><dd>{account.managerName ?? "—"}</dd>
                 <dt>Доступ</dt><dd>{role.baseRole === "admin" ? "Усі програми й підрозділи" : scopeLabels.join(", ") || "—"}</dd>
               </dl>
             )}
@@ -158,8 +194,9 @@ function AccountList({ accounts, roles, departments, applications, currentUserId
               <RejectionEditor onCancel={() => onEdit(null)} busy={busy} error={error}
                 onSave={(reason) => onSave(applicationPath, "POST", { decision: "reject", reason }, "Заявку відхилено.")} />
             ) : editType ? (
-              <AccessAssignment key={editType} account={account} roles={roles} departments={departments}
-                approval={editType === "approve"} onCancel={() => onEdit(null)} busy={busy} error={error}
+              <AccessAssignment key={editType} account={editType === "assign" ? account : null}
+                roles={roles} departments={departments} label={editType === "approve" ? "Схвалити заявку" : "Зберегти доступ"}
+                onCancel={() => onEdit(null)} busy={busy} error={error}
                 onSave={(assignment) => editType === "approve"
                   ? onSave(applicationPath, "POST", { decision: "approve", ...assignment }, "Заявку схвалено.")
                   : onSave(`/admin/accounts/${account.id}`, "PATCH", assignment, "Доступ оновлено.")} />
@@ -223,7 +260,7 @@ function RoleList({ roles, permissions, editor, onEdit, onSave, busy, error }) {
 }
 
 export function AdminAccess({ api, currentUserId }) {
-  const [tab, setTab] = useState("applications");
+  const [tab, setTab] = useState("accounts");
   const [filter, setFilter] = useState("pending");
   const [editor, setEditor] = useState(null);
   const [data, setData] = useState(null);
@@ -270,6 +307,7 @@ export function AdminAccess({ api, currentUserId }) {
 
   const applications = tab === "applications";
   const accountStatus = applications ? filter : "approved";
+  const accounts = data?.accounts.filter(({ status }) => status === accountStatus);
   const editProps = { editor, onEdit: edit, onSave: save, busy, error: saveError };
   return (
     <section className="access-management" aria-labelledby="access-title">
@@ -304,7 +342,16 @@ export function AdminAccess({ api, currentUserId }) {
                 disabled={busy || Boolean(editor)}>Оновити заявки</button>
             </div>
           )}
-          <AccountList accounts={data.accounts.filter(({ status }) => status === accountStatus)}
+          {!applications && (editor?.type === "createAccount" ? (
+            <AccountCreation managers={accounts} roles={data.roles} departments={data.departments}
+              onSave={(value) => save("/admin/accounts", "POST", value, "Обліковий запис створено.")}
+              onCancel={() => edit(null)} busy={busy} error={saveError} />
+          ) : (
+            <button type="button" onClick={() => edit({ type: "createAccount" })} disabled={busy}>
+              Додати обліковий запис
+            </button>
+          ))}
+          <AccountList accounts={accounts}
             roles={data.roles} departments={data.departments} applications={applications}
             currentUserId={currentUserId} {...editProps} />
         </>

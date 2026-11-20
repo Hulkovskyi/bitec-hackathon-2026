@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto";
+import { accountManagerJoin, insertApprovedAccount, prepareAccountCredentials } from "./accounts.js";
 import { permissions, roleBases, rolePermissions } from "./permissions.js";
 import { audit, forbidden, missing } from "./registry.js";
 import { ApiError, choice, invalid, keys, text, uuid } from "./validation.js";
 
 const permissionKeys = new Set(permissions.map(({ key }) => key));
-const accountFields = `
+function accountSelect(db) {
+  return `SELECT
   a.user_id AS id,a.username,u.display_name AS fullName,a.department,a.position,a.status,
-  a.role_id AS roleId,a.submitted_at AS submittedAt,a.reviewed_at AS reviewedAt,a.decision_reason AS decisionReason
-`;
+  a.role_id AS roleId,a.submitted_at AS submittedAt,a.reviewed_at AS reviewedAt,a.decision_reason AS decisionReason,
+  manager.id AS managerId,manager.display_name AS managerName
+  FROM credential_accounts a JOIN users u ON u.id=a.user_id
+  ${accountManagerJoin(db)}`;
+}
 
 function roleView(row) {
   return {
@@ -29,7 +34,7 @@ async function verifyAdministrator(db, actorId) {
 
 async function accountForAdmin(db, accountId) {
   const account = await db.prepare(`
-    SELECT ${accountFields} FROM credential_accounts a JOIN users u ON u.id=a.user_id
+    ${accountSelect(db)}
     WHERE a.user_id=? AND a.status<>'draft'
   `).get(accountId);
   if (!account) missing();
@@ -50,11 +55,15 @@ async function assignedAccess(db, body) {
   return { role, departments };
 }
 
+async function addScopes(db, accountId, departments) {
+  const insertScope = db.prepare("INSERT INTO user_scopes (user_id,program_id,department_id) VALUES (?,?,?)");
+  for (const department of departments) await insertScope.run(accountId, department.program_id, department.id);
+}
+
 async function grantAccess(db, accountId, { role, departments }) {
   await db.prepare("UPDATE users SET role=?,active=1 WHERE id=?").run(role.base_role, accountId);
   await db.prepare("DELETE FROM user_scopes WHERE user_id=?").run(accountId);
-  const insertScope = db.prepare("INSERT INTO user_scopes (user_id,program_id,department_id) VALUES (?,?,?)");
-  for (const department of departments) await insertScope.run(accountId, department.program_id, department.id);
+  await addScopes(db, accountId, departments);
 }
 
 function roleFields(body) {
@@ -74,7 +83,7 @@ export function mountAccountAdminRoutes(app, db) {
     const result = await db.transaction(async (tx) => {
       await verifyAdministrator(tx, req.user.id);
       const accounts = await tx.prepare(`
-        SELECT ${accountFields} FROM credential_accounts a JOIN users u ON u.id=a.user_id
+        ${accountSelect(tx)}
         WHERE a.status<>'draft' ORDER BY a.username
       `).all();
       const scopes = await tx.prepare(`
@@ -96,6 +105,31 @@ export function mountAccountAdminRoutes(app, db) {
         roles, departments, permissions };
     }, { readOnly: true });
     res.json(result);
+  });
+
+  app.post("/api/admin/accounts", async (req, res) => {
+    keys(req.query, []);
+    const fields = ["fullName", "username", "password", "department", "position", "managerId", "roleId", "departmentIds"];
+    keys(req.body, fields, fields);
+    const managerId = uuid(req.body.managerId);
+    const credentials = await prepareAccountCredentials(req.body);
+    const created = await db.transaction(async (tx) => {
+      await verifyAdministrator(tx, req.user.id);
+      const manager = await tx.prepare(`
+        SELECT 1 FROM credential_accounts a JOIN users u ON u.id=a.user_id
+        WHERE a.user_id=? AND a.status='approved' AND u.active=1
+      `).get(managerId);
+      if (!manager) invalid("Оберіть чинного керівника зі списку облікових записів");
+      const { role, departments } = await assignedAccess(tx, req.body);
+      const id = await insertApprovedAccount(tx, credentials, {
+        roleId: role.id, baseRole: role.base_role, managerId, reviewedBy: req.user.id,
+      });
+      await addScopes(tx, id, departments);
+      const account = await accountForAdmin(tx, id);
+      await audit(tx, req.user.id, "create", "account", id, null, account);
+      return account;
+    });
+    res.status(201).json(created);
   });
 
   app.post("/api/admin/applications/:id/decision", async (req, res) => {
@@ -121,6 +155,7 @@ export function mountAccountAdminRoutes(app, db) {
           UPDATE credential_accounts SET status='rejected',reviewed_at=?,reviewed_by=?,decision_reason=? WHERE user_id=?
         `).run(reviewedAt, req.user.id, reason, id);
       }
+      await tx.prepare("DELETE FROM account_sessions WHERE user_id=?").run(id);
       const updated = await accountForAdmin(tx, id);
       await audit(tx, req.user.id, decision, "access_application", id, { status: account.status }, {
         status: updated.status, roleId: updated.roleId, departmentIds: updated.departmentIds, reason: updated.decisionReason,
