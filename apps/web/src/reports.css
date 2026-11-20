@@ -318,7 +318,8 @@
     border: 1px solid var(--line-strong);
   }
 
-  .report-problems button.link {
+  .report-problems button.link,
+  .report-table .report-source-link {
     color: inherit;
     text-decoration: none;
   }

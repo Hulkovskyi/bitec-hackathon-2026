@@ -63,7 +63,85 @@ const officialStatuses = {
   ne_rozpochato: "Не розпочато",
 };
 
-export function OfficialMeasureResult({ result }) {
+const officialAuditObjects = { measure: "Захід", result: "Результат", evidence: "Підтвердження" };
+const officialAuditFields = { status: "Стан", sha256: "Контрольна сума SHA-256", strok_data: "Плановий строк" };
+
+function OfficialAudit({ api, measureId }) {
+  const [open, setOpen] = useState(false);
+  const [page, setPage] = useState(1);
+  const [retry, setRetry] = useState(0);
+  const [response, setResponse] = useState(null);
+  const pageSize = 10;
+  const current = response?.page === page && response?.retry === retry ? response : null;
+  const journal = current?.journal;
+
+  useEffect(() => {
+    if (!open) return;
+    const controller = new AbortController();
+    api(`/measures/${measureId}/official-audit?page=${page}&pageSize=${pageSize}`, { signal: controller.signal })
+      .then((journal) => {
+        if (!controller.signal.aborted) setResponse({ journal, page, retry });
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) setResponse({ error, page, retry });
+      });
+    return () => controller.abort();
+  }, [api, measureId, open, page, retry]);
+
+  return (
+    <div className="result-history">
+      <details onToggle={(event) => setOpen(event.currentTarget.open)}>
+        <summary>Архівний журнал дій</summary>
+        <RequestError error={current?.error} onRetry={() => setRetry((n) => n + 1)} />
+        {open && !current && <p role="status">Завантажуємо архівний журнал…</p>}
+        {journal && (
+          <>
+            {journal.items.length === 0 && (
+              <p className="result-muted">{journal.available
+                ? "У джерелі немає подій для цього заходу."
+                : "Цей імпорт не містить архівного журналу."}</p>
+            )}
+            {journal.items.length > 0 && (
+              <ol className="result-events">
+                {journal.items.map((event) => {
+                  const [date, localTime] = event.occurredAt.split("T");
+                  return (
+                    <li key={event.sourceId}>
+                      <strong>{event.action}</strong>
+                      <span className="result-event-meta">
+                        <span>{event.actorLabel}</span>
+                        <time dateTime={event.occurredAt}>{formatRegistryDate(date)} · {localTime}</time>
+                      </span>
+                      <p className="result-muted">{officialAuditObjects[event.objectType]} {event.objectCode}</p>
+                      {(event.field || event.before != null || event.after != null) && (
+                        <dl className="inspector-facts">
+                          {event.field && <><dt>Поле</dt><dd>{officialAuditFields[event.field] ?? event.field}</dd></>}
+                          <dt>Було</dt><dd className="result-text">{event.before ?? "—"}</dd>
+                          <dt>Стало</dt><dd className="result-text">{event.after ?? "—"}</dd>
+                        </dl>
+                      )}
+                    </li>
+                  );
+                })}
+              </ol>
+            )}
+            {journal.total > pageSize && (
+              <nav className="result-action-row" aria-label="Сторінки архівного журналу">
+                <button type="button" className="secondary" disabled={page === 1}
+                  onClick={() => setPage(page - 1)}>Попередня</button>
+                <span>Сторінка {page} з {Math.ceil(journal.total / pageSize)}</span>
+                <button type="button" className="secondary" disabled={page * pageSize >= journal.total}
+                  onClick={() => setPage(page + 1)}>Наступна</button>
+              </nav>
+            )}
+          </>
+        )}
+      </details>
+    </div>
+  );
+}
+
+export function OfficialMeasureResult({ result, measureId, user, api }) {
   const year = result.periodKey.slice(0, 4);
   const half = result.periodKey.endsWith("H1") ? "І півріччя" : "ІІ півріччя";
   return (
@@ -83,6 +161,8 @@ export function OfficialMeasureResult({ result }) {
         <dt>Підтвердження в архіві</dt>
         <dd>{result.evidence.length ? <ul>{result.evidence.map((title, index) => <li key={index}>{title}</li>)}</ul> : "Відсутні"}</dd>
       </dl>
+      {hasPermission(user, "audit.read", ["executor", "coordinator", "admin"].includes(user.role)) &&
+        <OfficialAudit key={measureId} api={api} measureId={measureId} />}
     </section>
   );
 }

@@ -13,6 +13,7 @@ import {
   selectPeriodMeasure,
   periodMeasure,
   getMeasure,
+  readOfficialAudit,
   riskCatalogScope,
   saveMeasure,
   deleteMeasure,
@@ -270,6 +271,15 @@ export function createApp(
     keys(req.body, ["version"], ["version"]);
     await deleteMeasure(database, req.user, uuid(req.params.id), req.body.version);
     return finishDeletion(res);
+  });
+  app.get("/api/measures/:id/official-audit", async (req, res) => {
+    keys(req.query, ["page", "pageSize"]);
+    const id = uuid(req.params.id);
+    const options = { today: today(), ...pagination(req.query) };
+    const audit = await database.transaction(
+      (tx) => readOfficialAudit(tx, req.user, id, options), { readOnly: true },
+    );
+    res.json(audit);
   });
   app.get("/api/measures/:id/audit", async (req, res) => {
     const body = await database.transaction(async (database) => {

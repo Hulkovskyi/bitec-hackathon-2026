@@ -45,6 +45,52 @@ async function verifySignals(base, headers, programId, riskKey) {
   };
 }
 
+async function verifyAudit(base, headers, input, report) {
+  const tables = input.tablytsi;
+  if (!tables.zhurnal_dii) return undefined;
+  const objectTypes = { zakhid: "measure", vykonannia: "result", pidtverdzhennia: "evidence" };
+  const evidenceMeasures = new Map(tables.pidtverdzhennia.map(({ id, zakhid_id }) => [id, zakhid_id]));
+  const actors = new Map(tables.korystuvachi.map(({ id, posada }) => [id, `${posada.trim()} · ${id}`]));
+  const optional = (value) => value === "" ? null : String(value);
+  const pending = new Map(tables.zhurnal_dii.map((event) => [event.id, {
+    measureCode: event.obiekt === "pidtverdzhennia" ? evidenceMeasures.get(event.obiekt_id) : event.obiekt_id,
+    occurredAt: event.chas, actorLabel: actors.get(event.korystuvach_id), action: event.diia.trim(),
+    objectType: objectTypes[event.obiekt], objectCode: event.obiekt_id,
+    field: optional(event.pole), before: optional(event.stare_znachennia), after: optional(event.nove_znachennia),
+  }]));
+  const expected = pending.size;
+  const differences = [];
+  let matched = 0;
+  let observed = 0;
+  for (const { measureId, code } of report.sections.flatMap(({ rows }) => rows)) {
+    let page = 1;
+    let total;
+    do {
+      const query = new URLSearchParams({ page: String(page), pageSize: "100" });
+      const response = await fetch(`${base}/measures/${measureId}/official-audit?${query}`, { headers });
+      if (!response.ok) throw new Error(`Архівний журнал ${code} · HTTP ${response.status}`);
+      const journal = await response.json();
+      if (!journal.available) differences.push({ code, issue: "missing_audit" });
+      total = journal.total;
+      for (const { sourceId, ...fields } of journal.items) {
+        observed++;
+        const reference = pending.get(sourceId);
+        if (!reference) {
+          differences.push({ sourceId, issue: "unexpected_or_duplicate" });
+          continue;
+        }
+        const received = { ...fields, measureCode: code };
+        const changed = Object.keys(reference).filter((field) => received[field] !== reference[field]);
+        if (changed.length) differences.push({ sourceId, fields: changed });
+        else matched++;
+        pending.delete(sourceId);
+      }
+    } while (page++ * 100 < total);
+  }
+  for (const sourceId of pending.keys()) differences.push({ sourceId, issue: "missing" });
+  return { expected, observed, matched, differences };
+}
+
 async function verify(database, input, imported, riskKey) {
   const origin = "http://127.0.0.1:3001";
   const server = createApp(database, {
@@ -81,7 +127,8 @@ async function verify(database, input, imported, riskKey) {
         parity.differences.push({ issue: "csv_json_mismatch" });
       }
       const signals = riskKey === undefined ? undefined : await verifySignals(base, headers, imported.programId, riskKey);
-      return { parity, signals };
+      const audit = await verifyAudit(base, headers, input, report);
+      return { parity, signals, audit };
     } finally {
       await fetch(base + "/session", { method: "DELETE", headers: { ...headers, Origin: origin } });
     }
@@ -109,10 +156,11 @@ async function main() {
     const imported = await importOfficialDataset(database, input, { demoMode: true });
     console.log(JSON.stringify(imported, null, 2));
     if (verification) {
-      const { parity, signals } = await verify(database, input, imported, riskKey);
+      const { parity, signals, audit } = await verify(database, input, imported, riskKey);
       console.log(JSON.stringify(parity, null, 2));
       if (signals) console.log(JSON.stringify(signals, null, 2));
-      if (parity.differences.length || (signals && (signals.matched !== signals.expected || signals.observed !== signals.expected ||
+      if (audit) console.log(JSON.stringify(audit, null, 2));
+      if (parity.differences.length || audit?.differences.length || (signals && (signals.matched !== signals.expected || signals.observed !== signals.expected ||
         signals.missing.length || signals.unexpected.length || signals.duplicate.length))) process.exitCode = 1;
     }
   } finally {
