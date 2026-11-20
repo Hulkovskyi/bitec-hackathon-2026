@@ -1,4 +1,5 @@
 import { useId, useState } from "react";
+import { minimumAccountPasswordLength } from "../../../shared/account-password.mjs";
 
 export function PasswordChange({ onSave, onCancel }) {
   const [saving, setSaving] = useState(false);
@@ -49,10 +50,10 @@ export function PasswordChange({ onSave, onCancel }) {
           </label>
           <label>
             Новий пароль
-            <input name="newPassword" type="password" autoComplete="new-password" minLength={12} maxLength={128}
+            <input name="newPassword" type="password" autoComplete="new-password" minLength={minimumAccountPasswordLength} maxLength={128}
               aria-describedby={error?.field === "newPassword" ? `${helpId} ${errorId}` : helpId}
               aria-invalid={error?.field === "newPassword" || undefined} required />
-            <small className="count" id={helpId}>Від 12 до 128 символів</small>
+            <small className="count" id={helpId}>Від {minimumAccountPasswordLength} до 128 символів</small>
           </label>
           <label>
             Підтвердіть новий пароль

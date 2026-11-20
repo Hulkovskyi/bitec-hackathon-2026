@@ -164,6 +164,7 @@ test("invalid provisioning and duplicate usernames leave no partial account, sco
     assert.equal((await provision(incomplete, cookie)).status, 400, field);
   }
   for (const payload of [
+    { ...enrollment, password: "short" },
     { ...enrollment, managerId: null },
     { ...enrollment, managerId: unknownId },
     { ...enrollment, managerId: fixture.users[0].id },
@@ -174,7 +175,9 @@ test("invalid provisioning and duplicate usernames leave no partial account, sco
   }
   assert.deepEqual(countWrites(), before);
 
-  assert.equal((await provision(enrollment, cookie)).status, 201);
+  const credentials = { ...enrollment, password: "T3st!6" };
+  assert.equal((await provision(credentials, cookie)).status, 201);
+  assert.equal((await login(credentials)).status, 201);
   const after = countWrites();
   const duplicate = await provision({ ...enrollment, username: "EMPLOYEE.TEST" }, cookie);
   assert.equal(duplicate.status, 409);
@@ -249,7 +252,7 @@ test("password change verifies the old secret, revokes only the owner's sessions
   const audit = () => db.prepare("SELECT * FROM audit_events WHERE entity_id=? ORDER BY occurred_at,id").all(userId);
   const beforeEvents = audit();
   const previousHash = storedHash();
-  const newPassword = "synthetic-new-passphrase";
+  const newPassword = "P4ss!6";
   const change = (cookie, currentPassword, next) => request("/auth/password", {
     method: "POST", cookie, body: { currentPassword, newPassword: next },
   });

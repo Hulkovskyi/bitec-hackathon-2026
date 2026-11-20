@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
+import { minimumAccountPasswordLength } from "../../../shared/account-password.mjs";
 import { adaptDatabase, databaseConstraintKind } from "./database.js";
 import { rolePermissions } from "./permissions.js";
 import { audit, forbidden, missing } from "./registry.js";
@@ -20,9 +21,11 @@ function usernameKey(value) {
   return username;
 }
 
-export function validateAccountPassword(value, minimum = 12) {
+export function validateAccountPassword(value, minimum = minimumAccountPasswordLength) {
   if (typeof value !== "string" || value.length < minimum || value.length > 128 || !value.trim()) {
-    invalid(minimum === 12 ? "Пароль має містити від 12 до 128 символів" : "Введіть пароль");
+    invalid(minimum === minimumAccountPasswordLength
+      ? `Пароль має містити від ${minimumAccountPasswordLength} до 128 символів`
+      : "Введіть пароль");
   }
   return value;
 }

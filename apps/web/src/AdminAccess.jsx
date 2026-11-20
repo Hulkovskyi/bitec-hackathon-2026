@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { minimumAccountPasswordLength } from "../../../shared/account-password.mjs";
 import { roleNames } from "./permissions.js";
 import "./account.css";
 
@@ -93,9 +94,9 @@ function AccountCreation({ managers, roles, departments, onSave, onCancel, busy,
         <label>
           Пароль
           <input name="password" type="password" autoComplete="new-password" aria-describedby="new-account-password-help"
-            minLength={12} maxLength={128} required disabled={busy} />
+            minLength={minimumAccountPasswordLength} maxLength={128} required disabled={busy} />
         </label>
-        <p id="new-account-password-help" className="count">Від 12 до 128 символів</p>
+        <p id="new-account-password-help" className="count">Від {minimumAccountPasswordLength} до 128 символів</p>
       </AccessAssignment>
     </div>
   );
