@@ -2,8 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { AccountEntry } from "./AccountEntry.jsx";
 import { AdminAccess } from "./AdminAccess.jsx";
+import { DeleteAction } from "./DeleteAction.jsx";
+import { DepartmentAdmin } from "./DepartmentAdmin.jsx";
 import { HalfYearReport } from "./HalfYearReport.jsx";
 import { ProgramDashboard } from "./ProgramDashboard.jsx";
+import { ProgramAdmin } from "./ProgramAdmin.jsx";
 import { ProgramReference } from "./ProgramReference.jsx";
 import { RegistryImport } from "./RegistryImport.jsx";
 import { ResultPanel } from "./ResultPanel.jsx";
@@ -221,14 +224,20 @@ function Registry({ api, user, logout, changePassword, rolePreview, busy, sessio
   const program = programs?.find(({ id }) => id === programId);
   const showAccess = manageAccess && navigation === "access";
   const showImport = importRegistry && navigation === "registryImport";
+  const showPrograms = manageAccess && navigation === "programManagement";
   if (unavailable) return <Workspace {...shell} programPicker={null} programNavigation={false}>{sessionError}</Workspace>;
-  if (showAccess || showImport) {
+  if (showAccess || showImport || showPrograms) {
     return (
       <Workspace {...shell} programPicker={null} programNavigation={Boolean(program)}
         activeView={navigation} onNavigate={setNavigation}>
         {sessionError}
-        {showAccess ? <AdminAccess api={api} currentUserId={user.id} />
-          : <RegistryImport api={api} onImported={() => setAttempt((value) => value + 1)} />}
+        {showAccess && <AdminAccess api={api} currentUserId={user.id} />}
+        {showImport && <RegistryImport api={api} onImported={() => setAttempt((value) => value + 1)} />}
+        {showPrograms && <ProgramAdmin api={api} programs={programs} error={error}
+          onRetry={() => setAttempt((value) => value + 1)} onChange={(id) => {
+            if (id) setProgramId(id);
+            setAttempt((value) => value + 1);
+          }} />}
       </Workspace>
     );
   }
@@ -281,6 +290,7 @@ async function registryPage(api, query, searching, signal) {
 
 function Program({ api, program, user, shell, sessionError, initialView, onOpenGlobal }) {
   const [reportPeriod, setReportPeriod] = useState(null);
+  const [registryNotice, setRegistryNotice] = useState("");
   const [view, setView] = useState(initialView ?? (
     hasPermission(user, "analytics.read", true) ? "dashboard" : "registry"
   ));
@@ -449,7 +459,7 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
   function navigate(next) {
     if (next === view) return;
     clearDetail();
-    if (next === "access" || next === "registryImport") onOpenGlobal(next);
+    if (next === "access" || next === "registryImport" || next === "programManagement") onOpenGlobal(next);
     else setView(next);
   }
   function resetList() {
@@ -471,6 +481,7 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
     ? matches.slice((visiblePage - 1) * registryPageSize, visiblePage * registryPageSize)
     : result?.items ?? [];
   const viewMode = view === "dashboard" ? "overview" : view;
+  const deletionView = detailView.current;
   const programContext = (
     <p>{program.title} <span aria-hidden="true">·</span> {formatRegistryDate(program.periodStart)} — {formatRegistryDate(program.periodEnd)}</p>
   );
@@ -514,7 +525,7 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
       {sessionError}
       {view === "registry" && <header className="section-heading">
         <div>
-          <h1>Реєстр заходів</h1>
+          <h1 id="registry-title" tabIndex={-1}>Реєстр заходів</h1>
           {programContext}
         </div>
         {canEditRegistry && options && (program.periodEnd < kyivToday() ? (
@@ -528,9 +539,17 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
           </button>
         ))}
       </header>}
-      {view === "passport" || view === "corruptionRisks" ? (
+      {view === "departments" ? (
+        <>
+          <ErrorMessage error={error} />
+          {options ? <DepartmentAdmin key={program.id} api={api} program={program}
+            departments={options.departments} onChange={() => setRefresh((value) => value + 1)} />
+            : !error && <p className="count" role="status">Завантаження підрозділів…</p>}
+        </>
+      ) : view === "passport" || view === "corruptionRisks" ? (
         <ProgramReference view={view} program={program} programContext={programContext}
-          departments={options?.departments ?? []} api={api} readOnly={Boolean(user.preview)} />
+          departments={options?.departments ?? []} api={api} readOnly={Boolean(user.preview)}
+          catalogAdmin={shell.manageAccess} onCatalogChange={() => setRefresh((value) => value + 1)} />
       ) : view === "report" ? (
         <HalfYearReport program={program} api={api} selectedPeriod={reportPeriod}
           onPeriodChange={setReportPeriod} onOpenMeasure={openDashboardMeasure} />
@@ -540,6 +559,7 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
           api={api} onOpenMeasure={openDashboardMeasure} />
       ) : (
         <>
+          {registryNotice && <p className="access-notice" role="status">{registryNotice}</p>}
           <div className={selected && !editing ? "register-grid register-grid-split" : "register-grid"}>
             <section className="register-list" aria-label="Перелік заходів">
               <div className="registry-filters">
@@ -670,6 +690,15 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
                       : <button className="link" type="button" onClick={() => setEditing(true)}>Редагувати захід</button>
                   )}
                 </div>
+                {shell.manageAccess && <DeleteAction key={selected.id} label="Видалити захід"
+                  prompt={`Видалити захід «${selected.code}»?`} onDelete={async () => {
+                    await api(`/measures/${selected.id}`, { method: "DELETE", body: JSON.stringify({ version: selected.version }) });
+                    setRefresh((value) => value + 1);
+                    if (detailView.current !== deletionView) return;
+                    clearDetail();
+                    setRegistryNotice(`Захід «${selected.code}» видалено.`);
+                    requestAnimationFrame(() => document.getElementById("registry-title")?.focus());
+                  }} />}
               </article>
             )}
           </div>

@@ -440,6 +440,74 @@ test("create and patch: assignment, optimistic version, validation, immutable ac
   assert.deepEqual((await request(path, { cookie })).data, snapshot);
 });
 
+test("only an administrator can delete an unused measure and its indicator with an audit record", async (t) => {
+  const { db, request, login } = await setup(t);
+  const admin = await login(208);
+  const coordinator = await login(205);
+  const created = await request("/api/measures", {
+    method: "POST", cookie: admin, body: createBody(),
+  });
+  assert.equal(created.status, 201);
+  const path = "/api/measures/" + created.data.id;
+  const remove = (cookie, version = 1) => request(path, { method: "DELETE", cookie, body: { version } });
+  const before = counts(db);
+  assert.equal((await remove(coordinator)).status, 403);
+  assert.equal((await remove(admin, 0)).status, 400);
+  assert.equal((await remove(admin, 2)).data.error.code, "version_conflict");
+
+  db.exec(`
+    CREATE TRIGGER fail_delete_audit BEFORE INSERT ON audit_events
+    WHEN NEW.action='delete' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;
+  `);
+  assert.equal((await remove(admin)).status, 500);
+  assert.deepEqual(counts(db), before);
+  assert.deepEqual((await request(path, { cookie: admin })).data, created.data);
+  db.exec("DROP TRIGGER fail_delete_audit");
+
+  const attempts = await Promise.all([remove(admin), remove(admin)]);
+  assert.deepEqual(attempts.map(({ status }) => status).sort(), [204, 404]);
+  assert.equal((await request(path, { cookie: admin })).status, 404);
+  assert.equal(db.prepare("SELECT 1 FROM indicators WHERE measure_id=?").get(created.data.id), undefined);
+  const events = db.prepare("SELECT * FROM audit_events WHERE action='delete' AND entity_id=?").all(created.data.id);
+  assert.equal(events.length, 1);
+  const [event] = events;
+  assert.equal(event.actor_id, id(208));
+  assert.equal(event.entity_type, "measure");
+  assert.equal(JSON.parse(event.before_json).indicator.id, created.data.indicator.id);
+  assert.equal(event.after_json, null);
+});
+
+test("measure deletion preserves results, period assignments and imported history", async (t) => {
+  const { db, request, login } = await setup(t);
+  const admin = await login(208);
+  db.prepare(`
+    INSERT INTO results (id, measure_id, period_key, revision, executor_id, created_at, updated_at)
+    VALUES (?, ?, 'once', 1, ?, '2026-11-17', '2026-11-17')
+  `).run(id(701), id(501), id(201));
+  db.prepare("INSERT INTO period_assignments (measure_id, period_key, executor_id) VALUES (?, 'once', ?)")
+    .run(id(502), id(202));
+  db.prepare(`
+    INSERT INTO official_dataset_batches (program_id, source_period, source_as_of, source_hash, imported_at)
+    VALUES (?, '2026-H1', '2026-07-06', ?, '2026-07-06')
+  `).run(id(1), "a".repeat(64));
+  db.prepare(`
+    INSERT INTO official_measure_metadata (
+      measure_id, program_id, section_order, plan_text, source_schedule_type, source_title, source_department_id,
+      source_department_title, source_section_code, indicator_title, expected_evidence, resources
+    ) VALUES (?, ?, 1, 'Навчальний план', 'continuous', 'Архівний захід', ?, 'Навчальний підрозділ', 3, 'Індикатор', '', '')
+  `).run(id(503), id(1), id(102));
+
+  const before = counts(db);
+  for (const n of [501, 502, 503]) {
+    const response = await request("/api/measures/" + id(n), {
+      method: "DELETE", cookie: admin, body: { version: 1 },
+    });
+    assert.equal(response.status, 409);
+    assert.equal(response.data.error.code, "measure_in_use");
+  }
+  assert.deepEqual(counts(db), before);
+});
+
 test("import is create-only, bounded, validated, admin-only and fully transactional", async (t) => {
   const { db, request, login } = await setup(t);
   const cookie = await login(208),

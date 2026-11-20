@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Glyph } from "./Workspace.jsx";
+import { DeleteAction } from "./DeleteAction.jsx";
 import "./program-reference.css";
 
 const formatValue = new Intl.NumberFormat("uk-UA", { maximumFractionDigits: 6 });
@@ -106,7 +107,7 @@ function PassportForm({ api, path, data, departments, close, update }) {
   );
 }
 
-function Passport({ api, path, departments, readOnly }) {
+function Passport({ api, path, departments, readOnly, catalogPath }) {
   const request = useProgramReference(api, path);
   const { data } = request;
   const [editing, setEditing] = useState(false);
@@ -119,8 +120,18 @@ function Passport({ api, path, departments, readOnly }) {
           <section className="dashboard-panel reference-section" aria-labelledby="program-goals">
             <div className="reference-section-heading">
               <h2 id="program-goals">Мета та цілі програми</h2>
-              {!readOnly && data.canEdit && !editing && <button className="secondary" type="button"
-                onClick={() => { setNotice(""); setEditing(true); }}>Редагувати паспорт</button>}
+              {!readOnly && data.canEdit && !editing && (
+                <div className="reference-actions">
+                  <button className="secondary" type="button"
+                    onClick={() => { setNotice(""); setEditing(true); }}>{data.goals ? "Редагувати паспорт" : "Додати паспорт"}</button>
+                  {catalogPath && data.goals && <DeleteAction label="Видалити паспорт"
+                    prompt="Видалити відомості з паспорта програми?" onDelete={async () => {
+                      await api(catalogPath, { method: "DELETE" });
+                      request.refresh();
+                      setNotice("Відомості паспорта видалено.");
+                    }} />}
+                </div>
+              )}
             </div>
             <div role="status">{notice && <p className="reference-notice">{notice}</p>}</div>
             {editing ? (
@@ -261,7 +272,19 @@ function RiskFacts({ risk }) {
   );
 }
 
-function RiskRecord({ risk, api, path, departments, refresh, readOnly }) {
+function RiskEditor({ api, path, risk, onCancel, onSave }) {
+  return (
+    <SaveForm label={risk ? "Редагування ризику" : "Новий ризик"} cancel={onCancel} onSave={onSave}
+      save={(fields) => api(path, { method: risk ? "PATCH" : "POST", body: JSON.stringify(Object.fromEntries(fields)) })}>
+      <div className="form-grid">
+        <label>Код ризику<input name="code" maxLength={50} defaultValue={risk?.code} required autoFocus /></label>
+        <label>Назва ризику<input name="title" maxLength={200} defaultValue={risk?.title} required /></label>
+      </div>
+    </SaveForm>
+  );
+}
+
+function RiskRecord({ risk, api, path, departments, refresh, readOnly, catalogPath, onCatalogChange }) {
   const [form, setForm] = useState("");
   const [notice, setNotice] = useState("");
   const { indicator, readings } = risk;
@@ -306,14 +329,26 @@ function RiskRecord({ risk, api, path, departments, refresh, readOnly }) {
         </details>
       )}
       <div role="status">{notice && <p className="reference-notice">{notice}</p>}</div>
-      {!readOnly && !form && (risk.canMeasure || risk.canEditIndicator) && (
+      {!readOnly && !form && (risk.canMeasure || risk.canEditIndicator || catalogPath) && (
         <div className="reference-actions">
           {risk.canMeasure && indicator && <button type="button" onClick={() => open("reading")}>Додати вимірювання</button>}
           {risk.canEditIndicator && <button className="secondary" type="button" onClick={() => open("indicator")}>
             {indicator ? "Редагувати індикатор" : "Налаштувати індикатор"}
           </button>}
+          {catalogPath && <button className="secondary" type="button" onClick={() => open("risk")}>Редагувати ризик</button>}
+          {catalogPath && <DeleteAction label="Видалити ризик" prompt={`Видалити ризик «${risk.code}»?`}
+            onDelete={async () => {
+              await api(catalogPath, { method: "DELETE" });
+              refresh();
+              onCatalogChange();
+            }} />}
         </div>
       )}
+      {form === "risk" && <RiskEditor api={api} path={catalogPath} risk={risk} onCancel={() => setForm("")}
+        onSave={() => {
+          saved("Ризик оновлено.");
+          onCatalogChange();
+        }} />}
       {form === "reading" && <ReadingForm api={api} path={path} risk={risk} close={() => setForm("")}
         saved={() => saved("Вимірювання збережено.")} />}
       {form === "indicator" && <IndicatorForm api={api} path={path} risk={risk} departments={departments}
@@ -322,16 +357,30 @@ function RiskRecord({ risk, api, path, departments, refresh, readOnly }) {
   );
 }
 
-function CorruptionRisks({ api, path, departments, readOnly }) {
+function CorruptionRisks({ api, path, departments, readOnly, catalogPath, onCatalogChange }) {
   const request = useProgramReference(api, path);
+  const [creating, setCreating] = useState(false);
+  const [notice, setNotice] = useState("");
   return (
     <>
       <ReferenceState {...request} />
+      {notice && <p className="access-notice" role="status">{notice}</p>}
+      {catalogPath && !creating && <div className="reference-actions">
+        <button type="button" onClick={() => { setNotice(""); setCreating(true); }}>Додати ризик</button>
+      </div>}
+      {creating && <RiskEditor api={api} path={catalogPath} onCancel={() => setCreating(false)}
+        onSave={() => {
+          setCreating(false);
+          setNotice("Ризик додано.");
+          request.refresh();
+          onCatalogChange();
+        }} />}
       {request.data?.items.length > 0 && (
         <div className="dashboard-panel reference-risk-list">
           {request.data.items.map((risk) => (
             <RiskRecord key={risk.id} risk={risk} api={api} path={`${path}/${risk.id}`}
-              departments={departments} refresh={request.refresh} readOnly={readOnly} />
+              departments={departments} refresh={request.refresh} readOnly={readOnly}
+              catalogPath={catalogPath && `${catalogPath}/${risk.id}`} onCatalogChange={onCatalogChange} />
           ))}
         </div>
       )}
@@ -340,9 +389,10 @@ function CorruptionRisks({ api, path, departments, readOnly }) {
   );
 }
 
-export function ProgramReference({ view, program, programContext, departments, api, readOnly }) {
+export function ProgramReference({ view, program, programContext, departments, api, readOnly, catalogAdmin, onCatalogChange }) {
   const passport = view === "passport";
   const path = `/programs/${program.id}/${passport ? "passport" : "corruption-risks"}`;
+  const catalogPath = catalogAdmin ? `/admin/programs/${program.id}/${passport ? "passport" : "risks"}` : null;
   return (
     <section aria-labelledby="reference-title" className="program-reference">
       <header className="section-heading">
@@ -352,8 +402,9 @@ export function ProgramReference({ view, program, programContext, departments, a
         </div>
       </header>
       {passport
-        ? <Passport key={path} api={api} path={path} departments={departments} readOnly={readOnly} />
-        : <CorruptionRisks key={path} api={api} path={path} departments={departments} readOnly={readOnly} />}
+        ? <Passport key={path} api={api} path={path} departments={departments} readOnly={readOnly} catalogPath={catalogPath} />
+        : <CorruptionRisks key={path} api={api} path={path} departments={departments} readOnly={readOnly}
+          catalogPath={catalogPath} onCatalogChange={onCatalogChange} />}
     </section>
   );
 }

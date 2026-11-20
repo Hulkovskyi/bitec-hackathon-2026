@@ -30,7 +30,7 @@ export function validateAccountPassword(value, minimum = minimumAccountPasswordL
   return value;
 }
 
-function profile(body) {
+export function validateAccountProfile(body) {
   return {
     username: usernameKey(body.username),
     fullName: text(body.fullName, 160),
@@ -138,7 +138,7 @@ function rateLimit(requests, windowMs, clientKey = (req) => req.ip) {
 }
 
 export async function prepareAccountCredentials(values) {
-  const data = profile(values);
+  const data = validateAccountProfile(values);
   return { ...data, passwordHash: await passwordHash(validateAccountPassword(values.password)) };
 }
 

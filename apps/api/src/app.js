@@ -4,6 +4,8 @@ import { adaptDatabase, databaseConstraintKind } from "./database.js";
 import { ApiError, keys, uuid, pagination, invalid } from "./validation.js";
 import { mountLoginRoutes, mountSessionRoutes } from "./accounts.js";
 import { mountAccountAdminRoutes } from "./account-admin.js";
+import { mountDepartmentAdminRoutes } from "./department-admin.js";
+import { mountCatalogAdminRoutes } from "./catalog-admin.js";
 import { hasPermission } from "./permissions.js";
 import {
   access,
@@ -11,6 +13,7 @@ import {
   periodMeasure,
   getMeasure,
   saveMeasure,
+  deleteMeasure,
   importRegistry,
   missing,
   forbidden,
@@ -81,6 +84,8 @@ export function createApp(
   mountLoginRoutes(app, database, authOptions);
   mountSessionRoutes(app, database, authOptions);
   mountAccountAdminRoutes(app, database);
+  mountDepartmentAdminRoutes(app, database);
+  mountCatalogAdminRoutes(app, database);
   app.get("/api/programs", async (req, res) => {
     keys(req.query, []);
     const admin = req.user.role === "admin";
@@ -216,6 +221,12 @@ export function createApp(
     res.json(
       await saveMeasure(database, req.user, req.body, uuid(req.params.id), { today }),
     );
+  });
+  app.delete("/api/measures/:id", async (req, res) => {
+    keys(req.query, []);
+    keys(req.body, ["version"], ["version"]);
+    await deleteMeasure(database, req.user, uuid(req.params.id), req.body.version);
+    res.status(204).end();
   });
   app.get("/api/measures/:id/audit", async (req, res) => {
     const body = await database.transaction(async (database) => {
