@@ -375,11 +375,18 @@ export function createEvidenceStore(database, { directory, storage = undefined, 
   async function deleteUncommitted(storageKey) {
     try {
       // A lost connection during COMMIT does not prove that it failed.
-      if (!await db.prepare("SELECT 1 FROM evidence_versions WHERE storage_key=?").get(storageKey)) {
-        await objects.delete(storageKey);
-      }
+      if (await db.prepare("SELECT 1 FROM evidence_versions WHERE storage_key=?").get(storageKey)) return;
+      await objects.delete(storageKey);
     } catch {
-      console.error("Could not confirm or remove an uncommitted evidence object");
+      try {
+        await db.prepare(`
+          INSERT INTO evidence_deletions (storage_key)
+          SELECT ? WHERE NOT EXISTS (SELECT 1 FROM evidence_versions WHERE storage_key=?)
+          ON CONFLICT (storage_key) DO NOTHING
+        `).run(storageKey, storageKey);
+      } catch {
+        console.error("Could not queue an uncommitted evidence object for removal");
+      }
     }
   }
 
@@ -394,6 +401,7 @@ export function createEvidenceStore(database, { directory, storage = undefined, 
       // Store immutable bytes before the transaction publishes their metadata.
       await objects.put(storageKey, file.bytes, file.mediaType);
     } catch (error) {
+      await deleteUncommitted(storageKey);
       if (error instanceof OversizedEvidenceObject) throw tooLarge(maxBytes);
       throw error;
     }

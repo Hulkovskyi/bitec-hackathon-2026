@@ -1,6 +1,6 @@
 import { forbidden, measureScope, missing, programAllowed, scope, selectMeasure } from "./registry.js";
 import { hasPermission } from "./permissions.js";
-import { canReadResult, effectiveAssignment } from "./result-access.js";
+import { canReadResult, effectiveAssignment, workInterval } from "./result-access.js";
 import { currentEvidence } from "./result-workflow.js";
 import { officialRiskRuleCodes, readOfficialRiskFlags } from "./official-risk-flags.js";
 import { mountRecommendationDecisionRoutes } from "./recommendation-decisions.js";
@@ -86,7 +86,7 @@ function periodLists(entries, asOf) {
       const timing = deadlineFlag(plan, periodKey, deadline, asOf, approved);
       periods.push({
         item,
-        active: plan.active && (periodKey === "once" || asOf <= deadline),
+        active: plan.active && (periodKey === "once" || asOf <= workInterval(plan, periodKey)?.[1]),
         completed,
         overdue: timing?.ruleCode === "overdue",
         dueSoon: timing?.ruleCode === "due_soon",

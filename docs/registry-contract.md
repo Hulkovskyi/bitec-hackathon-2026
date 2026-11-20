@@ -62,8 +62,8 @@ JSON camelCase, /api зберігається для сумісності з н�
 | --- | --- |
 | GET /api/me | {id, displayName, role, scopes:[{programId,departmentId}]} |
 | GET /api/programs | {items:[{id,code,title,periodStart,periodEnd}]} у межах доступу |
-| GET /api/programs/:id/registry-options | {sections,departments,risks,executors}; executors доступні з `registry.write` або `workflow.assign`, кожний {id,displayName,departmentIds:[...]}; departmentIds — перетин точних scopes виконавця й доступних caller підрозділів цієї програми, порожній перетин виключає виконавця |
-| GET /api/measures | programId обов'язковий; sectionId,departmentId,executorId,active опціональні; page>=1, pageSize 1–100 (default 20); {items,total,page,pageSize}; порядок code,id |
+| GET /api/programs/:id/registry-options | {sections,departments,risks,executors}; executors доступні з `registry.write` або `workflow.assign`, кожний {id,displayName,departmentIds:[...]}; departmentIds — перетин підрозділів виконавця й користувача в цій програмі. У парольному режимі для нових призначень доступні виконавці зі схваленим обліковим записом. Ризики обмежені правами й підрозділами, а редактори також можуть обрати ризик без налаштованого власника |
+| GET /api/measures | programId обов'язковий; sectionId,departmentId,executorId,active,periodKey опціональні; q виконує пошук за кодом і назвою без урахування регістру в межах доступу до пагінації; page>=1, pageSize 1–100 (default 20); {items,total,page,pageSize}; порядок code,id |
 | GET /api/measures/:id | повний Measure |
 | POST /api/measures | CreateMeasure -> 201 Measure, Location |
 | PATCH /api/measures/:id | {version,...змінені поля CreateMeasure} -> 200 Measure, version+1 |

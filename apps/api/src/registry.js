@@ -60,6 +60,24 @@ export function measureScope(user) {
   };
 }
 
+export function executorAccountFilter(user) {
+  return ["password", "preview"].includes(user?.authKind) ? `AND EXISTS (
+    SELECT 1 FROM credential_accounts a WHERE a.user_id=u.id AND a.status='approved'
+  )` : "";
+}
+
+export function riskCatalogScope(user, { includeUnowned = false } = {}) {
+  if (!user || user.role === "admin") return { sql: "1=1", params: [] };
+  return { sql: `(
+    EXISTS (SELECT 1 FROM user_scopes us WHERE us.user_id=? AND us.program_id=r.program_id
+      AND us.department_id=ri.owner_department_id)
+    OR EXISTS (SELECT 1 FROM measures m JOIN sections s ON s.id=m.section_id
+      JOIN user_scopes us ON us.program_id=s.program_id AND us.department_id=m.department_id
+      WHERE m.risk_id=r.id AND s.program_id=r.program_id AND us.user_id=?)
+    ${includeUnowned ? "OR ri.risk_id IS NULL" : ""}
+  )`, params: [user.id, user.id] };
+}
+
 export function access(user, { periodKey, today = kyivDate() } = {}) {
   const { sql, params } = measureScope(user);
   const conditions = [sql];
@@ -133,7 +151,7 @@ export function measure(row) {
   };
 }
 async function getOfficialResult(db, user, row, today) {
-  if (!hasPermission(user, "analytics.read")) forbidden();
+  if (!hasPermission(user, "analytics.read") && !hasPermission(user, "reports.read")) forbidden();
   const archive = await db.prepare(`
     SELECT r.source_period, b.source_as_of, r.source_status, r.source_approved,
            r.source_actual_date, r.source_user_id, r.description, r.measured_value,
@@ -233,7 +251,7 @@ export async function validateMeasure(
   user,
   oldProgram,
   today = kyivDate(),
-  { allowUnspecifiedIndicators = false } = {},
+  { allowUnspecifiedIndicators = false, previousMeasure = null } = {},
 ) {
   const db = adaptDatabase(database);
   const value = {
@@ -261,20 +279,21 @@ export async function validateMeasure(
     invalid("Некоректний підрозділ");
   if (user && !(await scope(db, user, section.program_id, value.departmentId)))
     forbidden();
-  const executor = await db
-    .prepare(
-      "SELECT 1 FROM users u JOIN user_scopes us ON us.user_id=u.id WHERE u.id=? AND u.active=1 AND u.role='executor' AND us.program_id=? AND us.department_id=?",
-    )
-    .get(value.executorId, section.program_id, value.departmentId);
-  if (!executor) invalid("Виконавець недоступний у вибраному підрозділі");
+  if (previousMeasure?.executorId !== value.executorId || previousMeasure?.departmentId !== value.departmentId) {
+    const executor = await db.prepare(`
+      SELECT 1 FROM users u JOIN user_scopes us ON us.user_id=u.id
+      WHERE u.id=? AND u.active=1 AND u.role='executor' AND us.program_id=? AND us.department_id=?
+        ${executorAccountFilter(user)}
+    `).get(value.executorId, section.program_id, value.departmentId);
+    if (!executor) invalid("Виконавець недоступний у вибраному підрозділі");
+  }
   if (section.code === 2) {
-    if (
-      !value.riskId ||
-      !(await db
-        .prepare("SELECT 1 FROM risks WHERE id=? AND program_id=?")
-        .get(value.riskId, section.program_id))
-    )
-      invalid("Оберіть ризик цієї програми");
+    const visible = riskCatalogScope(user, { includeUnowned: true });
+    const risk = value.riskId && await db.prepare(`
+      SELECT 1 FROM risks r LEFT JOIN risk_indicators ri ON ri.risk_id=r.id
+      WHERE r.id=? AND r.program_id=? AND ${visible.sql}
+    `).get(value.riskId, section.program_id, ...visible.params);
+    if (!risk) invalid("Оберіть доступний ризик цієї програми");
   } else if (value.riskId !== null)
     invalid("Ризик дозволений лише для розділу 2");
   value.effectiveFrom =
@@ -419,7 +438,7 @@ export async function saveMeasure(database, user, input, id, { today = kyivDate 
       user,
       before?.programId,
       dateToday,
-      { allowUnspecifiedIndicators: preservesMissingValues },
+      { allowUnspecifiedIndicators: preservesMissingValues, previousMeasure: before },
     );
     if (before && (
       value.departmentId !== before.departmentId ||

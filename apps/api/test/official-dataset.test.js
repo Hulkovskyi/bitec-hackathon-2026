@@ -167,6 +167,7 @@ test("H1 reproduces organizer fields and keeps historical report evidence scoped
   assert.equal(rows[0].sourceResult.markedApproved, true);
   assert.deepEqual(rows[0].sourceEvidence, [{ title: "Умовний документ", referenceUrl: "https://example.org/claim" }]);
   assert.equal(rows[0].resultId, null);
+  assert.equal(report.summary.problemRows.find(({ code }) => code === "Z-P").source, "official");
   assert.equal(rows[1].sourceResult.markedApproved, false);
   assert.equal(rows[1].actualDate, "2026-07-03");
   assert.equal(rows[2].indicator.target, null);

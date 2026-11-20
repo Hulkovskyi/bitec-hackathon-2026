@@ -227,6 +227,7 @@ export function ProgramDashboard({
   initialDepartmentId = "",
 }) {
   const [departmentId, setDepartmentId] = useState(initialDepartmentId);
+  const [flagFilter, setFlagFilter] = useState({ source: "live", ruleCode: "" });
   const view = roleViews[userRole] ?? roleViews.analyst;
   const title = { signals: "Сигнали", approvals: "Погодження" }[mode] ?? view.title;
   const showDepartment = userRole !== "executor" && departments.length > 0;
@@ -256,7 +257,8 @@ export function ProgramDashboard({
       </header>
       {mode === "signals" ? (
         <RiskFlags key={departmentId} api={api} scope={scope} periods={periods}
-          onOpenSubject={onOpenSubject} canOpenRisk={canOpenRisk} onOpenMeasure={onOpenMeasure} showDecisions />
+          onOpenSubject={onOpenSubject} canOpenRisk={canOpenRisk} onOpenMeasure={onOpenMeasure} showDecisions
+          filter={flagFilter} onFilterChange={setFlagFilter} />
       ) : (
         <DashboardScope key={`${mode}:${departmentId}`} api={api} scope={scope}
           view={view} periods={periods} onlyApprovals={mode === "approvals"}
@@ -482,13 +484,22 @@ function RiskFlags(props) {
   return <RiskDecisions {...props} />;
 }
 
-function RiskFlagList({ api, scope, periods, onOpenMeasure, onOpenSubject, canOpenRisk, showDecisions = false, renderDecision }) {
-  const [filter, setFilter] = useState({ source: "live", ruleCode: "", page: 1 });
+function RiskFlagList({
+  api, scope, periods, onOpenMeasure, onOpenSubject, canOpenRisk, showDecisions = false, renderDecision,
+  filter: sharedFilter, onFilterChange,
+}) {
+  const [localFilter, setLocalFilter] = useState({ source: "live", ruleCode: "" });
+  const [page, setPage] = useState(1);
+  const filter = sharedFilter ?? localFilter;
+  function updateFilter(next) {
+    (onFilterChange ?? setLocalFilter)(next);
+    setPage(1);
+  }
   const query = new URLSearchParams({
     ...scope,
     ...(filter.source === "official" ? { source: "official" } : {}),
     ...(filter.ruleCode ? { ruleCode: filter.ruleCode } : {}),
-    page: String(filter.page),
+    page: String(page),
   });
   const request = useDashboardQuery(api, `/risk-flags?${query}`);
   const labels = filter.source === "official" ? officialRuleLabels : ruleLabels;
@@ -501,7 +512,7 @@ function RiskFlagList({ api, scope, periods, onOpenMeasure, onOpenSubject, canOp
             <label>
               <span id="dashboard-flag-source-label">Джерело</span>
               <select aria-labelledby="dashboard-flag-source-label" value={filter.source} onChange={(event) => {
-                setFilter({ source: event.target.value, ruleCode: "", page: 1 });
+                updateFilter({ source: event.target.value, ruleCode: "" });
               }}>
                 {Object.entries(flagSources).map(([source, label]) => <option key={source} value={source}>{label}</option>)}
               </select>
@@ -509,7 +520,7 @@ function RiskFlagList({ api, scope, periods, onOpenMeasure, onOpenSubject, canOp
           )}
           <label>
             <span id="dashboard-flag-rule-label">Правило</span>
-            <select aria-labelledby="dashboard-flag-rule-label" value={filter.ruleCode} onChange={(event) => setFilter({ ...filter, ruleCode: event.target.value, page: 1 })}>
+            <select aria-labelledby="dashboard-flag-rule-label" value={filter.ruleCode} onChange={(event) => updateFilter({ ...filter, ruleCode: event.target.value })}>
               <option value="">Усі правила</option>
               {Object.entries(labels).map(([code, label]) => (
                 <option key={code} value={code}>{filter.source === "official" ? `${code} · ` : ""}{label}</option>
@@ -539,7 +550,7 @@ function RiskFlagList({ api, scope, periods, onOpenMeasure, onOpenSubject, canOp
                 ? "Для цієї програми немає архівного зрізу."
                 : "За цим фільтром сигналів немає."}</p>}
               <Pagination data={request.data} label="Сторінки сигналів"
-                onPageChange={(page) => setFilter({ ...filter, page })} />
+                onPageChange={setPage} />
             </>
           )}
         </div>

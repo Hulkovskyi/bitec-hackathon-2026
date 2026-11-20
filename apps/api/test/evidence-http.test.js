@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { createApp } from "../src/app.js";
+import { createEvidenceStore } from "../src/evidence.js";
 import { migrate } from "../src/database.js";
 import { seed } from "../src/seed.js";
 
@@ -14,13 +15,14 @@ const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
 const origin = "http://127.0.0.1:3001";
 const sha256 = (value) => createHash("sha256").update(value).digest("hex");
 
-async function setup(t, { creatorId = 201 } = {}) {
+async function setup(t, { creatorId = 201, storage } = {}) {
   const evidenceDirectory = await mkdtemp(join(tmpdir(), "dacm-test-evidence-"));
   const db = new DatabaseSync(":memory:");
   migrate(db);
   await seed(db, { demoMode: true });
+  const evidenceStore = createEvidenceStore(db, { directory: evidenceDirectory, storage });
   const server = createApp(db, {
-    evidenceDirectory,
+    evidenceStore,
     demoMode: true,
     today: () => "2026-11-17",
   }).listen(0, "127.0.0.1");
@@ -71,7 +73,7 @@ async function setup(t, { creatorId = 201 } = {}) {
       method: "POST", cookie, body,
     });
   }
-  return { db, evidenceDirectory, request, login, result, executor, creator, upload };
+  return { db, evidenceDirectory, evidenceStore, request, login, result, executor, creator, upload };
 }
 
 test("evidence keeps immutable bytes and version history with scoped download and integrity", async (t) => {
@@ -223,4 +225,43 @@ test("admin can manage a measure and its result while uploads retain executor ow
   assert.equal((await approved.json()).status, "approved");
   const evidenceAudits = db.prepare("SELECT actor_id FROM audit_events WHERE entity_type='evidence'").all();
   assert.deepEqual(evidenceAudits.map(({ actor_id }) => actor_id), [id(208), id(208)]);
+});
+
+test("a failed upload with possibly stored bytes queues an idempotent removal", async (t) => {
+  const objects = new Map();
+  let canDelete = false;
+  const storage = {
+    async put(key, bytes) {
+      objects.set(key, bytes);
+      throw new Error("Synthetic response failure after storage");
+    },
+    async get(key) { return objects.get(key) ?? null; },
+    async delete(key) {
+      if (!canDelete) throw new Error("Synthetic delete unavailable");
+      objects.delete(key);
+    },
+  };
+  const { db, result, evidenceStore, upload } = await setup(t, { storage });
+  assert.equal((await upload("Синтетичні байти")).status, 500);
+  assert.equal(objects.size, 1);
+  assert.equal(await evidenceStore.pendingDeletions(), 1);
+  assert.equal(db.prepare("SELECT version FROM results WHERE id=?").get(result.id).version, result.version);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM evidence_versions").get().n, 0);
+  canDelete = true;
+  assert.equal(await evidenceStore.drainDeletions(), 0);
+  assert.equal(objects.size, 0);
+});
+
+test("inactive measures retain draft history and stop draft edits and uploads", async (t) => {
+  const { db, result, executor, request, upload } = await setup(t);
+  db.prepare("UPDATE measures SET active=0 WHERE id=?").run(id(501));
+  const updated = await request(`/api/results/${result.id}`, {
+    method: "PATCH", cookie: executor, body: { version: result.version, description: "Тестова зміна" },
+  });
+  assert.equal(updated.status, 409);
+  assert.equal((await updated.json()).error.code, "inactive_measure");
+  const uploaded = await upload("Синтетичний файл");
+  assert.equal(uploaded.status, 409);
+  assert.equal((await uploaded.json()).error.code, "inactive_measure");
+  assert.equal((await request(`/api/results/${result.id}`, { cookie: executor })).status, 200);
 });

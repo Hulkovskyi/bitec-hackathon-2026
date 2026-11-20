@@ -102,6 +102,10 @@ export async function isIndependentReviewer(db, result, actorId) {
   return submission?.actor_id !== actorId;
 }
 
+export function assertActiveMeasure(plan) {
+  if (!plan.active) throw new ApiError(409, "inactive_measure", "Захід неактивний");
+}
+
 export async function assertResultEditor(db, user, result) {
   if (!hasPermission(user, "workflow.submit")) forbidden();
   const plan = await planForScope(db, user, result.measure_id);
@@ -109,6 +113,7 @@ export async function assertResultEditor(db, user, result) {
     (user.role === "executor" && result.executor_id !== user.id) ||
     (await effectiveAssignment(db, plan, result.period_key)).executorId !== result.executor_id
   ) missing();
+  assertActiveMeasure(plan);
   if (!["draft", "returned"].includes(result.status))
     throw new ApiError(409, "invalid_transition", "Редагування для цього стану недоступне");
 }
