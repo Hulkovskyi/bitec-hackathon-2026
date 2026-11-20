@@ -1,7 +1,7 @@
 import express from "express";
 import { fileURLToPath } from "node:url";
 import { adaptDatabase, databaseConstraintKind } from "./database.js";
-import { ApiError, choice, keys, uuid, pagination, invalid } from "./validation.js";
+import { ApiError, choice, keys, uuid, pagination, invalid, text } from "./validation.js";
 import { mountLoginRoutes, mountSessionRoutes } from "./accounts.js";
 import { mountAccountAdminRoutes } from "./account-admin.js";
 import { mountDepartmentAdminRoutes } from "./department-admin.js";
@@ -9,9 +9,11 @@ import { mountCatalogAdminRoutes } from "./catalog-admin.js";
 import { hasPermission } from "./permissions.js";
 import {
   access,
+  executorAccountFilter,
   selectPeriodMeasure,
   periodMeasure,
   getMeasure,
+  riskCatalogScope,
   saveMeasure,
   deleteMeasure,
   importRegistry,
@@ -129,11 +131,13 @@ export function createApp(
           "SELECT id,program_id AS programId,code,title FROM sections WHERE program_id=? ORDER BY code",
         )
         .all(id);
-      const risks = await database
-        .prepare(
-          "SELECT id,program_id AS programId,code,title FROM risks WHERE program_id=? ORDER BY code",
-        )
-        .all(id);
+      const canPlan = !req.user.preview && hasPermission(req.user, "registry.write");
+      const riskScope = riskCatalogScope(req.user, { includeUnowned: canPlan });
+      const risks = canPlan || hasPermission(req.user, "risks.read") ? await database.prepare(`
+        SELECT r.id,r.program_id AS "programId",r.code,r.title
+        FROM risks r LEFT JOIN risk_indicators ri ON ri.risk_id=r.id
+        WHERE r.program_id=? AND ${riskScope.sql} ORDER BY r.code,r.id
+      `).all(id, ...riskScope.params) : [];
       const departments = await database
         .prepare(
           `SELECT d.id,d.program_id AS programId,d.code,d.title FROM departments d WHERE d.program_id=? ${admin ? "" : "AND EXISTS (SELECT 1 FROM user_scopes us WHERE us.department_id=d.id AND us.program_id=d.program_id AND us.user_id=?)"} ORDER BY d.code`,
@@ -142,7 +146,7 @@ export function createApp(
       const executors = (hasPermission(req.user, "registry.write") || hasPermission(req.user, "workflow.assign"))
         ? await database
             .prepare(
-              `SELECT u.id,u.display_name AS displayName,us.department_id AS departmentId FROM users u JOIN user_scopes us ON us.user_id=u.id WHERE u.active=1 AND u.role='executor' AND us.program_id=? ${admin ? "" : "AND EXISTS (SELECT 1 FROM user_scopes own WHERE own.user_id=? AND own.program_id=us.program_id AND own.department_id=us.department_id)"} ORDER BY u.display_name,u.id`,
+              `SELECT u.id,u.display_name AS displayName,us.department_id AS departmentId FROM users u JOIN user_scopes us ON us.user_id=u.id WHERE u.active=1 AND u.role='executor' AND us.program_id=? ${executorAccountFilter(req.user)} ${admin ? "" : "AND EXISTS (SELECT 1 FROM user_scopes own WHERE own.user_id=? AND own.program_id=us.program_id AND own.department_id=us.department_id)"} ORDER BY u.display_name,u.id`,
             )
             .all(...(admin ? [id] : [id, req.user.id]))
         : [];
@@ -176,6 +180,7 @@ export function createApp(
           "executorId",
           "active",
           "periodKey",
+          "q",
           "page",
           "pageSize",
         ],
@@ -205,16 +210,30 @@ export function createApp(
         params.push(Number(req.query.active === "true"));
       }
       const where = conditions.join(" AND ");
-      const { n: total } = await database
-        .prepare(
+      const offset = (page - 1) * pageSize;
+      const filter = req.query.q === undefined ? "" : text(req.query.q, 200, true).normalize("NFC").toLocaleLowerCase("uk");
+      let total, rows;
+      if (filter) {
+        // SQLite lower() is ASCII-only. Match literal Ukrainian text consistently on both databases.
+        const candidates = await database.prepare(`
+          SELECT m.id,m.code,m.title FROM measures m JOIN sections s ON s.id=m.section_id
+          WHERE ${where} ORDER BY m.code,m.id
+        `).all(...params);
+        const matches = candidates.filter(({ code, title }) =>
+          `${code} ${title}`.normalize("NFC").toLocaleLowerCase("uk").includes(filter));
+        const ids = matches.slice(offset, offset + pageSize).map(({ id }) => id);
+        total = matches.length;
+        rows = ids.length ? await database.prepare(`
+          ${selectPeriodMeasure(rule)} WHERE m.id IN (${ids.map(() => "?").join(",")}) ORDER BY m.code,m.id
+        `).all(rule.period, ...ids) : [];
+      } else {
+        ({ n: total } = await database.prepare(
           `SELECT count(*) AS n FROM measures m JOIN sections s ON s.id=m.section_id WHERE ${where}`,
-        )
-        .get(...params);
-      const rows = await database
-        .prepare(
+        ).get(...params));
+        rows = await database.prepare(
           `${selectPeriodMeasure(rule)} WHERE ${where} ORDER BY m.code,m.id LIMIT ? OFFSET ?`,
-        )
-        .all(rule.period, ...params, pageSize, (page - 1) * pageSize);
+        ).all(rule.period, ...params, pageSize, offset);
+      }
       const items = rows.map((row) => periodMeasure(row, req.user, rule.period));
       return { items, total, page, pageSize };
     }, { readOnly: true });

@@ -218,7 +218,7 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, source
   const latest = items[0];
   const openPeriod = measure.active &&
     (!latest || (latest.status === "approved" && latest.outcome !== "completed"));
-  const writableExecutorId = canSubmit && (!isExecutor || assignment?.executorId === user.id)
+  const writableExecutorId = measure.active && canSubmit && (!isExecutor || assignment?.executorId === user.id)
     ? assignment?.executorId : null;
   const allowAssign = measure.active && latest?.status !== "submitted" &&
     !(latest?.status === "approved" && latest.outcome === "completed");

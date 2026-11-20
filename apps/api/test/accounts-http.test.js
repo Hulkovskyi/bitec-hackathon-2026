@@ -131,8 +131,15 @@ test("an administrator provisions a complete account with immediate, scoped pass
     body: { name: role.data.name, permissions: ["registry.write"] } })).status, 200);
   assert.equal((await request(report, { cookie })).status, 403);
   const { id: _id, effectiveFrom: _start, ...measure } = fixture.measures[0];
+  const registryOptions = `/programs/${programId}/registry-options`;
+  assert.deepEqual((await request(registryOptions, { cookie })).data.executors, []);
   assert.equal((await request("/measures", { method: "POST", cookie,
-    body: { ...measure, code: "CUSTOM-ROLE-TEST" } })).status, 201);
+    body: { ...measure, code: "SEED-ONLY-EXECUTOR" } })).status, 400);
+  const worker = await provision({ ...enrollment, username: "real.executor", roleId: "executor" }, adminCookie);
+  assert.equal(worker.status, 201);
+  assert.deepEqual((await request(registryOptions, { cookie })).data.executors.map(({ id }) => id), [worker.data.id]);
+  assert.equal((await request("/measures", { method: "POST", cookie,
+    body: { ...measure, executorId: worker.data.id, code: "CUSTOM-ROLE-TEST" } })).status, 201);
 
   const assignment = "/admin/accounts/" + created.data.id;
   assert.equal((await request(assignment, { method: "PATCH", cookie: adminCookie,
@@ -150,6 +157,22 @@ test("an administrator provisions a complete account with immediate, scoped pass
   assert.equal((await request("/me", { cookie })).status, 401);
   assert.equal((await request("/session", { method: "DELETE", cookie: rotated.cookie })).status, 204);
   assert.equal((await request("/me", { cookie: rotated.cookie })).status, 401);
+});
+
+test("bootstrap administrators with a custom username retain protected access", async (t) => {
+  const { request, login, admin, provision, enrollment } = await setup(t);
+  const { cookie } = await login(administrator);
+  const backup = { ...enrollment, username: "backup.admin", roleId: "admin", departmentIds: [] };
+  assert.equal((await provision(backup, cookie)).status, 201);
+  const { cookie: backupCookie } = await login(backup);
+  const path = `/admin/accounts/${admin.id}`;
+  const { accounts } = (await request("/admin/access", { cookie })).data;
+  assert.equal(accounts.find(({ id }) => id === admin.id).primaryAdministrator, true);
+  const profile = { username: "renamed.admin", fullName: administrator.fullName,
+    department: administrator.department, position: administrator.position, managerId: null };
+  assert.equal((await request(path + "/profile", { method: "PATCH", cookie, body: profile })).status, 403);
+  assert.equal((await request(path, { method: "DELETE", cookie: backupCookie })).status, 403);
+  assert.equal((await request("/me", { cookie })).status, 200);
 });
 
 test("invalid provisioning and duplicate usernames leave no partial account, scope or audit row", async (t) => {

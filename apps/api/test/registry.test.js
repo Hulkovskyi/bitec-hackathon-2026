@@ -176,6 +176,7 @@ test("all five roles: scoped lists, pagination/count, options and foreign IDs", 
       options.data.departments.length,
       [206, 208].includes(user) ? 2 : 1,
     );
+    if (user <= 203) assert.deepEqual(options.data.risks, []);
     assert.equal(
       options.data.executors.length,
       [205, 208].includes(user) ? (user === 208 ? 3 : 2) : 0,
@@ -222,6 +223,23 @@ test("all five roles: scoped lists, pagination/count, options and foreign IDs", 
     ).status,
     404,
   );
+});
+
+test("registry searches literal Ukrainian text within scope before pagination", async (t) => {
+  const { db, request, login } = await setup(t);
+  db.prepare("UPDATE measures SET title=? WHERE id=?").run("Спільний запит Ї %_", id(501));
+  db.prepare("UPDATE measures SET title=? WHERE id=?").run("Спільний запит Ї %_", id(502));
+  const path = `/api/measures?programId=${id(1)}&pageSize=1&q=${encodeURIComponent("СПІЛЬНИЙ ЗАПИТ Ї %_")}`;
+  const admin = await login(208);
+  const first = await request(path, { cookie: admin });
+  const second = await request(path + "&page=2", { cookie: admin });
+  assert.equal(first.data.total, 2);
+  assert.deepEqual(first.data.items.map(({ id }) => id), [id(501)]);
+  assert.deepEqual(second.data.items.map(({ id }) => id), [id(502)]);
+  const executor = await login(201);
+  assert.equal((await request(path, { cookie: executor })).data.total, 1);
+  assert.equal((await request(path + "&page=2", { cookie: executor })).data.items.length, 0);
+  assert.equal((await request(path + "&q=duplicate", { cookie: executor })).status, 400);
 });
 
 test("sessions: no implicit login, hashed tokens, expiry, deactivation, logout and Origin", async (t) => {

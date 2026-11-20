@@ -98,6 +98,33 @@ function App() {
     return () => controller.abort();
   }, [attempt]);
 
+  useEffect(() => {
+    if (!user) return;
+    let controller;
+    function checkSession() {
+      if (document.visibilityState !== "visible") return;
+      controller?.abort();
+      const check = new AbortController();
+      controller = check;
+      api("/me", { signal: check.signal })
+        .then((current) => {
+          if (!check.signal.aborted && JSON.stringify(current) !== JSON.stringify(user)) {
+            setUser((value) => value === user ? current : value);
+          }
+        })
+        .catch((cause) => {
+          if (!check.signal.aborted && cause.status === 401) {
+            setUser((value) => value === user ? null : value);
+          }
+        });
+    }
+    document.addEventListener("visibilitychange", checkSession);
+    return () => {
+      controller?.abort();
+      document.removeEventListener("visibilitychange", checkSession);
+    };
+  }, [user]);
+
   const sessionApi = useCallback(async (path, options) => {
     try {
       return await api(path, options);
@@ -179,7 +206,8 @@ function App() {
   const rolePreview = user.preview
     ? { onExit: exitRolePreview, ...previewExit }
     : user.role === "admin" ? { api: sessionApi, onStart: startRolePreview } : null;
-  return <Registry key={`${user.authKind}:${user.id}`} api={sessionApi} user={user}
+  const accessKey = JSON.stringify([user.authKind, user.id, user.roleId, user.permissions, user.scopes]);
+  return <Registry key={accessKey} api={sessionApi} user={user}
     logout={logout} changePassword={user.preview ? null : changePassword} rolePreview={rolePreview}
     busy={loading} sessionError={errorMessage} />;
 }
@@ -244,7 +272,7 @@ function Registry({ api, user, logout, changePassword, rolePreview, busy, sessio
   }
   return program ? (
     <Program key={program.id} api={api} program={program} user={user} shell={shell} sessionError={sessionError}
-      initialView={navigation} onOpenGlobal={setNavigation} />
+      initialView={navigation} onNavigate={setNavigation} />
   ) : (
     <Workspace {...shell} programNavigation={false} onNavigate={manageAccess || importRegistry ? setNavigation : null}>
       {sessionError}
@@ -268,23 +296,7 @@ function scheduleLabel(measure) {
   return formatRegistryDate(measure.plannedDate);
 }
 
-// Search uses the same server-filtered list and loads its pages only when needed.
-async function registryPage(api, query, searching, signal) {
-  const parameters = new URLSearchParams(query);
-  if (!searching) return api("/measures?" + parameters, { signal });
-  parameters.set("page", "1");
-  parameters.set("pageSize", "100");
-  const first = await api("/measures?" + parameters, { signal });
-  const items = [...first.items];
-  for (let page = 2; page <= Math.ceil(first.total / first.pageSize); page += 1) {
-    parameters.set("page", String(page));
-    const response = await api("/measures?" + parameters, { signal });
-    items.push(...response.items);
-  }
-  return { ...first, items };
-}
-
-function Program({ api, program, user, shell, sessionError, initialView, onOpenGlobal }) {
+function Program({ api, program, user, shell, sessionError, initialView, onNavigate }) {
   const [reportPeriod, setReportPeriod] = useState(null);
   const [signalSubject, setSignalSubject] = useState(null);
   const [registryNotice, setRegistryNotice] = useState("");
@@ -310,9 +322,7 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
   const detailView = useRef(0);
   const detailHeading = useRef(null);
   const focusOnDetail = useRef(false);
-  const searchTerm = search.trim().toLocaleLowerCase("uk");
-  const searching = Boolean(searchTerm);
-  const serverPage = searching ? 1 : page;
+  const searchTerm = search.trim().normalize("NFC").toLocaleLowerCase("uk");
   useEffect(() => () => {
     detailView.current += 1;
     detailRequest.current?.abort();
@@ -328,44 +338,53 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
       : current);
   }, []);
 
+  const [optionsError, setOptionsError] = useState(null);
   useEffect(() => {
+    const controller = new AbortController();
+    setOptionsError(null);
+    api(`/programs/${program.id}/registry-options`, { signal: controller.signal })
+      .then((value) => { if (!controller.signal.aborted) setOptions(value); })
+      .catch((cause) => { if (!controller.signal.aborted) setOptionsError(cause); });
+    return () => controller.abort();
+  }, [api, program.id, refresh]);
+  useEffect(() => {
+    if (view !== "registry") return;
     const controller = new AbortController();
     setLoading(true);
     setError(null);
     const query = new URLSearchParams({
       programId: program.id,
-      page: String(serverPage),
+      page: String(page),
       pageSize: String(registryPageSize),
       ...(section ? { sectionId: section } : {}),
       ...(active ? { active } : {}),
       ...(periodKey ? { periodKey } : {}),
+      ...(searchTerm ? { q: searchTerm } : {}),
     });
-    Promise.all([
-      api(`/programs/${program.id}/registry-options`, {
-        signal: controller.signal,
-      }),
-      registryPage(api, query, searching, controller.signal),
-    ])
-      .then(([o, r]) => {
+    const load = async () => {
+      try {
+        const value = await api("/measures?" + query, { signal: controller.signal });
         if (controller.signal.aborted) return;
-        setOptions(o);
-        const lastPage = lastRegistryPage(r.total);
-        if (!searching && serverPage > lastPage) {
-          // A save can remove the only row on the current server page.
+        const lastPage = lastRegistryPage(value.total);
+        if (page > lastPage) {
           setResult(null);
           setPage(lastPage);
-          return;
+        } else {
+          setResult(value);
         }
-        setResult(r);
-      })
-      .catch((e) => {
-        if (!controller.signal.aborted) setError(e);
-      })
-      .finally(() => {
+      } catch (cause) {
+        if (!controller.signal.aborted) setError(cause);
+      } finally {
         if (!controller.signal.aborted) setLoading(false);
-      });
-    return () => controller.abort();
-  }, [api, program.id, serverPage, section, active, periodKey, refresh, searching]);
+      }
+    };
+    const timeout = searchTerm ? setTimeout(load, 180) : null;
+    if (timeout === null) load();
+    return () => {
+      clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [api, program.id, page, section, active, periodKey, refresh, searchTerm, view]);
   function clearDetail() {
     detailView.current += 1;
     detailRequest.current?.abort();
@@ -378,7 +397,7 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
   }
   function changePage(offset) {
     clearDetail();
-    if (!searching) setResult(null);
+    setResult(null);
     setPage((p) => p + offset);
   }
   async function open(id, {
@@ -421,7 +440,8 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
       return;
     }
     setView("registry");
-    if (section || active || searching || page !== 1 || periodKey !== requestedPeriod) {
+    onNavigate("registry");
+    if (section || active || searchTerm || page !== 1 || periodKey !== requestedPeriod) {
       setResult(null);
       setSection("");
       setActive("");
@@ -434,7 +454,9 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
   function openSignalSubject(subject) {
     clearDetail();
     setSignalSubject(subject);
-    setView(subject.type === "risk" ? "corruptionRisks" : "dashboard");
+    const next = subject.type === "risk" ? "corruptionRisks" : "dashboard";
+    setView(next);
+    onNavigate(next);
   }
   function beginSave() {
     const originView = detailView.current;
@@ -465,8 +487,8 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
     if (next === view) return;
     clearDetail();
     setSignalSubject(null);
-    if (next === "access" || next === "registryImport" || next === "programManagement") onOpenGlobal(next);
-    else setView(next);
+    onNavigate(next);
+    if (!["access", "registryImport", "programManagement"].includes(next)) setView(next);
   }
   function resetList() {
     clearDetail();
@@ -474,18 +496,12 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
     setPage(1);
   }
   const resultAnchor = useRef(null);
-  const matches = searching && result
-    ? result.items.filter((item) => `${item.code} ${item.title}`.toLocaleLowerCase("uk").includes(searchTerm))
-    : null;
-  const total = matches?.length ?? result?.total ?? 0;
+  const missingRegistrySetup = options && (!options.departments.length
+    ? "Спочатку додайте підрозділ."
+    : !options.executors.length ? "Спочатку призначте виконавця з активним обліковим записом." : "");
+  const total = result?.total ?? 0;
   const lastPage = lastRegistryPage(total);
-  const visiblePage = matches ? Math.min(page, lastPage) : page;
-  useEffect(() => {
-    if (page !== visiblePage) setPage(visiblePage);
-  }, [page, visiblePage]);
-  const rows = matches
-    ? matches.slice((visiblePage - 1) * registryPageSize, visiblePage * registryPageSize)
-    : result?.items ?? [];
+  const rows = result?.items ?? [];
   const viewMode = view === "dashboard" ? "overview" : view;
   const deletionView = detailView.current;
   const programContext = (
@@ -539,6 +555,8 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
         </div>
         {canEditRegistry && options && (program.periodEnd < kyivToday() ? (
           <p className="count">Період програми завершено.</p>
+        ) : missingRegistrySetup ? (
+          <p className="count">{missingRegistrySetup}</p>
         ) : (
           <button type="button" className="with-icon" onClick={() => {
             clearDetail();
@@ -550,10 +568,11 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
       </header>}
       {view === "departments" ? (
         <>
-          <ErrorMessage error={error} />
+          <ErrorMessage error={optionsError} />
+          {optionsError && <button className="secondary" type="button" onClick={() => setRefresh((n) => n + 1)}>Повторити завантаження</button>}
           {options ? <DepartmentAdmin key={program.id} api={api} program={program}
             departments={options.departments} onChange={() => setRefresh((value) => value + 1)} />
-            : !error && <p className="count" role="status">Завантаження підрозділів…</p>}
+            : !optionsError && <p className="count" role="status">Завантаження підрозділів…</p>}
         </>
       ) : view === "passport" || view === "corruptionRisks" ? (
         <ProgramReference view={view} program={program} programContext={programContext}
@@ -579,13 +598,11 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
                   <span>Пошук заходів</span>
                   <span className="search-field">
                     <Glyph name="search" size={17} />
-                    <input type="search" placeholder="Код або назва" value={search}
+                    <input type="search" maxLength={200} placeholder="Код або назва" value={search}
                       onChange={(event) => {
                         const next = event.target.value;
-                        if (Boolean(next.trim()) !== searching) setResult(null);
-                        clearDetail();
+                        if (next.trim().normalize("NFC").toLocaleLowerCase("uk") !== searchTerm) resetList();
                         setSearch(next);
-                        setPage(1);
                       }} />
                   </span>
                 </label>
@@ -627,8 +644,8 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
                 </label>
               </div>
               <div className="register-content">
-                <ErrorMessage error={error} />
-                {error && (
+                <ErrorMessage error={error ?? optionsError} />
+                {(error || optionsError) && (
                   <button className="secondary" type="button" onClick={() => setRefresh((value) => value + 1)}>
                     Повторити завантаження
                   </button>
@@ -641,16 +658,16 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
                       <RegistryTable items={rows} selectedId={selected?.id} departments={options?.departments}
                         disabled={detailLoading} onOpen={(id) => open(id, { focusHeading: true })} />
                     ) : (
-                      <p className="empty">{searching
+                      <p className="empty">{searchTerm
                         ? "За цим запитом заходів немає."
                         : "За вибраними фільтрами немає доступних заходів."}</p>
                     )}
                     {lastPage > 1 && (
                       <nav className="register-pagination" aria-label="Сторінки реєстру">
-                        <button className="secondary" type="button" disabled={visiblePage === 1 || loading}
+                        <button className="secondary" type="button" disabled={page === 1 || loading}
                           onClick={() => changePage(-1)}>Попередня</button>
-                        <span>Сторінка {visiblePage}</span>
-                        <button className="secondary" type="button" disabled={visiblePage >= lastPage || loading}
+                        <span>Сторінка {page}</span>
+                        <button className="secondary" type="button" disabled={page >= lastPage || loading}
                           onClick={() => changePage(1)}>Наступна</button>
                       </nav>
                     )}
@@ -688,7 +705,9 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
                   <dt>Індикатор</dt>
                   <dd>{selected.indicator.title}: {selected.indicator.baseline ?? "—"} → {selected.indicator.target ?? "—"} {selected.indicator.unit ?? ""}</dd>
                   <dt>Ризик</dt>
-                  <dd>{options?.risks.find((entry) => entry.id === selected.riskId)?.title || "Не застосовується"}</dd>
+                  <dd>{selected.riskId
+                    ? options?.risks.find((entry) => entry.id === selected.riskId)?.title ?? "Назва недоступна"
+                    : "Не застосовується"}</dd>
                   <dt>Версія запису</dt>
                   <dd>{selected.version}</dd>
                 </dl>
@@ -785,7 +804,8 @@ function MeasureForm({
   onCancel,
   onReload,
 }) {
-  const firstDepartment = options.departments[0]?.id || "";
+  const firstDepartment = options.departments.find(({ id }) =>
+    options.executors.some(({ departmentIds }) => departmentIds.includes(id)))?.id ?? options.departments[0]?.id ?? "";
   const [value, setValue] = useState(() =>
     original
       ? {
@@ -822,6 +842,7 @@ function MeasureForm({
   const change = (key, v) => setValue((old) => ({ ...old, [key]: v }));
   const indicator = (key, v) =>
     setValue((old) => ({ ...old, indicator: { ...old.indicator, [key]: v } }));
+  const availableExecutors = options.executors.filter((item) => item.departmentIds.includes(value.departmentId));
   const today = kyivToday();
   const effectiveFrom = original?.effectiveFrom ?? (today > program.periodStart ? today : program.periodStart);
   const riskRequired =
@@ -936,14 +957,15 @@ function MeasureForm({
               onChange={(e) => change("executorId", e.target.value)}
             >
               <option value="">Оберіть виконавця</option>
-              {options.executors
-                .filter((e) => e.departmentIds.includes(value.departmentId))
-                .map((e) => (
-                  <option key={e.id} value={e.id}>
-                    {e.displayName}
-                  </option>
-                ))}
+              {value.executorId && !availableExecutors.some(({ id }) => id === value.executorId) &&
+                <option value={value.executorId}>Поточний виконавець недоступний</option>}
+              {availableExecutors.map((e) => (
+                <option key={e.id} value={e.id}>{e.displayName}</option>
+              ))}
             </select>
+            {!availableExecutors.length && !value.executorId && (
+              <span className="count">У цього підрозділу ще немає виконавця з активним доступом.</span>
+            )}
           </label>
           {riskRequired && (
             <label>

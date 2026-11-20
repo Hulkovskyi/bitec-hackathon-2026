@@ -191,6 +191,7 @@ function summarize(rows) {
       problemRows.push({
         measureId, periodKey, resultId, code, title, departmentTitle, executionState,
         targetReached: row.indicator.targetReached,
+        ...(row.sourceResult ? { source: "official" } : {}),
       });
     }
   }

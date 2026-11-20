@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, audit, forbidden, missing, programAllowed, scope } from "./registry.js";
+import { access, audit, forbidden, missing, programAllowed, riskCatalogScope, scope } from "./registry.js";
 import { hasPermission } from "./permissions.js";
 import { ApiError, choice, date, flag, invalid, keys, text, uuid } from "./validation.js";
 
@@ -144,11 +144,7 @@ async function readRisks(db, user, programId, riskId = null) {
     SELECT 1 FROM user_scopes us
     WHERE us.user_id=? AND us.program_id=r.program_id AND us.department_id=ri.owner_department_id
   )`;
-  const linkedScope = `EXISTS (
-    SELECT 1 FROM measures m JOIN sections s ON s.id=m.section_id
-    JOIN user_scopes us ON us.program_id=s.program_id AND us.department_id=m.department_id
-    WHERE m.risk_id=r.id AND s.program_id=r.program_id AND us.user_id=?
-  )`;
+  const visible = riskCatalogScope(user);
   const rows = await db.prepare(`
     SELECT r.id, r.code, r.title, ri.title AS indicator_title, ri.unit, ri.direction, ri.baseline,
            ri.baseline_on, ri.target, ri.target_on, ri.description, ri.likelihood, ri.impact,
@@ -157,10 +153,10 @@ async function readRisks(db, user, programId, riskId = null) {
     FROM risks r LEFT JOIN risk_indicators ri ON ri.risk_id=r.id
     LEFT JOIN departments d ON d.id=ri.owner_department_id AND d.program_id=r.program_id
     WHERE r.program_id=? ${riskId === null ? "" : "AND r.id=?"}
-      ${admin ? "" : `AND (${ownerScope} OR ${linkedScope})`}
+      AND ${visible.sql}
     ORDER BY r.code, r.id
   `).all(...(admin ? [] : [user.id]), programId, ...(riskId === null ? [] : [riskId]),
-    ...(admin ? [] : [user.id, user.id]));
+    ...visible.params);
   if (!rows.length && riskId !== null) missing();
   const readingsForRisk = db.prepare(`
     SELECT id, reading_on, value, source FROM risk_measurements

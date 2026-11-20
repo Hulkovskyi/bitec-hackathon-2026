@@ -69,7 +69,6 @@ function AccessAssignment({ account, roles, departments, label, busy, error, onS
 }
 
 function AccountProfileFields({ account, managers, busy }) {
-  const primaryAdministrator = account?.roleId === "admin" && account.username === "admin";
   const availableManagers = managers.filter(({ id }) => id !== account?.id);
   const currentManagerMissing = account?.managerId && !availableManagers.some(({ id }) => id === account.managerId);
   return (
@@ -90,7 +89,7 @@ function AccountProfileFields({ account, managers, busy }) {
       <label>
         Логін
         <input name="username" defaultValue={account?.username} autoCapitalize="none" spellCheck={false}
-          readOnly={primaryAdministrator} minLength={3} maxLength={64} required disabled={busy} />
+          readOnly={account?.primaryAdministrator} minLength={3} maxLength={64} required disabled={busy} />
       </label>
     </>
   );
@@ -212,8 +211,7 @@ function AccountList({ accounts, managers, roles, departments, applications, rev
         const editType = editor?.id === account.id ? editor.type : null;
         const applicationPath = `/admin/applications/${account.id}/decision`;
         const accountPath = `/admin/accounts/${account.id}`;
-        const allowedToRemove = account.id !== currentUserId
-          && !(account.roleId === "admin" && account.username === "admin");
+        const allowedToRemove = account.id !== currentUserId && !account.primaryAdministrator;
         const scopeLabels = account.departmentIds.map((id) => departmentsById.get(id))
           .filter(Boolean).map(({ programCode, title }) => `${programCode} · ${title}`);
         return (
@@ -393,7 +391,8 @@ export function AdminAccess({ api, currentUserId }) {
   const applications = tab === "applications";
   const revoked = tab === "revoked";
   const accountStatus = applications ? filter : revoked ? "revoked" : "approved";
-  const accounts = data?.accounts.filter(({ status }) => status === accountStatus);
+  const accounts = data?.accounts.filter(({ status, submittedAt }) =>
+    status === accountStatus && (!applications || filter === "pending" || submittedAt));
   const managers = data?.accounts.filter(({ status }) => status === "approved");
   const editProps = { editor, onEdit: edit, onSave: save, busy, error: saveError };
   return (

@@ -3,12 +3,14 @@ import { adaptDatabase } from "./database.js";
 import { hasPermission, loadPermissions } from "./permissions.js";
 import {
   audit,
+  executorAccountFilter,
   forbidden,
   kyivDate,
   measure,
   missing,
 } from "./registry.js";
 import {
+  assertActiveMeasure,
   assertPeriod,
   assertResultEditor,
   canReadResult,
@@ -113,10 +115,6 @@ function planSnapshot(row) {
 const versionConflict = () =>
   new ApiError(409, "version_conflict", "Версія результату змінилася");
 
-function inactiveMeasure() {
-  throw new ApiError(409, "inactive_measure", "Захід неактивний");
-}
-
 function latestResult(db, measureId, periodKey) {
   return db.prepare(
     "SELECT * FROM results WHERE measure_id=? AND period_key=? ORDER BY revision DESC LIMIT 1",
@@ -174,7 +172,7 @@ export async function createResult(db, user, measureId, input) {
   return adaptDatabase(db).transaction(async (db) => {
     const plan = await planForScope(db, user, measureId);
     const { executorId } = await assignmentForUser(db, plan, user, periodKey);
-    if (!plan.active) inactiveMeasure();
+    assertActiveMeasure(plan);
 
     const previous = await latestResult(db, plan.id, periodKey);
     if (previous && previous.status !== "approved")
@@ -248,7 +246,7 @@ export async function assignExecutor(db, user, measureId, input) {
     const plan = await planForScope(db, user, measureId);
     const periodKey = input.periodKey;
     assertPeriod(plan, periodKey);
-    if (!plan.active) inactiveMeasure();
+    assertActiveMeasure(plan);
     const before = await effectiveAssignment(db, plan, periodKey);
     if (version !== before.version) throw versionConflict();
 
@@ -261,7 +259,7 @@ export async function assignExecutor(db, user, measureId, input) {
       `SELECT 1 FROM users u
        JOIN user_scopes us ON us.user_id=u.id
        WHERE u.id=? AND u.role='executor' AND u.active=1
-         AND us.program_id=? AND us.department_id=?`,
+         AND us.program_id=? AND us.department_id=? ${executorAccountFilter(user)}`,
     ).get(executorId, plan.program_id, plan.department_id);
     if (!eligible) invalid("Виконавець не має доступу до підрозділу");
 
@@ -319,7 +317,7 @@ export async function transitionResult(
     if (submit) {
       if ((await effectiveAssignment(db, plan, result.period_key)).executorId !== result.executor_id)
         missing();
-      if (!plan.active) inactiveMeasure();
+      assertActiveMeasure(plan);
     } else if (!(await isIndependentReviewer(db, result, actor.id))) {
       forbidden();
     }

@@ -73,6 +73,22 @@ async function setup(t, measures, today = () => date, evidenceStore) {
   return { db, directory, login, request };
 }
 
+test("annual obligations remain in the H1 denominator after the May deadline", async (t) => {
+  const annual = measure(850, "ANNUAL-H1", { scheduleType: "periodic", recurrence: "annual_april_may", plannedDate: null });
+  let current = "2026-06-01";
+  const { login } = await setup(t, [annual], () => current);
+  const get = await login(208);
+  const path = `/dashboard?programId=${program}`;
+  const june = checked(await get(path));
+  assert.equal(june.counts.measures, 1);
+  assert.equal(june.items[0].deadline, "2026-05-31");
+  assert.equal(june.counts.overdue, 1);
+  current = "2026-07-01";
+  const july = checked(await get(path));
+  assert.equal(july.counts.measures, 0);
+  assert.equal(july.counts.overdue, 1);
+});
+
 function checked(response, status = 200) {
   assert.equal(response.status, status, JSON.stringify(response.data));
   return response.data;
