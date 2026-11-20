@@ -106,11 +106,11 @@ function PeriodResults({ api, measure, onPlanLockChange, options, period, source
   const resultPath = `/measures/${measure.id}/results`;
   const assignmentPath = `/measures/${measure.id}/assignment`;
   const isExecutor = user.role === "executor";
-  const canAssign = hasPermission(user, "workflow.assign", user.role === "coordinator");
-  const canSubmit = hasPermission(user, "workflow.submit", isExecutor);
+  const canAssign = !user.preview && hasPermission(user, "workflow.assign", user.role === "coordinator");
+  const canSubmit = !user.preview && hasPermission(user, "workflow.submit", isExecutor);
   const canTrackAssignments = hasPermission(user, "audit.read", user.role === "coordinator") &&
     hasPermission(user, "audit.assignments", user.role === "coordinator");
-  const canEditPlan = !isExecutor && hasPermission(user, "registry.write", user.role === "coordinator");
+  const canEditPlan = !user.preview && !isExecutor && hasPermission(user, "registry.write", user.role === "coordinator");
 
   useEffect(() => {
     const controller = new AbortController();
@@ -407,7 +407,8 @@ function ResultDetail({
 
   const editable = writableExecutorId === result.executorId &&
     ["draft", "returned"].includes(result.status);
-  const canReview = result.status === "submitted" && result.canReview;
+  const canReview = !user.preview && result.status === "submitted" && result.canReview;
+  const canCheck = hasPermission(user, "workflow.review", ["coordinator", "admin"].includes(user.role));
   const canAudit = hasPermission(user, "audit.read", ["executor", "coordinator", "admin"].includes(user.role));
   const busyOrLoading = Boolean(busy) || loading;
 

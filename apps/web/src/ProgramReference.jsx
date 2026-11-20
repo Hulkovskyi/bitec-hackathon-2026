@@ -106,7 +106,7 @@ function PassportForm({ api, path, data, departments, close, update }) {
   );
 }
 
-function Passport({ api, path, departments }) {
+function Passport({ api, path, departments, readOnly }) {
   const request = useProgramReference(api, path);
   const { data } = request;
   const [editing, setEditing] = useState(false);
@@ -119,7 +119,7 @@ function Passport({ api, path, departments }) {
           <section className="dashboard-panel reference-section" aria-labelledby="program-goals">
             <div className="reference-section-heading">
               <h2 id="program-goals">Мета та цілі програми</h2>
-              {data.canEdit && !editing && <button className="secondary" type="button"
+              {!readOnly && data.canEdit && !editing && <button className="secondary" type="button"
                 onClick={() => { setNotice(""); setEditing(true); }}>Редагувати паспорт</button>}
             </div>
             <div role="status">{notice && <p className="reference-notice">{notice}</p>}</div>
@@ -261,7 +261,7 @@ function RiskFacts({ risk }) {
   );
 }
 
-function RiskRecord({ risk, api, path, departments, refresh }) {
+function RiskRecord({ risk, api, path, departments, refresh, readOnly }) {
   const [form, setForm] = useState("");
   const [notice, setNotice] = useState("");
   const { indicator, readings } = risk;
@@ -306,7 +306,7 @@ function RiskRecord({ risk, api, path, departments, refresh }) {
         </details>
       )}
       <div role="status">{notice && <p className="reference-notice">{notice}</p>}</div>
-      {!form && (risk.canMeasure || risk.canEditIndicator) && (
+      {!readOnly && !form && (risk.canMeasure || risk.canEditIndicator) && (
         <div className="reference-actions">
           {risk.canMeasure && indicator && <button type="button" onClick={() => open("reading")}>Додати вимірювання</button>}
           {risk.canEditIndicator && <button className="secondary" type="button" onClick={() => open("indicator")}>
@@ -322,7 +322,7 @@ function RiskRecord({ risk, api, path, departments, refresh }) {
   );
 }
 
-function CorruptionRisks({ api, path, departments }) {
+function CorruptionRisks({ api, path, departments, readOnly }) {
   const request = useProgramReference(api, path);
   return (
     <>
@@ -331,7 +331,7 @@ function CorruptionRisks({ api, path, departments }) {
         <div className="dashboard-panel reference-risk-list">
           {request.data.items.map((risk) => (
             <RiskRecord key={risk.id} risk={risk} api={api} path={`${path}/${risk.id}`}
-              departments={departments} refresh={request.refresh} />
+              departments={departments} refresh={request.refresh} readOnly={readOnly} />
           ))}
         </div>
       )}
@@ -340,7 +340,7 @@ function CorruptionRisks({ api, path, departments }) {
   );
 }
 
-export function ProgramReference({ view, program, programContext, departments, api }) {
+export function ProgramReference({ view, program, programContext, departments, api, readOnly }) {
   const passport = view === "passport";
   const path = `/programs/${program.id}/${passport ? "passport" : "corruption-risks"}`;
   return (
@@ -352,8 +352,8 @@ export function ProgramReference({ view, program, programContext, departments, a
         </div>
       </header>
       {passport
-        ? <Passport key={path} api={api} path={path} departments={departments} />
-        : <CorruptionRisks key={path} api={api} path={path} departments={departments} />}
+        ? <Passport key={path} api={api} path={path} departments={departments} readOnly={readOnly} />
+        : <CorruptionRisks key={path} api={api} path={path} departments={departments} readOnly={readOnly} />}
     </section>
   );
 }

@@ -2,7 +2,8 @@ import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from "no
 import { promisify } from "node:util";
 import { adaptDatabase, databaseConstraintKind } from "./database.js";
 import { rolePermissions } from "./permissions.js";
-import { audit, missing } from "./registry.js";
+import { audit, forbidden, missing } from "./registry.js";
+import { assertPreviewAdministrator, exitRolePreview, mountRolePreviewRoutes, previewIdentity } from "./role-preview.js";
 import { ApiError, invalid, keys, text, uuid } from "./validation.js";
 
 const cookieName = "dacm_session";
@@ -76,7 +77,15 @@ async function startSession(db, req, res, options, userId, kind, verifiedPasswor
   const token = randomBytes(32).toString("hex");
   const now = Date.now();
   const expiresAt = new Date(now + sessionDuration).toISOString();
+  const previousToken = tokenFrom(req);
   await db.transaction(async (tx) => {
+    if (previousToken && (await tx.prepare(`
+      SELECT 1 FROM account_session_previews p
+      JOIN account_sessions s ON s.id_hash=p.session_id_hash
+      JOIN credential_accounts a ON a.user_id=s.user_id
+      JOIN users u ON u.id=a.user_id
+      WHERE s.id_hash=? AND s.expires_at>? AND u.active=1 AND u.role='admin' AND a.status='approved'
+    `).get(digest(previousToken), new Date().toISOString()))) forbidden();
     if (kind === "password") {
       const current = await tx.prepare(`
         SELECT 1 FROM credential_accounts a JOIN users u ON u.id=a.user_id
@@ -84,7 +93,7 @@ async function startSession(db, req, res, options, userId, kind, verifiedPasswor
       `).get(userId, verifiedPasswordHash);
       if (!current) invalidCredentials();
     }
-    await deleteSession(tx, tokenFrom(req));
+    await deleteSession(tx, previousToken);
     const table = kind === "password" ? "account_sessions" : "sessions";
     await tx.prepare(`DELETE FROM ${table} WHERE expires_at<=?`).run(new Date(now).toISOString());
     if (kind === "password") {
@@ -99,7 +108,7 @@ async function startSession(db, req, res, options, userId, kind, verifiedPasswor
     .status(201).json({ userId });
 }
 
-function rateLimit(requests, windowMs) {
+function rateLimit(requests, windowMs, clientKey = (req) => req.ip) {
   const clients = new Map();
   let nextCleanup = 0;
   return (req, res, next) => {
@@ -110,7 +119,7 @@ function rateLimit(requests, windowMs) {
       }
       nextCleanup = now + windowMs;
     }
-    const client = req.ip;
+    const client = clientKey(req);
     let entry = clients.get(client);
     if (!entry || entry.until <= now) {
       entry = { count: 0, until: now + windowMs };
@@ -229,10 +238,12 @@ export function mountSessionRoutes(app, db, options) {
       SELECT u.id, u.display_name AS displayName, u.role, a.username,
              a.department, a.position, a.status, a.role_id AS roleId,
              manager.id AS managerId, manager.display_name AS managerName,
-             r.name AS roleName, r.permissions_json
+             r.name AS roleName, r.permissions_json, p.preview_user_id,
+             p.session_id_hash IS NOT NULL AS preview_active
       FROM account_sessions s JOIN credential_accounts a ON a.user_id=s.user_id
       JOIN users u ON u.id=a.user_id LEFT JOIN account_roles r ON r.id=a.role_id
       ${accountManagerJoin(db)}
+      LEFT JOIN account_session_previews p ON p.session_id_hash=s.id_hash
       WHERE s.id_hash=? AND s.expires_at>? AND a.status='approved' AND u.active=1
     `).get(hash, now);
     if (account) {
@@ -242,6 +253,10 @@ export function mountSessionRoutes(app, db, options) {
         permissions: rolePermissions(role, account.permissions_json),
         profile: { username, fullName: displayName, department, position, managerId, managerName },
       };
+      req.passwordSession = { id, hash, role, previewActive: Boolean(account.preview_active) };
+      if (req.passwordSession.previewActive && role === "admin") {
+        req.user = await previewIdentity(db, account.preview_user_id);
+      }
     } else if (options.demoMode) {
       const demo = await db.prepare(`
         SELECT u.id,u.display_name AS displayName,u.role,r.name AS roleName FROM sessions s
@@ -255,15 +270,65 @@ export function mountSessionRoutes(app, db, options) {
     next();
   });
   app.delete("/api/session", async (req, res) => {
-    await db.transaction((tx) => deleteSession(tx, tokenFrom(req)));
+    await db.transaction(async (tx) => {
+      await exitRolePreview(tx, req.passwordSession);
+      await deleteSession(tx, tokenFrom(req));
+    });
     res.clearCookie(cookieName, cookieOptions(req, options)).status(204).end();
   });
+  mountRolePreviewRoutes(app, db);
   app.get("/api/me", async (req, res) => {
+    assertPreviewAdministrator(req.passwordSession);
     keys(req.query, []);
-    const scopes = await db.prepare(`
+    const scopes = req.user.preview?.unavailable ? [] : await db.prepare(`
       SELECT program_id AS programId,department_id AS departmentId FROM user_scopes WHERE user_id=?
       ORDER BY program_id,department_id
     `).all(req.user.id);
     res.json({ ...req.user, scopes });
+  });
+  app.use("/api", (req, _res, next) => {
+    assertPreviewAdministrator(req.passwordSession);
+    if (req.user.preview) {
+      if (req.method !== "GET" && req.method !== "HEAD") forbidden();
+      if (req.user.preview.unavailable) {
+        throw new ApiError(409, "role_preview_unavailable", "Обліковий запис для перегляду більше не доступний");
+      }
+    }
+    next();
+  });
+  app.post("/api/auth/password", rateLimit(10, 10 * 60_000, (req) => req.user.id), async (req, res) => {
+    if (req.user.authKind !== "password") forbidden();
+    keys(req.query, []);
+    const fields = ["currentPassword", "newPassword"];
+    keys(req.body, fields, fields);
+    const currentPassword = validateAccountPassword(req.body.currentPassword, 1);
+    const newPassword = validateAccountPassword(req.body.newPassword);
+    if (Buffer.from(currentPassword).equals(Buffer.from(newPassword))) {
+      invalid("Новий пароль має відрізнятися від поточного");
+    }
+    const id = req.user.id;
+    const sessionHash = digest(tokenFrom(req));
+    const current = await db.prepare("SELECT password_hash FROM credential_accounts WHERE user_id=?").get(id);
+    if (!(await passwordMatches(currentPassword, current?.password_hash)) || !current) {
+      throw new ApiError(401, "invalid_credentials", "Невірний поточний пароль");
+    }
+    const replacementHash = await passwordHash(newPassword);
+    await db.transaction(async (tx) => {
+      const { changes } = await tx.prepare(`
+        UPDATE credential_accounts SET password_hash=?
+        WHERE user_id=? AND password_hash=? AND status='approved'
+          AND EXISTS (SELECT 1 FROM users u WHERE u.id=credential_accounts.user_id AND u.active=1)
+          AND EXISTS (
+            SELECT 1 FROM account_sessions s
+            WHERE s.user_id=credential_accounts.user_id AND s.id_hash=? AND s.expires_at>?
+              AND NOT EXISTS (SELECT 1 FROM account_session_previews p WHERE p.session_id_hash=s.id_hash)
+          )
+      `).run(replacementHash, id, current.password_hash, sessionHash, new Date().toISOString());
+      if (changes !== 1) throw new ApiError(409, "password_changed", "Пароль або сеанс уже змінився. Увійдіть знову");
+      await tx.prepare("DELETE FROM account_sessions WHERE user_id=?").run(id);
+      await tx.prepare("DELETE FROM sessions WHERE user_id=?").run(id);
+      await audit(tx, id, "change_password", "account", id, null, null);
+    });
+    res.clearCookie(cookieName, cookieOptions(req, options)).status(204).end();
   });
 }

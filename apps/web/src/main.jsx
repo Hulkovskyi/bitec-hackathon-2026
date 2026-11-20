@@ -9,7 +9,7 @@ import { RegistryImport } from "./RegistryImport.jsx";
 import { ResultPanel } from "./ResultPanel.jsx";
 import { measurePeriods, recurrenceLabels } from "./measure-schedule.js";
 import { halfYears, kyivToday } from "./periods.js";
-import { Glyph, Workspace } from "./Workspace.jsx";
+import { Glyph, SignIn, Workspace } from "./Workspace.jsx";
 import { hasPermission, roleNames } from "./permissions.js";
 import "./styles.css";
 
@@ -44,11 +44,15 @@ function ErrorMessage({ error }) {
 }
 function App() {
   const [user, setUser] = useState(null);
+  const [notice, setNotice] = useState("");
+  const [sessionChecking, setSessionChecking] = useState(true);
+  const [previewExit, setPreviewExit] = useState({ busy: false, error: null });
   const [loading, setLoading] = useState(true),
     [error, setError] = useState(null);
   const [attempt, setAttempt] = useState(0);
   const sessionChannel = useRef(null);
   const refreshSession = useCallback(() => {
+    setSessionChecking(true);
     setLoading(true);
     setUser(null);
     setAttempt((value) => value + 1);
@@ -72,7 +76,7 @@ function App() {
     api("/me", { signal: controller.signal })
       .then((current) => {
         if (controller.signal.aborted) return;
-        if (current.authKind === "password" && current.status === "approved") {
+        if ((current.authKind === "password" || current.authKind === "preview") && current.status === "approved") {
           setUser(current);
         } else if (current.authKind === "password") {
           setError("Адміністратор ще не відкрив доступ до цього облікового запису.");
@@ -82,7 +86,10 @@ function App() {
         if (!controller.signal.aborted && e.status !== 401) setError(e);
       })
       .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        if (!controller.signal.aborted) {
+          setSessionChecking(false);
+          setLoading(false);
+        }
       });
     return () => controller.abort();
   }, [attempt]);
@@ -94,15 +101,19 @@ function App() {
       if (cause.status === 401 && !options?.signal?.aborted) {
         setUser((current) => current === user ? null : current);
       }
+      if (cause.code === "role_preview_unavailable" && user?.preview && !options?.signal?.aborted) {
+        refreshSession();
+      }
       throw cause;
     }
-  }, [user]);
+  }, [user, refreshSession]);
 
   async function authenticate(credentials) {
     setLoading(true);
     setError(null);
     try {
       await api("/auth/login", { method: "POST", body: JSON.stringify(credentials) });
+      setNotice("");
       sessionChannel.current?.postMessage("changed");
       refreshSession();
     } catch (e) {
@@ -110,6 +121,36 @@ function App() {
       setLoading(false);
     }
   }
+  async function changePassword(credentials) {
+    try {
+      await api("/auth/password", { method: "POST", body: JSON.stringify(credentials) });
+    } catch (cause) {
+      if (cause.status === 401 && cause.code !== "invalid_credentials") refreshSession();
+      throw cause;
+    }
+    setNotice("Пароль змінено. Увійдіть із новим паролем.");
+    sessionChannel.current?.postMessage("changed");
+    refreshSession();
+  }
+
+  async function startRolePreview(userId) {
+    await sessionApi("/role-preview", { method: "PUT", body: JSON.stringify({ userId }) });
+    sessionChannel.current?.postMessage("changed");
+    refreshSession();
+  }
+
+  async function exitRolePreview() {
+    setPreviewExit({ busy: true, error: null });
+    try {
+      await sessionApi("/role-preview", { method: "DELETE" });
+      sessionChannel.current?.postMessage("changed");
+      refreshSession();
+      setPreviewExit({ busy: false, error: null });
+    } catch (cause) {
+      setPreviewExit({ busy: false, error: cause });
+    }
+  }
+
   async function logout() {
     setLoading(true);
     setError(null);
@@ -125,21 +166,30 @@ function App() {
     }
   }
   const errorMessage = <ErrorMessage error={error} />;
-  if (!user) {
-    return <AccountEntry loading={loading} error={errorMessage} onLogin={authenticate} />;
+  if (sessionChecking) {
+    return <SignIn title="Перевіряємо сеанс"><p role="status">Завантажуємо доступ…</p></SignIn>;
   }
-  return <Registry key={user.id} api={sessionApi} user={user}
-    logout={logout} busy={loading} sessionError={errorMessage} />;
+  if (!user) {
+    return <AccountEntry loading={loading} error={errorMessage} notice={notice} onLogin={authenticate} />;
+  }
+  const rolePreview = user.preview
+    ? { onExit: exitRolePreview, ...previewExit }
+    : user.role === "admin" ? { api: sessionApi, onStart: startRolePreview } : null;
+  return <Registry key={`${user.authKind}:${user.id}`} api={sessionApi} user={user}
+    logout={logout} changePassword={user.preview ? null : changePassword} rolePreview={rolePreview}
+    busy={loading} sessionError={errorMessage} />;
 }
-function Registry({ api, user, logout, busy, sessionError }) {
-  const manageAccess = user.authKind === "password" && user.role === "admin";
-  const importRegistry = hasPermission(user, "registry.import", user.role === "admin");
+function Registry({ api, user, logout, changePassword, rolePreview, busy, sessionError }) {
+  const manageAccess = !user.preview && user.authKind === "password" && user.role === "admin";
+  const importRegistry = !user.preview && hasPermission(user, "registry.import", user.role === "admin");
+  const unavailable = Boolean(user.preview?.unavailable);
   const [navigation, setNavigation] = useState(manageAccess ? "access" : null);
   const [attempt, setAttempt] = useState(0);
   const [programs, setPrograms] = useState(null),
     [programId, setProgramId] = useState(""),
     [error, setError] = useState(null);
   useEffect(() => {
+    if (unavailable) return;
     const controller = new AbortController();
     setError(null);
     setPrograms(null);
@@ -153,7 +203,7 @@ function Registry({ api, user, logout, busy, sessionError }) {
         if (!controller.signal.aborted) setError(e);
       });
     return () => controller.abort();
-  }, [api, attempt]);
+  }, [api, attempt, unavailable]);
   const programPicker = (
     <label className="program-select">
       <span>Програма</span>
@@ -165,12 +215,13 @@ function Registry({ api, user, logout, busy, sessionError }) {
     </label>
   );
   const shell = {
-    user, role: user.roleName ?? roleNames[user.role], logout, busy, programPicker,
+    user, role: user.roleName ?? roleNames[user.role], logout, changePassword, rolePreview, busy, programPicker,
     manageAccess, importRegistry,
   };
   const program = programs?.find(({ id }) => id === programId);
   const showAccess = manageAccess && navigation === "access";
   const showImport = importRegistry && navigation === "registryImport";
+  if (unavailable) return <Workspace {...shell} programPicker={null} programNavigation={false}>{sessionError}</Workspace>;
   if (showAccess || showImport) {
     return (
       <Workspace {...shell} programPicker={null} programNavigation={Boolean(program)}
@@ -233,7 +284,7 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
   const [view, setView] = useState(initialView ?? (
     hasPermission(user, "analytics.read", true) ? "dashboard" : "registry"
   ));
-  const canEditRegistry = hasPermission(user, "registry.write", user.role === "coordinator");
+  const canEditRegistry = !user.preview && hasPermission(user, "registry.write", user.role === "coordinator");
   const [options, setOptions] = useState(null),
     [result, setResult] = useState(null),
     [error, setError] = useState(null);
@@ -479,7 +530,7 @@ function Program({ api, program, user, shell, sessionError, initialView, onOpenG
       </header>}
       {view === "passport" || view === "corruptionRisks" ? (
         <ProgramReference view={view} program={program} programContext={programContext}
-          departments={options?.departments ?? []} api={api} />
+          departments={options?.departments ?? []} api={api} readOnly={Boolean(user.preview)} />
       ) : view === "report" ? (
         <HalfYearReport program={program} api={api} selectedPeriod={reportPeriod}
           onPeriodChange={setReportPeriod} onOpenMeasure={openDashboardMeasure} />
