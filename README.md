@@ -42,11 +42,11 @@ npm run offline
 
 Команда збере інтерфейс, підготує невеликий навчальний набір у `data/offline.sqlite` і надрукує локальну адресу для браузера. Під час першого запуску з новою базою термінал покаже логін адміністратора `demo-local` і випадковий пароль. Збережіть пароль для входу після перезапуску. Після встановлення залежностей мережа не потрібна.
 
-Для перевірки тих самих 50 заходів, 14 ризиків і звіту за І півріччя, що й в онлайн-демо, [один раз імпортуйте офіційний набір](#локальне-демо-на-офіційному-наборі-bitec). Для ручного запуску дивіться [налаштування локального входу](#вхід-з-обліковими-записами). Тести запускаються через `npm test`.
+Для ручного запуску дивіться [налаштування локального входу](#вхід-з-обліковими-записами). Тести запускаються через `npm test`.
 
 ### Вхід з обліковими записами
 
-Команди `create-admin` і `npm start` за замовчуванням використовують `data/demo.sqlite`. Якщо під час імпорту вказали `DATABASE_PATH`, збережіть те саме значення для обох команд.
+Команди `create-admin` і `npm start` за замовчуванням використовують `data/demo.sqlite`. Для іншої бази задайте те саме значення `DATABASE_PATH` для обох команд.
 
 <details>
 <summary>Команди для Bash і Zsh</summary>
@@ -80,28 +80,6 @@ try { npm run create-admin } finally { Remove-Item Env:DACM_ADMIN_PASSWORD }
 ```
 
 </details>
-
-### Локальне демо на офіційному наборі BITEC
-
-Після `npm ci` розпакуйте `dani/nabir.json` і `kliuch/ochikuvani-sygnaly.csv` з архіву організаторів. Скрипт імпортує його в окремий файл SQLite і з параметром `--verify` запускає тимчасовий локальний API для звірки. [Синтетичний ZIP BITEC](https://hack.bitec.com.ua/wp-content/uploads/2026/11/zavdannia-2-syntetychnyi-nabir-63022726.zip)
-
-**PowerShell**
-
-```powershell
-$env:DEMO_MODE = 'true'
-$env:DATABASE_PATH = './data/official-bitec.sqlite'
-node scripts/import-official-dataset.mjs 'C:\шлях\до\dani\nabir.json' $env:DATABASE_PATH --verify --risk-key 'C:\шлях\до\kliuch\ochikuvani-sygnaly.csv'
-```
-
-**Bash або Zsh**
-
-```bash
-export DEMO_MODE=true
-export DATABASE_PATH=./data/official-bitec.sqlite
-node scripts/import-official-dataset.mjs '/шлях/до/dani/nabir.json' "$DATABASE_PATH" --verify --risk-key '/шлях/до/kliuch/ochikuvani-sygnaly.csv'
-```
-
-Очікуваний результат звірки містить `rows: 50`, `referenceRows: 50` і `differences: []`. Для сигналів очікуються `expected: 29`, `observed: 29`, `matched: 29` та порожні списки розбіжностей. У тому самому терміналі виконайте `npm run offline`, увійдіть і відкрийте **Звіти → 2026 · І півріччя** або **Сигнали → Зріз організаторів**.
 
 ## Як влаштовано
 
