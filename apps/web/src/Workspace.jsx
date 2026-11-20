@@ -5,6 +5,8 @@ const glyphs = {
   signals: <><path d="M10.3 4.8 3 18a1.6 1.6 0 0 0 1.4 2.3h15.2A1.6 1.6 0 0 0 21 18l-7.3-13.2a2 2 0 0 0-3.4 0Z" /><path d="M12 9v4m0 3.5h.01" /></>,
   approvals: <><circle cx="12" cy="12" r="9" /><path d="m8 12 2.5 2.5L16 9" /></>,
   report: <><rect x="5" y="3" width="14" height="18" rx="2" /><path d="M9 16v-4m3 4V8m3 8v-6" /></>,
+  passport: <><path d="M4 5h6a2 2 0 0 1 2 2v13a3 3 0 0 0-3-3H4Zm16 0h-6a2 2 0 0 0-2 2v13a3 3 0 0 1 3-3h5Z" /><path d="M7 9h2m6 0h2" /></>,
+  corruptionRisks: <><path d="M12 3 20 6v5c0 5-3.4 8.1-8 10-4.6-1.9-8-5-8-10V6Z" /><path d="M12 8v4m0 3h.01" /></>,
   plus: <path d="M12 5v14M5 12h14" />,
   search: <><circle cx="10.5" cy="10.5" r="5.5" /><path d="m15 15 4 4" /></>,
   chevron: <path d="m7 10 5 5 5-5" />,
@@ -34,6 +36,8 @@ function Brand() {
 const navigation = [
   { key: "dashboard", label: "Огляд", visible: (role) => role !== "admin" },
   { key: "registry", label: "Реєстр", visible: () => true },
+  { key: "passport", label: "Паспорт програми", visible: () => true },
+  { key: "corruptionRisks", label: "Корупційні ризики", visible: (role) => role !== "executor" },
   { key: "signals", label: "Сигнали", visible: (role) => ["coordinator", "leader", "analyst"].includes(role) },
   { key: "approvals", label: "Погодження", visible: (role) => role === "coordinator" },
   { key: "report", label: "Звіти", visible: (role) => role !== "executor" },
@@ -89,7 +93,7 @@ export function Workspace({ user, role, sessionForm, logout, busy, programPicker
           <div className="workspace-tools">
             <span className="demo">Синтетичні дані</span>
             <details className="workspace-account">
-              <summary aria-label="Демосесія">
+              <summary aria-label={`Демосесія · ${user.displayName} · ${role}`}>
                 <span className="account-avatar" aria-hidden="true">{initials}</span>
                 <span className="account-name"><strong>{user.displayName}</strong><span>{role}</span></span>
                 <Glyph name="chevron" size={16} />

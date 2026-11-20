@@ -287,7 +287,7 @@ function DashboardList({ request, selection, onSelect, periods, onOpenMeasure })
   return (
     <section className="dashboard-panel dashboard-list-panel" aria-labelledby="dashboard-list-title">
       <div className="dashboard-heading dashboard-panel-heading">
-        <h4 id="dashboard-list-title">{title}</h4>
+        <h2 id="dashboard-list-title">{title}</h2>
         {request.data && <span className="dashboard-total" role="status">Усього: {request.data.total}</span>}
       </div>
       <div className="dashboard-panel-body">
@@ -314,7 +314,7 @@ function CompletionProgress({ summary }) {
   return (
     <section className="dashboard-panel dashboard-progress" aria-labelledby="dashboard-progress-title">
       <div className="dashboard-heading dashboard-panel-heading">
-        <h4 id="dashboard-progress-title">Загальний прогрес</h4>
+        <h2 id="dashboard-progress-title">Загальний прогрес</h2>
         <p>Виконання поточних періодів</p>
       </div>
       <div className="dashboard-panel-body">
@@ -346,7 +346,7 @@ function DepartmentProgress({ api, programId, departments }) {
   return (
     <section className="dashboard-panel" aria-labelledby="department-progress-title">
       <div className="dashboard-panel-heading department-progress-heading">
-        <h4 id="department-progress-title">Виконання за підрозділами</h4>
+        <h2 id="department-progress-title">Виконання за підрозділами</h2>
         <p>Виконано з усіх поточних періодів</p>
       </div>
       <ul className="department-progress-list" role="list">
@@ -441,7 +441,7 @@ function RiskFlags({ api, scope, periods, onOpenMeasure }) {
   return (
     <section className="dashboard-panel dashboard-flags-panel" aria-labelledby="dashboard-flags-title">
       <div className="dashboard-heading dashboard-panel-heading dashboard-flags-heading">
-        <h4 id="dashboard-flags-title">Сигнали ризику</h4>
+        <h2 id="dashboard-flags-title">Сигнали ризику</h2>
         <label>
           Правило
           <select value={filter.ruleCode} onChange={(event) => setFilter({ ruleCode: event.target.value, page: 1 })}>

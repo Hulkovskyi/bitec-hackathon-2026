@@ -10,7 +10,7 @@
   gap: 8px 18px;
 }
 
-.dashboard-heading :is(h3, h4, p),
+.dashboard-heading :is(h2, p),
 .dashboard-heading label {
   margin: 0;
 }
@@ -152,7 +152,7 @@
   margin-bottom: 14px;
 }
 
-.dashboard-panel-heading h4 {
+.dashboard-panel-heading h2 {
   color: var(--text);
   font-size: var(--type-subhead);
   line-height: 1.25;
@@ -234,7 +234,7 @@
   font-size: var(--type-xs);
 }
 
-.department-progress-heading :is(h4, p) {
+.department-progress-heading :is(h2, p) {
   margin: 0;
 }
 

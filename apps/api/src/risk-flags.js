@@ -1,5 +1,5 @@
 import { kyivDate } from "./registry.js";
-import { workInterval } from "./result-access.js";
+import { workDeadline, workInterval } from "./result-access.js";
 
 const millisecondsPerDay = 86_400_000;
 
@@ -25,7 +25,7 @@ export function startedDeadlines(plan, today) {
       const periodKey = `${String(year).padStart(4, "0")}-H${half}`;
       const interval = workInterval(plan, periodKey);
       if (interval && interval[0] <= today) {
-        deadlines.push({ periodKey, deadline: interval[1] });
+        deadlines.push({ periodKey, deadline: workDeadline(plan, periodKey, interval) });
       }
     }
   }
@@ -127,8 +127,8 @@ function indicatorFlags(source, plan, result) {
   if (!Number.isFinite(result.measured_value)) return [];
 
   const actual = Number(result.measured_value.toFixed(6));
-  const target = Number(plan.target.toFixed(6));
-  const baseline = Number(plan.baseline.toFixed(6));
+  const target = Number.isFinite(plan.target) ? Number(plan.target.toFixed(6)) : null;
+  const baseline = Number.isFinite(plan.baseline) ? Number(plan.baseline.toFixed(6)) : null;
   const { direction } = plan;
   const comparison = {
     ...source,
@@ -150,7 +150,7 @@ function indicatorFlags(source, plan, result) {
       suggestedAction: "Звірте вимірювання з ціллю й уточніть потрібні дії.",
     });
   }
-  if (result.outcome === "completed" && noImprovement) {
+  if (result.outcome === "completed" && baseline !== null && noImprovement) {
     flags.push({
       ...comparison,
       ruleCode: "closed_without_improvement",

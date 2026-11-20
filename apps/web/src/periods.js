@@ -1,3 +1,6 @@
+export const kyivToday = () =>
+  new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Kyiv" }).format(new Date());
+
 export function halfYears(start, end) {
   const periods = [];
   for (let year = Number(start.slice(0, 4)); year <= Number(end.slice(0, 4)); year++) {

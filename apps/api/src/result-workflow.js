@@ -71,10 +71,12 @@ async function validateForDecision(db, result, plan, today, verifyEvidence) {
   await validateResultDates(db, result, plan, today);
 
   const evidence = await currentEvidence(db, result);
-  if (
-    outcome !== "not_completed" &&
-    (result.actual_date !== result.result_date || !Number.isFinite(result.measured_value) || evidence.length === 0)
-  ) invalid("Потрібні фактична дата, виміряне значення й актуальний доказ виконавця");
+  if (outcome !== "not_completed") {
+    if (result.actual_date !== result.result_date || evidence.length === 0)
+      invalid("Потрібні фактична дата й актуальний доказ виконавця");
+    if (plan.target !== null && !Number.isFinite(result.measured_value))
+      invalid("Потрібне виміряне значення індикатора");
+  }
   if (result.measured_value !== null && !Number.isFinite(result.measured_value))
     invalid("Некоректне виміряне значення");
 
@@ -100,6 +102,7 @@ function planSnapshot(row) {
     title: plan.title,
     description: plan.description,
     scheduleType: plan.scheduleType,
+    ...(plan.recurrence ? { recurrence: plan.recurrence } : {}),
     plannedDate: plan.plannedDate,
     effectiveFrom: plan.effectiveFrom,
     indicator: plan.indicator,
@@ -129,8 +132,13 @@ async function hasPlanAssignment(db, plan, userId) {
   if (plan.executor_id !== userId) return false;
   const halfIndex = (value) => Number(value.slice(0, 4)) * 2 + Number(value.slice(5, 7) >= "07");
   const start = plan.period_start > plan.effective_from ? plan.period_start : plan.effective_from;
-  const available = halfIndex(plan.period_end) - halfIndex(start) + 1;
-  return overrides.length < available;
+  const end = plan.period_end;
+  if (plan.recurrence === "annual_april_may") {
+    const firstYear = Number(start.slice(0, 4)) + Number(start.slice(5) > "05-31");
+    const lastYear = Number(end.slice(0, 4)) - Number(end.slice(5) < "04-01");
+    return overrides.length < lastYear - firstYear + 1;
+  }
+  return overrides.length < halfIndex(end) - halfIndex(start) + 1;
 }
 
 async function assignmentForUser(db, plan, user, periodKey) {
