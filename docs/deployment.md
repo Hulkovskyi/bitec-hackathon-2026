@@ -43,7 +43,7 @@ npx vercel deploy --prod
 | `SUPABASE_SECRET_KEY` | Службовий ключ проєкту BITEC. Sensitive. |
 | `SUPABASE_EVIDENCE_BUCKET` | Назва bucket. Типове значення `bitec-evidence`. |
 
-Для підготовки навчальних записів в окремій синтетичній базі запустіть `npm run setup:hosted-demo` з `DEMO_MODE=true`, `DACM_ADMIN_DATABASE_URL` і `SUPABASE_DB_CA`. Офіційний архів BITEC можна окремо імпортувати й перевірити за допомогою скрипта `import-official-dataset.mjs`. [Імпорт і звірка H1](../README.md#локальне-демо-на-офіційному-наборі-bitec)
+Для підготовки навчальних записів в окремій синтетичній базі запустіть `npm run setup:hosted-demo` з `DEMO_MODE=true`, `DACM_ADMIN_DATABASE_URL` і `SUPABASE_DB_CA`. Офіційний архів BITEC можна окремо імпортувати й перевірити за допомогою скрипта `import-official-dataset.mjs`. [Імпорт і звірка H1](official-dataset-mapping.md#як-перевірити-імпорт)
 
 ## Скидання облікових записів через GitHub
 

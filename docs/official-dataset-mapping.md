@@ -1,6 +1,16 @@
 # Відповідність офіційного синтетичного набору та реєстру v1
 
-Поточна версія імпортує офіційний `dani/nabir.json` до локальної SQLite й звіряє звіт H1 з еталоном. [Запуск і перевірка](../README.md#локальне-демо-на-офіційному-наборі-bitec)
+Поточна версія імпортує офіційний `dani/nabir.json` до локальної SQLite й звіряє піврічний звіт та контрольні сигнали з еталоном.
+
+## Як перевірити імпорт
+
+Після `npm ci` розпакуйте архів так, щоб файли `dani/nabir.json` і `kliuch/ochikuvani-sygnaly.csv` були в папці `../bitec-data` відносно кореня репозиторію. У терміналі задайте `$env:DEMO_MODE = 'true'` для PowerShell або `export DEMO_MODE=true` для Bash чи Zsh. З кореня репозиторію виконайте команду для окремої локальної бази. [Синтетичний набір BITEC](https://hack.bitec.com.ua/wp-content/uploads/2026/11/zavdannia-2-syntetychnyi-nabir-63022726.zip)
+
+```sh
+node scripts/import-official-dataset.mjs ../bitec-data/dani/nabir.json ./data/official-check.sqlite --verify --risk-key ../bitec-data/kliuch/ochikuvani-sygnaly.csv
+```
+
+Очікуваний результат для І півріччя 2026 року — 50 рядків звіту без розбіжностей і 29 із 29 контрольних сигналів. [Скрипт звірки](../scripts/import-official-dataset.mjs)
 
 ## Аналіз початкової моделі станом на 18.11.2026
 
